@@ -1,0 +1,8 @@
+{
+  "gameTitle": "Monster Hunter Wilds",
+  "appDataKind": "gogma-artian-planner-master",
+  "gameVersion": "unknown-initial",
+  "dataVersion": 4,
+  "generatedAt": null,
+  "notes": "Weapon, element, bonus, rank, applicability, mapping, series skill, and group skill masters are project-owner verified. gogma_artian rank I definitions were removed in dataVersion 4: the earlier real-game rank I report was an unamended normal-scope Gogma. Lottery and material data remain disabled and unverified."
+}

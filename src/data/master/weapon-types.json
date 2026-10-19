@@ -1,0 +1,142 @@
+[
+  {
+    "id": "weapon.great_sword",
+    "displayNameJa": "大剣",
+    "displayNameEn": "大剣",
+    "sortOrder": 1,
+    "category": "melee",
+    "supportsElement": true,
+    "supportsSharpness": true,
+    "isEnabled": true
+  },
+  {
+    "id": "weapon.long_sword",
+    "displayNameJa": "太刀",
+    "displayNameEn": "太刀",
+    "sortOrder": 2,
+    "category": "melee",
+    "supportsElement": true,
+    "supportsSharpness": true,
+    "isEnabled": true
+  },
+  {
+    "id": "weapon.sword_and_shield",
+    "displayNameJa": "片手剣",
+    "displayNameEn": "片手剣",
+    "sortOrder": 3,
+    "category": "melee",
+    "supportsElement": true,
+    "supportsSharpness": true,
+    "isEnabled": true
+  },
+  {
+    "id": "weapon.dual_blades",
+    "displayNameJa": "双剣",
+    "displayNameEn": "双剣",
+    "sortOrder": 4,
+    "category": "melee",
+    "supportsElement": true,
+    "supportsSharpness": true,
+    "isEnabled": true
+  },
+  {
+    "id": "weapon.hammer",
+    "displayNameJa": "ハンマー",
+    "displayNameEn": "ハンマー",
+    "sortOrder": 5,
+    "category": "melee",
+    "supportsElement": true,
+    "supportsSharpness": true,
+    "isEnabled": true
+  },
+  {
+    "id": "weapon.hunting_horn",
+    "displayNameJa": "狩猟笛",
+    "displayNameEn": "狩猟笛",
+    "sortOrder": 6,
+    "category": "melee",
+    "supportsElement": true,
+    "supportsSharpness": true,
+    "isEnabled": true
+  },
+  {
+    "id": "weapon.lance",
+    "displayNameJa": "ランス",
+    "displayNameEn": "ランス",
+    "sortOrder": 7,
+    "category": "melee",
+    "supportsElement": true,
+    "supportsSharpness": true,
+    "isEnabled": true
+  },
+  {
+    "id": "weapon.gunlance",
+    "displayNameJa": "ガンランス",
+    "displayNameEn": "ガンランス",
+    "sortOrder": 8,
+    "category": "melee",
+    "supportsElement": true,
+    "supportsSharpness": true,
+    "isEnabled": true
+  },
+  {
+    "id": "weapon.switch_axe",
+    "displayNameJa": "スラッシュアックス",
+    "displayNameEn": "スラッシュアックス",
+    "sortOrder": 9,
+    "category": "melee",
+    "supportsElement": true,
+    "supportsSharpness": true,
+    "isEnabled": true
+  },
+  {
+    "id": "weapon.charge_blade",
+    "displayNameJa": "チャージアックス",
+    "displayNameEn": "チャージアックス",
+    "sortOrder": 10,
+    "category": "melee",
+    "supportsElement": true,
+    "supportsSharpness": true,
+    "isEnabled": true
+  },
+  {
+    "id": "weapon.insect_glaive",
+    "displayNameJa": "操虫棍",
+    "displayNameEn": "操虫棍",
+    "sortOrder": 11,
+    "category": "melee",
+    "supportsElement": true,
+    "supportsSharpness": true,
+    "isEnabled": true
+  },
+  {
+    "id": "weapon.bow",
+    "displayNameJa": "弓",
+    "displayNameEn": "弓",
+    "sortOrder": 12,
+    "category": "ranged",
+    "supportsElement": true,
+    "supportsSharpness": false,
+    "isEnabled": true
+  },
+  {
+    "id": "weapon.light_bowgun",
+    "displayNameJa": "ライトボウガン",
+    "displayNameEn": "ライトボウガン",
+    "sortOrder": 13,
+    "category": "ranged",
+    "supportsElement": true,
+    "supportsSharpness": false,
+    "isEnabled": true
+  },
+  {
+    "id": "weapon.heavy_bowgun",
+    "displayNameJa": "ヘビィボウガン",
+    "displayNameEn": "ヘビィボウガン",
+    "sortOrder": 14,
+    "category": "ranged",
+    "supportsElement": true,
+    "supportsSharpness": false,
+    "isEnabled": true
+  }
+]

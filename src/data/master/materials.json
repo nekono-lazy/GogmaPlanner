@@ -1,0 +1,9 @@
+[
+  {
+    "id": "material.fixture.placeholder",
+    "displayNameJa": "検証用素材",
+    "displayNameEn": "Validation-only Material",
+    "sortOrder": 1,
+    "isEnabled": false
+  }
+]

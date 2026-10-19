@@ -1,0 +1,17 @@
+[
+  {
+    "id": "lottery.fixture.unverified.gogma_bonus.dual_blades.attack.ex",
+    "lotteryKind": "gogma_bonus",
+    "weaponTypeId": "weapon.dual_blades",
+    "rarity": null,
+    "resultType": "bonus",
+    "bonusTypeId": "bonus_type.attack",
+    "bonusRankId": "bonus_rank.ex",
+    "seriesSkillId": null,
+    "groupSkillId": null,
+    "internalValue": "unverified-placeholder",
+    "weight": 0,
+    "sortOrder": 1000,
+    "isEnabled": false
+  }
+]

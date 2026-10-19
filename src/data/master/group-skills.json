@@ -1,0 +1,121 @@
+[
+  {
+    "id": "group_skill.verified_01",
+    "displayNameJa": "鱗張りの技法",
+    "displayNameEn": "鱗張りの技法",
+    "sortOrder": 1,
+    "isEnabled": true
+  },
+  {
+    "id": "group_skill.verified_02",
+    "displayNameJa": "革細工の柔性",
+    "displayNameEn": "革細工の柔性",
+    "sortOrder": 2,
+    "isEnabled": true
+  },
+  {
+    "id": "group_skill.verified_03",
+    "displayNameJa": "毛皮の昂揚",
+    "displayNameEn": "毛皮の昂揚",
+    "sortOrder": 3,
+    "isEnabled": true
+  },
+  {
+    "id": "group_skill.verified_04",
+    "displayNameJa": "甲虫の知らせ",
+    "displayNameEn": "甲虫の知らせ",
+    "sortOrder": 4,
+    "isEnabled": true
+  },
+  {
+    "id": "group_skill.verified_05",
+    "displayNameJa": "護竜の脈動",
+    "displayNameEn": "護竜の脈動",
+    "sortOrder": 5,
+    "isEnabled": true
+  },
+  {
+    "id": "group_skill.verified_06",
+    "displayNameJa": "ヌシの誇り",
+    "displayNameEn": "ヌシの誇り",
+    "sortOrder": 6,
+    "isEnabled": true
+  },
+  {
+    "id": "group_skill.verified_07",
+    "displayNameJa": "甲虫の擬態",
+    "displayNameEn": "甲虫の擬態",
+    "sortOrder": 7,
+    "isEnabled": true
+  },
+  {
+    "id": "group_skill.verified_08",
+    "displayNameJa": "革細工の滑性",
+    "displayNameEn": "革細工の滑性",
+    "sortOrder": 8,
+    "isEnabled": true
+  },
+  {
+    "id": "group_skill.verified_09",
+    "displayNameJa": "鱗重ねの工夫",
+    "displayNameEn": "鱗重ねの工夫",
+    "sortOrder": 9,
+    "isEnabled": true
+  },
+  {
+    "id": "group_skill.verified_10",
+    "displayNameJa": "毛皮の誘惑",
+    "displayNameEn": "毛皮の誘惑",
+    "sortOrder": 10,
+    "isEnabled": true
+  },
+  {
+    "id": "group_skill.verified_11",
+    "displayNameJa": "護竜の守り",
+    "displayNameEn": "護竜の守り",
+    "sortOrder": 11,
+    "isEnabled": true
+  },
+  {
+    "id": "group_skill.verified_12",
+    "displayNameJa": "ヌシの憤激",
+    "displayNameEn": "ヌシの憤激",
+    "sortOrder": 12,
+    "isEnabled": true
+  },
+  {
+    "id": "group_skill.verified_13",
+    "displayNameJa": "先達の導き",
+    "displayNameEn": "先達の導き",
+    "sortOrder": 13,
+    "isEnabled": true
+  },
+  {
+    "id": "group_skill.verified_14",
+    "displayNameJa": "栄光の誉れ",
+    "displayNameEn": "栄光の誉れ",
+    "sortOrder": 14,
+    "isEnabled": true
+  },
+  {
+    "id": "group_skill.verified_15",
+    "displayNameJa": "祝祭の巡り",
+    "displayNameEn": "祝祭の巡り",
+    "sortOrder": 15,
+    "isEnabled": true
+  },
+  {
+    "id": "group_skill.apex",
+    "displayNameJa": "ヌシの魂",
+    "displayNameEn": "ヌシの魂",
+    "sortOrder": 16,
+    "isEnabled": true
+  },
+  {
+    "id": "group_skill.verified_17",
+    "displayNameJa": "拳を極めし者",
+    "displayNameEn": "拳を極めし者",
+    "sortOrder": 17,
+    "isEnabled": false
+  }
+]

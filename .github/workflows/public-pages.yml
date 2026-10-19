@@ -1,0 +1,82 @@
+name: Public GitHub Pages (manual)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.repository == 'nekono-lazy/GogmaPlanner' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.event.repository.private == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Verify Public repository and manual main dispatch
+        env:
+          EXPECTED_REPOSITORY_ID: ${{ vars.PUBLIC_REPOSITORY_ID }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = 'nekono-lazy/GogmaPlanner'
+          test "$GITHUB_EVENT_NAME" = 'workflow_dispatch'
+          test "$GITHUB_REF" = 'refs/heads/main'
+          [[ "$EXPECTED_REPOSITORY_ID" =~ ^[1-9][0-9]*$ ]]
+          test "$GITHUB_REPOSITORY_ID" = "$EXPECTED_REPOSITORY_ID"
+
+      # github.sha is the immutable main snapshot selected by the dispatch.
+      # A later push to main cannot change this checkout or its build ID.
+      - name: Checkout dispatched Public main commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Verify checkout and capture build ID
+        id: source
+        run: |
+          set -euo pipefail
+          head_sha="$(git rev-parse HEAD)"
+          [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]]
+          test "$head_sha" = "$GITHUB_SHA"
+          printf 'sha=%s\n' "$head_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+        env:
+          VITE_APP_BUILD_ID: ${{ steps.source.outputs.sha }}
+
+      - name: Package licenses and verify distribution
+        env:
+          PUBLIC_BUILD_SHA: ${{ steps.source.outputs.sha }}
+        run: node scripts/verify-public-dist.mjs --package-licenses "$PUBLIC_BUILD_SHA"
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v6
+
+      - name: Upload verified artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: ./dist
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

@@ -1,0 +1,50 @@
+[
+  {
+    "id": "bonus_type.attack",
+    "displayNameJa": "基礎攻撃力強化",
+    "displayNameEn": "基礎攻撃力強化",
+    "sortOrder": 1,
+    "category": "offense",
+    "isEnabled": true
+  },
+  {
+    "id": "bonus_type.affinity",
+    "displayNameJa": "会心率強化",
+    "displayNameEn": "会心率強化",
+    "sortOrder": 2,
+    "category": "offense",
+    "isEnabled": true
+  },
+  {
+    "id": "bonus_type.element",
+    "displayNameJa": "属性強化",
+    "displayNameEn": "属性強化",
+    "sortOrder": 3,
+    "category": "element",
+    "isEnabled": true
+  },
+  {
+    "id": "bonus_type.normal_sharpness",
+    "displayNameJa": "斬れ味強化",
+    "displayNameEn": "斬れ味強化",
+    "sortOrder": 4,
+    "category": "sharpness",
+    "isEnabled": true
+  },
+  {
+    "id": "bonus_type.normal_capacity",
+    "displayNameJa": "装填数強化",
+    "displayNameEn": "装填数強化",
+    "sortOrder": 5,
+    "category": "ranged",
+    "isEnabled": true
+  },
+  {
+    "id": "bonus_type.gogma_sharpness_capacity",
+    "displayNameJa": "斬れ味・装填強化",
+    "displayNameEn": "斬れ味・装填強化",
+    "sortOrder": 6,
+    "category": "utility",
+    "isEnabled": true
+  }
+]

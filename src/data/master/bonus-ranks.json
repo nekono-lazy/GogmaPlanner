@@ -1,0 +1,42 @@
+[
+  {
+    "id": "bonus_rank.base",
+    "displayNameJa": "通常",
+    "displayNameEn": "通常",
+    "order": 0,
+    "isEx": false,
+    "isEnabled": true
+  },
+  {
+    "id": "bonus_rank.i",
+    "displayNameJa": "I",
+    "displayNameEn": "I",
+    "order": 1,
+    "isEx": false,
+    "isEnabled": true
+  },
+  {
+    "id": "bonus_rank.ii",
+    "displayNameJa": "II",
+    "displayNameEn": "II",
+    "order": 2,
+    "isEx": false,
+    "isEnabled": true
+  },
+  {
+    "id": "bonus_rank.iii",
+    "displayNameJa": "III",
+    "displayNameEn": "III",
+    "order": 3,
+    "isEx": false,
+    "isEnabled": true
+  },
+  {
+    "id": "bonus_rank.ex",
+    "displayNameJa": "EX",
+    "displayNameEn": "EX",
+    "order": 4,
+    "isEx": true,
+    "isEnabled": true
+  }
+]

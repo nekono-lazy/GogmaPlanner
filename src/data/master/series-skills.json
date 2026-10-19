@@ -1,0 +1,177 @@
+[
+  {
+    "id": "series_skill.verified_01",
+    "displayNameJa": "闢獣の力",
+    "displayNameEn": "闢獣の力",
+    "sortOrder": 1,
+    "isEnabled": true
+  },
+  {
+    "id": "series_skill.verified_02",
+    "displayNameJa": "火竜の力",
+    "displayNameEn": "火竜の力",
+    "sortOrder": 2,
+    "isEnabled": true
+  },
+  {
+    "id": "series_skill.verified_03",
+    "displayNameJa": "兇爪竜の力",
+    "displayNameEn": "兇爪竜の力",
+    "sortOrder": 3,
+    "isEnabled": true
+  },
+  {
+    "id": "series_skill.verified_04",
+    "displayNameJa": "護鎖刃竜の命脈",
+    "displayNameEn": "護鎖刃竜の命脈",
+    "sortOrder": 4,
+    "isEnabled": true
+  },
+  {
+    "id": "series_skill.verified_05",
+    "displayNameJa": "波衣竜の守護",
+    "displayNameEn": "波衣竜の守護",
+    "sortOrder": 5,
+    "isEnabled": true
+  },
+  {
+    "id": "series_skill.verified_06",
+    "displayNameJa": "煌雷竜の力",
+    "displayNameEn": "煌雷竜の力",
+    "sortOrder": 6,
+    "isEnabled": true
+  },
+  {
+    "id": "series_skill.verified_07",
+    "displayNameJa": "雷顎竜の闘志",
+    "displayNameEn": "雷顎竜の闘志",
+    "sortOrder": 7,
+    "isEnabled": true
+  },
+  {
+    "id": "series_skill.verified_08",
+    "displayNameJa": "雪獅子の闘志",
+    "displayNameEn": "雪獅子の闘志",
+    "sortOrder": 8,
+    "isEnabled": true
+  },
+  {
+    "id": "series_skill.verified_09",
+    "displayNameJa": "鎧竜の守護",
+    "displayNameEn": "鎧竜の守護",
+    "sortOrder": 9,
+    "isEnabled": true
+  },
+  {
+    "id": "series_skill.verified_10",
+    "displayNameJa": "凍峰竜の反逆",
+    "displayNameEn": "凍峰竜の反逆",
+    "sortOrder": 10,
+    "isEnabled": true
+  },
+  {
+    "id": "series_skill.verified_11",
+    "displayNameJa": "暗器蛸の力",
+    "displayNameEn": "暗器蛸の力",
+    "sortOrder": 11,
+    "isEnabled": true
+  },
+  {
+    "id": "series_skill.verified_12",
+    "displayNameJa": "獄焔蛸の反逆",
+    "displayNameEn": "獄焔蛸の反逆",
+    "sortOrder": 12,
+    "isEnabled": true
+  },
+  {
+    "id": "series_skill.gore_magala",
+    "displayNameJa": "黒蝕竜の力",
+    "displayNameEn": "黒蝕竜の力",
+    "sortOrder": 13,
+    "isEnabled": true
+  },
+  {
+    "id": "series_skill.verified_14",
+    "displayNameJa": "鎖刃竜の飢餓",
+    "displayNameEn": "鎖刃竜の飢餓",
+    "sortOrder": 14,
+    "isEnabled": true
+  },
+  {
+    "id": "series_skill.verified_15",
+    "displayNameJa": "泡狐竜の力",
+    "displayNameEn": "泡狐竜の力",
+    "sortOrder": 15,
+    "isEnabled": true
+  },
+  {
+    "id": "series_skill.verified_16",
+    "displayNameJa": "白熾龍の脈動",
+    "displayNameEn": "白熾龍の脈動",
+    "sortOrder": 16,
+    "isEnabled": true
+  },
+  {
+    "id": "series_skill.verified_17",
+    "displayNameJa": "花舞の祈り",
+    "displayNameEn": "花舞の祈り",
+    "sortOrder": 17,
+    "isEnabled": false
+  },
+  {
+    "id": "series_skill.verified_18",
+    "displayNameJa": "千刃竜の闘志",
+    "displayNameEn": "千刃竜の闘志",
+    "sortOrder": 18,
+    "isEnabled": true
+  },
+  {
+    "id": "series_skill.verified_19",
+    "displayNameJa": "海竜の渦雷",
+    "displayNameEn": "海竜の渦雷",
+    "sortOrder": 19,
+    "isEnabled": true
+  },
+  {
+    "id": "series_skill.verified_20",
+    "displayNameJa": "踊火の祈り",
+    "displayNameEn": "踊火の祈り",
+    "sortOrder": 20,
+    "isEnabled": false
+  },
+  {
+    "id": "series_skill.verified_21",
+    "displayNameJa": "暗黒騎士の証",
+    "displayNameEn": "暗黒騎士の証",
+    "sortOrder": 21,
+    "isEnabled": true
+  },
+  {
+    "id": "series_skill.verified_22",
+    "displayNameJa": "オメガレゾナンス",
+    "displayNameEn": "オメガレゾナンス",
+    "sortOrder": 22,
+    "isEnabled": true
+  },
+  {
+    "id": "series_skill.verified_23",
+    "displayNameJa": "夢灯の祈り",
+    "displayNameEn": "夢灯の祈り",
+    "sortOrder": 23,
+    "isEnabled": false
+  },
+  {
+    "id": "series_skill.verified_24",
+    "displayNameJa": "巨戟龍の黙示録",
+    "displayNameEn": "巨戟龍の黙示録",
+    "sortOrder": 24,
+    "isEnabled": true
+  },
+  {
+    "id": "series_skill.verified_25",
+    "displayNameJa": "祝謡の祈り",
+    "displayNameEn": "祝謡の祈り",
+    "sortOrder": 25,
+    "isEnabled": false
+  }
+]

@@ -1,0 +1,82 @@
+[
+  {
+    "id": "element.none",
+    "displayNameJa": "無属性",
+    "displayNameEn": "無属性",
+    "sortOrder": 1,
+    "allowsElementBonus": false,
+    "isEnabled": true
+  },
+  {
+    "id": "element.fire",
+    "displayNameJa": "火",
+    "displayNameEn": "火",
+    "sortOrder": 2,
+    "allowsElementBonus": true,
+    "isEnabled": true
+  },
+  {
+    "id": "element.water",
+    "displayNameJa": "水",
+    "displayNameEn": "水",
+    "sortOrder": 3,
+    "allowsElementBonus": true,
+    "isEnabled": true
+  },
+  {
+    "id": "element.thunder",
+    "displayNameJa": "雷",
+    "displayNameEn": "雷",
+    "sortOrder": 4,
+    "allowsElementBonus": true,
+    "isEnabled": true
+  },
+  {
+    "id": "element.ice",
+    "displayNameJa": "氷",
+    "displayNameEn": "氷",
+    "sortOrder": 5,
+    "allowsElementBonus": true,
+    "isEnabled": true
+  },
+  {
+    "id": "element.dragon",
+    "displayNameJa": "龍",
+    "displayNameEn": "龍",
+    "sortOrder": 6,
+    "allowsElementBonus": true,
+    "isEnabled": true
+  },
+  {
+    "id": "element.poison",
+    "displayNameJa": "毒",
+    "displayNameEn": "毒",
+    "sortOrder": 7,
+    "allowsElementBonus": true,
+    "isEnabled": true
+  },
+  {
+    "id": "element.paralysis",
+    "displayNameJa": "麻痺",
+    "displayNameEn": "麻痺",
+    "sortOrder": 8,
+    "allowsElementBonus": true,
+    "isEnabled": true
+  },
+  {
+    "id": "element.sleep",
+    "displayNameJa": "睡眠",
+    "displayNameEn": "睡眠",
+    "sortOrder": 9,
+    "allowsElementBonus": true,
+    "isEnabled": true
+  },
+  {
+    "id": "element.blast",
+    "displayNameJa": "爆破",
+    "displayNameEn": "爆破",
+    "sortOrder": 10,
+    "allowsElementBonus": true,
+    "isEnabled": true
+  }
+]

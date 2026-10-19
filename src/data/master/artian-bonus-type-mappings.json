@@ -1,0 +1,27 @@
+[
+  {
+    "id": "artian_bonus_mapping.attack",
+    "normalBonusTypeId": "bonus_type.attack",
+    "gogmaBonusTypeId": "bonus_type.attack"
+  },
+  {
+    "id": "artian_bonus_mapping.affinity",
+    "normalBonusTypeId": "bonus_type.affinity",
+    "gogmaBonusTypeId": "bonus_type.affinity"
+  },
+  {
+    "id": "artian_bonus_mapping.element",
+    "normalBonusTypeId": "bonus_type.element",
+    "gogmaBonusTypeId": "bonus_type.element"
+  },
+  {
+    "id": "artian_bonus_mapping.sharpness",
+    "normalBonusTypeId": "bonus_type.normal_sharpness",
+    "gogmaBonusTypeId": "bonus_type.gogma_sharpness_capacity"
+  },
+  {
+    "id": "artian_bonus_mapping.capacity",
+    "normalBonusTypeId": "bonus_type.normal_capacity",
+    "gogmaBonusTypeId": "bonus_type.gogma_sharpness_capacity"
+  }
+]

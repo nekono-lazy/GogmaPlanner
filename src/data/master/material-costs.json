@@ -1,0 +1,10 @@
+[
+  {
+    "id": "material_cost.fixture.reset_skills.common",
+    "operationType": "reset_skills",
+    "weaponTypeId": null,
+    "materialId": "material.fixture.placeholder",
+    "quantity": 1,
+    "isEnabled": false
+  }
+]
