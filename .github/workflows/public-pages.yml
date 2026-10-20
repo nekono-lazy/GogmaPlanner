@@ -1,6 +1,9 @@
-name: Public GitHub Pages (manual)
+name: Public GitHub Pages
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -12,7 +15,7 @@ concurrency:
 
 jobs:
   deploy:
-    if: github.repository == 'nekono-lazy/GogmaPlanner' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.event.repository.private == false
+    if: github.repository == 'nekono-lazy/GogmaPlanner' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && github.event.repository.private == false
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -22,20 +25,26 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - name: Verify Public repository and manual main dispatch
+      - name: Verify Public repository and main deployment event
         env:
           EXPECTED_REPOSITORY_ID: ${{ vars.PUBLIC_REPOSITORY_ID }}
+          IS_PRIVATE: ${{ github.event.repository.private }}
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = 'nekono-lazy/GogmaPlanner'
-          test "$GITHUB_EVENT_NAME" = 'workflow_dispatch'
+          case "$GITHUB_EVENT_NAME" in
+            push|workflow_dispatch) ;;
+            *) exit 1 ;;
+          esac
+          test "$IS_PRIVATE" = 'false'
           test "$GITHUB_REF" = 'refs/heads/main'
           [[ "$EXPECTED_REPOSITORY_ID" =~ ^[1-9][0-9]*$ ]]
           test "$GITHUB_REPOSITORY_ID" = "$EXPECTED_REPOSITORY_ID"
+          printf 'Event: %s\nCommit: %s\n' "$GITHUB_EVENT_NAME" "$GITHUB_SHA"
 
-      # github.sha is the immutable main snapshot selected by the dispatch.
+      # github.sha is the immutable main snapshot selected by the push or dispatch event.
       # A later push to main cannot change this checkout or its build ID.
-      - name: Checkout dispatched Public main commit
+      - name: Checkout event Public main commit
         uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
