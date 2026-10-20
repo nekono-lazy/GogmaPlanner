@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react'
 import { useId } from 'react'
-import { Alert, Box, Divider, Paper, Stack, Typography } from '@mui/material'
+import { Alert, AlertTitle, Box, Divider, Paper, Stack, Typography } from '@mui/material'
 import type { MasterDataRoot } from '../../domain/master/masterTypes'
 import {
   restorationBonusScopeFieldLabel,
@@ -10,7 +10,7 @@ import { RestorationBonusSlots } from '../RestorationBonusSlots'
 import { ExecutionEntityName } from './ExecutionWeaponDetailDialog'
 import { StatusChip } from '../StatusChip'
 import { groupSkillLabel, seriesSkillLabel } from '../search/searchPresentation'
-import type { ExecutionStepPresentation } from './executionStepPresentation'
+import type { ExecutionNormalCreationGuidance, ExecutionStepPresentation } from './executionStepPresentation'
 
 function ExpectedResultSection({
   presentation,
@@ -67,11 +67,43 @@ function ExpectedResultSection({
 }
 
 /**
+ * The game operation of a Normal creation Step with a recorded role
+ * (`docs/UI_FLOW.md` 12, Issue #275), in place of the persisted instruction:
+ * the instruction naming the weapon type (and the production target's
+ * element), the production target's notice above the body text, then the
+ * supplementary lines. The Counter-advance / production-target difference is
+ * carried by the wording, the role chip and the notice's icon and title, never
+ * by colour alone.
+ */
+function NormalCreationGuidanceSection({ guidance }: { guidance: ExecutionNormalCreationGuidance }) {
+  return (
+    <Stack spacing={1}>
+      <Typography component="p" sx={{ fontWeight: 700, overflowWrap: 'anywhere' }}>
+        {guidance.instruction}
+      </Typography>
+      {guidance.keepNotice !== null && (
+        <Alert severity="warning" role="note">
+          <AlertTitle sx={{ fontWeight: 700 }}>{guidance.keepNotice.title}</AlertTitle>
+          {guidance.keepNotice.body}
+        </Alert>
+      )}
+      {guidance.notes.map((note) => (
+        <Typography key={note} variant="body2" color="text.secondary" sx={{ overflowWrap: 'anywhere' }}>
+          {note}
+        </Typography>
+      ))}
+    </Stack>
+  )
+}
+
+/**
  * The current Step of the Execution Navigator (`docs/UI_FLOW.md` 12).
  *
  * Everything shown comes from the persisted Step and its `executionEffects`;
- * no Seed or Counter value appears. The actions are the caller's children, so
- * the card never decides which confirmation applies.
+ * no Seed or Counter value appears. A Normal creation with a recorded role
+ * shows its derived instruction instead of the persisted one (Issue #275).
+ * The actions are the caller's children, so the card never decides which
+ * confirmation applies.
  */
 export function ExecutionStepCard({
   presentation,
@@ -113,19 +145,14 @@ export function ExecutionStepCard({
         ) : (
           <>
             <Typography sx={{ fontWeight: 500, overflowWrap: 'anywhere' }}>{step.title}</Typography>
-            <Typography variant="body2" color="text.secondary" sx={{ overflowWrap: 'anywhere' }}>
-              {step.instruction}
-            </Typography>
+            {presentation.normalCreation === null ? (
+              <Typography variant="body2" color="text.secondary" sx={{ overflowWrap: 'anywhere' }}>
+                {step.instruction}
+              </Typography>
+            ) : (
+              <NormalCreationGuidanceSection guidance={presentation.normalCreation} />
+            )}
           </>
-        )}
-
-        {normalCreationRole === 'counter_advance' && (
-          <Typography variant="body2">
-            Counter進行用の作成です。この武器は所持武器として登録しません。
-          </Typography>
-        )}
-        {normalCreationRole === 'production_target' && (
-          <Typography variant="body2">この後巨戟化する作成対象です。</Typography>
         )}
 
         {/*

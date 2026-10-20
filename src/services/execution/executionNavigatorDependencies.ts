@@ -16,6 +16,7 @@ import type {
   CalculationContext,
   ExecutionHistory,
   ExecutionSavePoint,
+  NormalArtianCounter,
   OwnedWeapon,
   ProductionPlan,
   ProductionPlanId,
@@ -54,6 +55,12 @@ export interface ExecutionNavigatorSnapshot {
   ownedWeapons: OwnedWeapon[]
   targetWeapons: TargetWeapon[]
   buildListEntries: BuildListEntry[]
+  /**
+   * Every persisted Normal Artian Counter, from this same read. Display only:
+   * a Normal creation Step names the weapon type to forge from the Counter its
+   * `rngAdvance.affectedNormalCounterId` advances (Issue #275).
+   */
+  normalCounters: NormalArtianCounter[]
   /**
    * The Plan's latest ExecutionHistory by `compareExecutionHistoryOrder()`, or
    * `null` when none exists. A stale Plan's recovery guidance reads it to tell
@@ -131,6 +138,7 @@ export async function loadExecutionNavigatorSnapshot(
     ownedWeapons,
     targetWeapons,
     buildListEntries,
+    normalCounters,
     latestExecutionHistory,
     executionSavePoint: savePoint,
     operationCountRecovery: deriveOperationCountRecovery(plan, { ownedWeapons, planExecutionHistory }),

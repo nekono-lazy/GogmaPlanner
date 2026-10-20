@@ -3,9 +3,11 @@ import {
   type ExecutionRuntimeErrorCode,
   type ReidentificationDestination,
 } from '../../domain/execution'
+import type { MasterDataRoot } from '../../domain/master/masterTypes'
 import type {
   ExecutionHistory,
   ExpectedResult,
+  NormalArtianCounter,
   OwnedWeapon,
   OwnedWeaponId,
   PlanStep,
@@ -106,6 +108,195 @@ export interface ExecutionStepPresentation {
   completionTargetLabels: string[]
   /** The Step carries `checkpointMilestones`: it reaches a selected intermediate state. */
   reachesCheckpoint: boolean
+  /**
+   * The game operation of a `create_normal_artian` Step whose
+   * `executionEffects.normalCreationRole` is recorded (Issue #275), shown in
+   * place of the persisted `step.instruction`. `null` for every other Step and
+   * for a Normal creation without a recorded role, which keeps the persisted
+   * instruction as it is.
+   */
+  normalCreation: ExecutionNormalCreationGuidance | null
+}
+
+/**
+ * What the player forges in the game for a `create_normal_artian` Step
+ * (`docs/UI_FLOW.md` 12, Issue #275).
+ *
+ * Presentation only: the role is `executionEffects.normalCreationRole` as it
+ * was persisted, never inferred, and the weapon type / element come from the
+ * same records the Execution runtime reads for that Step (see
+ * `normalCreationWeapon()`). The persisted Step is never rewritten.
+ */
+export interface ExecutionNormalCreationGuidance {
+  role: PlanStepNormalCreationRole
+  /** A blind production-target Normal: its five slots are the user's observation. */
+  isBlind: boolean
+  /**
+   * 「双剣」 (Counter-advance) or 「双剣・火属性」 (production target) from the
+   * Master `displayNameJa`, or `null` when it cannot be resolved safely; the
+   * instruction then names no weapon type or element at all.
+   */
+  weaponDescription: string | null
+  /** The operation itself, e.g. 「双剣の通常アーティアを1本作成してください。」 */
+  instruction: string
+  /** The production-target notice shown above the body text; `null` for a Counter-advance Normal. */
+  keepNotice: { title: string; body: string } | null
+  /** Supplementary lines in display order. */
+  notes: readonly string[]
+}
+
+/** The persisted records a Normal creation instruction is named from. */
+export interface ExecutionNormalCreationSources {
+  normalCounters: readonly Pick<NormalArtianCounter, 'id' | 'weaponTypeId'>[]
+  master: Pick<MasterDataRoot, 'weaponTypes' | 'elements'>
+}
+
+function masterDisplayName(
+  entries: readonly { id: string; displayNameJa: string }[],
+  id: string,
+): string | null {
+  return entries.find((entry) => entry.id === id)?.displayNameJa ?? null
+}
+
+/** 「火」 reads 「火属性」; a name that already says 属性 (「無属性」) is kept. */
+function elementPhrase(displayName: string): string {
+  return displayName.endsWith('属性') ? displayName : `${displayName}属性`
+}
+
+/**
+ * The weapon type of the Normal Counter the Step advances, from the persisted
+ * Counter record `rngAdvance.affectedNormalCounterId` names - never by reading
+ * the Counter ID. `none` when the Step names no Counter (a blind creation over
+ * an unconfirmed Counter); `unresolved` when it names one that is not in the
+ * snapshot, which the Execution runtime refuses too.
+ */
+function advancedNormalCounterWeaponType(
+  step: PlanStep,
+  normalCounters: ExecutionNormalCreationSources['normalCounters'],
+): { kind: 'none' } | { kind: 'unresolved' } | { kind: 'resolved'; weaponTypeId: string } {
+  const counterId = step.rngAdvance.affectedNormalCounterId
+  if (counterId === null) return { kind: 'none' }
+  const record = normalCounters.find(({ id }) => id === counterId)
+  return record === undefined ? { kind: 'unresolved' } : { kind: 'resolved', weaponTypeId: record.weaponTypeId }
+}
+
+/**
+ * The weapon type (and, for the production target, the element) the Step
+ * forges, or `null` whenever the records do not agree.
+ *
+ * - Counter-advance: the advanced Normal Counter's weapon type, which must
+ *   match the Step's Target when the Target is known, because the forge only
+ *   exists to move that very Counter.
+ * - Production target: the identity the runtime registers the weapon with
+ *   (`productionTargetNormalIdentity()`): the Target for a blind creation, the
+ *   recorded `inventoryChange.addOwnedWeapon` otherwise, which must agree with
+ *   the Target and with the advanced Counter.
+ */
+function normalCreationWeapon(
+  step: PlanStep,
+  role: PlanStepNormalCreationRole,
+  target: TargetWeapon | null,
+  normalCounters: ExecutionNormalCreationSources['normalCounters'],
+): { weaponTypeId: string; elementId: string | null } | null {
+  const counter = advancedNormalCounterWeaponType(step, normalCounters)
+  if (role === 'counter_advance') {
+    if (counter.kind !== 'resolved') return null
+    if (target !== null && target.weaponTypeId !== counter.weaponTypeId) return null
+    return { weaponTypeId: counter.weaponTypeId, elementId: null }
+  }
+  const effects = step.executionEffects
+  if (effects === undefined || target === null) return null
+  let identity: { weaponTypeId: string; elementId: string }
+  if (effects.observationBinding !== null) {
+    identity = { weaponTypeId: target.weaponTypeId, elementId: target.elementId }
+  } else {
+    const registered = step.inventoryChange?.addOwnedWeapon ?? null
+    if (
+      registered === null ||
+      registered.kind !== 'normal' ||
+      registered.id !== effects.trackedOwnedWeaponId ||
+      registered.weaponTypeId !== target.weaponTypeId ||
+      registered.elementId !== target.elementId
+    ) {
+      return null
+    }
+    identity = { weaponTypeId: registered.weaponTypeId, elementId: registered.elementId }
+  }
+  if (counter.kind === 'unresolved') return null
+  if (counter.kind === 'resolved' && counter.weaponTypeId !== identity.weaponTypeId) return null
+  return identity
+}
+
+/**
+ * The 「双剣」 / 「双剣・火属性」 the instruction names, or `null` when a name is
+ * missing from the Master: an internal ID is never shown as a weapon name, and
+ * a production target never names its weapon type without its element.
+ */
+function normalCreationWeaponDescription(
+  weapon: { weaponTypeId: string; elementId: string | null } | null,
+  master: ExecutionNormalCreationSources['master'],
+): string | null {
+  if (weapon === null) return null
+  const weaponTypeName = masterDisplayName(master.weaponTypes, weapon.weaponTypeId)
+  if (weaponTypeName === null) return null
+  if (weapon.elementId === null) return weaponTypeName
+  const elementName = masterDisplayName(master.elements, weapon.elementId)
+  return elementName === null ? null : `${weaponTypeName}・${elementPhrase(elementName)}`
+}
+
+/** The production-target notice, emphasized above the body text (Issue #275). */
+const PRODUCTION_TARGET_KEEP_NOTICE = {
+  title: 'この武器は、この後の巨戟化に使用します。',
+  body: '巨戟化するまで、作成した武器を処分しないでください。',
+} as const
+
+export function createNormalCreationGuidance(
+  step: PlanStep,
+  target: TargetWeapon | null,
+  sources: ExecutionNormalCreationSources,
+): ExecutionNormalCreationGuidance | null {
+  const effects = step.executionEffects
+  // A role is never inferred: a legacy Step, or one with no recorded role,
+  // keeps its persisted instruction.
+  if (step.operationType !== 'create_normal_artian' || effects === undefined) return null
+  const role = effects.normalCreationRole
+  if (role === null) return null
+  const weaponDescription = normalCreationWeaponDescription(
+    normalCreationWeapon(step, role, target, sources.normalCounters),
+    sources.master,
+  )
+  const instruction = weaponDescription === null
+    ? '通常アーティアを1本作成してください。'
+    : `${weaponDescription}の通常アーティアを1本作成してください。`
+  if (role === 'counter_advance') {
+    return {
+      role,
+      isBlind: false,
+      weaponDescription,
+      instruction,
+      keepNotice: null,
+      notes: [
+        weaponDescription === null
+          ? '通常アーティアCounterを進めるための作成です。この武器は所持武器として登録しません。'
+          : '武器種ごとの通常アーティアCounterを進めるための作成です。この武器は所持武器として登録しません。',
+        ...(weaponDescription === null ? ['作成する武器種を特定できないため、武器種を表示していません。'] : []),
+      ],
+    }
+  }
+  const isBlind = effects.observationBinding !== null
+  return {
+    role,
+    isBlind,
+    weaponDescription,
+    instruction,
+    keepNotice: PRODUCTION_TARGET_KEEP_NOTICE,
+    notes: [
+      isBlind
+        ? '復元ボーナスは予測していないため、ゲーム画面で確認した5枠を入力して所持武器として登録します。後の「復元ボーナスを再抽選」で5枠すべてが引き直されます。'
+        : '作成後、復元ボーナス5枠を想定結果と照らし合わせてください。この武器を所持武器として登録します。',
+      ...(weaponDescription === null ? ['作成する武器種・属性を特定できないため、武器種・属性を表示していません。'] : []),
+    ],
+  }
 }
 
 export function ownedWeaponLabel(
@@ -146,6 +337,7 @@ export function createExecutionStepPresentation(
   step: PlanStep,
   ownedWeapons: readonly OwnedWeapon[],
   targetWeapons: readonly TargetWeapon[],
+  normalCreationSources: ExecutionNormalCreationSources,
 ): ExecutionStepPresentation {
   const effects = step.executionEffects
   const actionKind = actionKindFor(step)
@@ -183,6 +375,7 @@ export function createExecutionStepPresentation(
       targetWeaponLabel(targetWeaponId, targetWeapons),
     ),
     reachesCheckpoint: (step.checkpointMilestones ?? []).length > 0,
+    normalCreation: createNormalCreationGuidance(step, target, normalCreationSources),
   }
 }
 

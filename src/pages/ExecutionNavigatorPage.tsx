@@ -710,8 +710,9 @@ function LoadedNavigator({
   /** 「実行状態の管理」, below the Step's game actions. */
   stateControls(options: StateControlsOptions): ReactNode
 }) {
-  const { plan, ownedWeapons, targetWeapons, buildListEntries, latestExecutionHistory } = snapshot
+  const { plan, ownedWeapons, targetWeapons, buildListEntries, normalCounters, latestExecutionHistory } = snapshot
   const progress = createExecutionProgress(plan)
+  const normalCreationSources = { normalCounters, master: dependencies.master }
 
   /**
    * The current Step's persisted internal information, in Debug Mode only
@@ -745,7 +746,7 @@ function LoadedNavigator({
       ? plan.steps.find(({ id }) => id === divergence.planStepId) ?? null
       : null
     if (uncertainStep !== null) {
-      const presentation = createExecutionStepPresentation(uncertainStep, ownedWeapons, targetWeapons)
+      const presentation = createExecutionStepPresentation(uncertainStep, ownedWeapons, targetWeapons, normalCreationSources)
       return (
         <>
           <ExecutionProgress progress={progress} />
@@ -828,7 +829,7 @@ function LoadedNavigator({
     )
   }
 
-  const presentation = createExecutionStepPresentation(step, ownedWeapons, targetWeapons)
+  const presentation = createExecutionStepPresentation(step, ownedWeapons, targetWeapons, normalCreationSources)
   // The same still-current authority the compromise finish runtime checks.
   const checkpoint =
     listCurrentCompromiseCheckpoints(plan, buildListEntries).find(
