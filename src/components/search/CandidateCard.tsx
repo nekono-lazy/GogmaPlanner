@@ -26,12 +26,12 @@ import {
   type SearchSourceExclusionDisplay,
 } from './sourceExclusionPresentation'
 import { CostEstimateSummary } from '../cost/CostEstimateSummary'
-import { AchievedCompletionVariants } from '../target/AchievedCompletionVariants'
 import {
-  ACHIEVED_COMPLETION_VARIANTS_LABEL,
+  describeAchievedCompletionSkillVariants,
   describeAchievedCompletionVariants,
   minimumRankSlotLabel,
 } from '../target/completionConditionPresentation'
+import { AchievedCompletionDefinitionItems } from './AchievedCompletionDefinitionItems'
 import { estimateCandidateCost } from '../../domain/cost'
 import type { MasterDataRoot } from '../../domain/master/masterTypes'
 import type {
@@ -211,13 +211,14 @@ export function CandidateCard({
               シリーズ: {seriesSkillLabel(candidate.seriesSkillId, master)} ／ グループ:{' '}
               {groupSkillLabel(candidate.groupSkillId, master)}
             </SearchDefinitionItem>
-            {/* Re-judged now from the finished slots and the Target as it is now
-                (`docs/REQUIREMENTS.md` 13.2): never read from the Candidate. */}
-            <SearchDefinitionItem label={ACHIEVED_COMPLETION_VARIANTS_LABEL}>
-              <AchievedCompletionVariants
-                achieved={describeAchievedCompletionVariants(target, candidate.finalBonuses, scope, master)}
-              />
-            </SearchDefinitionItem>
+            {/* Re-judged now from the finished slots / Skills and the Target as it
+                is now (`docs/REQUIREMENTS.md` 13.2): never read from the Candidate.
+                The Skill configurations get their own row only for a Target with
+                two or more of them (Issue #367). */}
+            <AchievedCompletionDefinitionItems
+              achieved={describeAchievedCompletionVariants(target, candidate.finalBonuses, scope, master)}
+              skill={describeAchievedCompletionSkillVariants(target, candidate.seriesSkillId, candidate.groupSkillId, master)}
+            />
           </SearchDefinitionList>
 
           <Box

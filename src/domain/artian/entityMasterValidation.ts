@@ -108,8 +108,9 @@ export function validateOwnedWeaponMasterReferences(
 }
 
 /**
- * The save-time Master references of a Target (`docs/DATA_MODEL.md` 8.2): the
- * weapon type, element and completion Skills must be enabled, and every slot's
+ * The save-time Master references of a Target (`docs/DATA_MODEL.md` 8.2 / 8.4):
+ * the weapon type, element and every completion Skill configuration's
+ * specified Series / Group Skill must be enabled, and every slot's
  * `(bonusTypeId, minimumRankId)` of every Variant must be a Production draw
  * candidate of the Target's weapon type / element / `gogma_artian` scope
  * (`docs/MASTER_DATA.md` 15.1). Import keeps checking existence only.
@@ -120,15 +121,22 @@ export function validateTargetWeaponMasterReferences(
 ): string[] {
   const issues: string[] = []
   validateCommon(
-    {
-      weaponTypeId: target.weaponTypeId,
-      elementId: target.elementId,
-      seriesSkillId: target.completionSkillCondition.seriesSkillId,
-      groupSkillId: target.completionSkillCondition.groupSkillId,
-    },
+    { weaponTypeId: target.weaponTypeId, elementId: target.elementId, seriesSkillId: null, groupSkillId: null },
     master,
     issues,
   )
+  // One configuration reads exactly as the former one condition did; two or
+  // more name the configuration the Skill belongs to.
+  const single = target.completionSkillVariants.length === 1
+  target.completionSkillVariants.forEach((variant, index) => {
+    const prefix = single ? '' : `完成スキル構成${index + 1}の`
+    if (variant.seriesSkillId !== null && !master.seriesSkills.some(({ id, isEnabled }) => id === variant.seriesSkillId && isEnabled)) {
+      issues.push(`seriesSkillId: ${prefix}利用可能なシリーズスキルではありません。`)
+    }
+    if (variant.groupSkillId !== null && !master.groupSkills.some(({ id, isEnabled }) => id === variant.groupSkillId && isEnabled)) {
+      issues.push(`groupSkillId: ${prefix}利用可能なグループスキルではありません。`)
+    }
+  })
   validateBonuses(master, target.weaponTypeId, target.elementId, 'gogma_artian',
     target.completionBonusVariants.flatMap((variant, variantIndex) => variant.slots.map((slot, slotIndex) => ({
       bonus: { bonusTypeId: slot.bonusTypeId, bonusRankId: slot.minimumRankId },

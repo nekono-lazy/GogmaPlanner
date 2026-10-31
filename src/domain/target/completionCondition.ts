@@ -13,7 +13,7 @@ import type {
   TargetWeapon,
 } from '../models/publicTypes'
 import { stableStringify } from '../models/hashing'
-import { evaluateSkillCondition } from './skillConditionEvaluator'
+import { satisfiesCompletionSkills } from './completionSkillVariants'
 import type { TargetEvaluationMasterSubset } from './targetEvaluationTypes'
 
 /**
@@ -262,9 +262,14 @@ export function satisfiesCompletionBonuses(
   return createCompletionBonusMatcher(target, master).satisfies(bonuses, scope)
 }
 
-/** `satisfiesCompletionTarget()`: the completion Bonus predicate AND the completion Skill condition. */
+/**
+ * `satisfiesCompletionTarget()` (`docs/PLANNER_SPEC.md` 20.2 / 22.2): the
+ * completion Bonus predicate AND the completion Skill predicate (any
+ * configuration, `satisfiesCompletionSkills()`). No Bonus Variant is paired
+ * with a Skill configuration.
+ */
 export function satisfiesCompletionTarget(
-  target: Pick<TargetWeapon, 'completionBonusVariants' | 'completionSkillCondition'>,
+  target: Pick<TargetWeapon, 'completionBonusVariants' | 'completionSkillVariants'>,
   bonuses: readonly RestorationBonus[],
   scope: RestorationBonusScope,
   seriesSkillId: SeriesSkillId | null,
@@ -273,7 +278,7 @@ export function satisfiesCompletionTarget(
 ): boolean {
   return (
     satisfiesCompletionBonuses(target, bonuses, scope, master) &&
-    evaluateSkillCondition(target.completionSkillCondition, seriesSkillId, groupSkillId)
+    satisfiesCompletionSkills(target, seriesSkillId, groupSkillId)
   )
 }
 

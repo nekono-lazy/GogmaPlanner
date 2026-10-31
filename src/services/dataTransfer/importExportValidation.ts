@@ -568,8 +568,13 @@ function targetWeaponReferences(target: TargetWeapon, path: string): MasterRefer
   const references: MasterReference[] = [
     ...masterReference('weaponTypeId', target.weaponTypeId, `${path}.weaponTypeId`),
     ...masterReference('elementId', target.elementId, `${path}.elementId`),
-    ...skillReferences(target.completionSkillCondition, `${path}.completionSkillCondition`),
   ]
+  // Existence only for every configuration's specified Series / Group Skill (`docs/DATA_MODEL.md` 15.1 schema 17).
+  if (Array.isArray(target.completionSkillVariants)) {
+    target.completionSkillVariants.forEach((variant, index) => {
+      references.push(...skillReferences(variant, `${path}.completionSkillVariants[${index}]`))
+    })
+  }
   // Existence only (`docs/DATA_MODEL.md` 15.1 schema 15): a slot outside the
   // Production availability is imported as it is (non-destructive load).
   if (Array.isArray(target.completionBonusVariants)) {

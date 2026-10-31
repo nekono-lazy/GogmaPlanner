@@ -191,8 +191,9 @@ export class PlanBreakingChangeGuard implements PlanGuardedPersistence {
   /**
    * Writes the difference between the persisted state and the decided final
    * state: removed records are deleted and changed or new ones put, so a record
-   * the save did not touch is never rewritten. The ended Plan, the deleted
-   * records after a restored save point and the deleted save point follow.
+   * the save did not touch is never rewritten. The BuildCandidates the mutation
+   * deletes, the ended Plan, the deleted records after a restored save point
+   * and the deleted save point follow.
    */
   private async write<R>(persisted: PlanGuardPersistedState, write: PlanGuardedMutationWrite<R>): Promise<void> {
     const { database } = this.dependencies
@@ -204,6 +205,12 @@ export class PlanBreakingChangeGuard implements PlanGuardedPersistence {
     await this.writeCollection(database.ownedWeapons, persisted.ownedWeapons, next.ownedWeapons)
     await this.writeCollection(database.targetWeapons, persisted.targetWeapons, next.targetWeapons)
     await this.writeCollection(database.buildListEntries, persisted.buildListEntries, next.buildListEntries)
+    // The saved Search results of a deleted Target go with it (Issue #371): the
+    // mutation named them from the state this transaction read, so the Target
+    // and its Candidates are deleted together or not at all.
+    if (write.deletedBuildCandidateIds.length > 0) {
+      await database.buildCandidates.bulkDelete([...write.deletedBuildCandidateIds])
+    }
 
     const termination = write.planTermination
     if (termination === null) return

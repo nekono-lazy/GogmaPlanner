@@ -21,7 +21,9 @@ import type { TargetEvaluationMasterSubset } from '../../domain/target/targetEva
 import { planStepOperationLabels } from '../../presentation/labels'
 import { orderPlanSteps } from '../planner/productionPlanPresentation'
 import {
+  describeEntryAchievedCompletionSkillVariants,
   describeEntryAchievedCompletionVariants,
+  type AchievedCompletionSkillVariants,
   type AchievedCompletionVariants,
 } from '../target/completionConditionPresentation'
 
@@ -115,8 +117,11 @@ export interface ExecutionStepPresentation {
   /**
    * The same completions with the completion Variants each achieves, judged at
    * display time (`docs/REQUIREMENTS.md` 13.2) from the completing Entry's
-   * Candidate Snapshot and the current Target. `achieved` is null when the
-   * caller gave no completion sources.
+   * Candidate Snapshot and the current Target, and - for a Target with two or
+   * more completion Skill configurations (Issue #367) - the configurations the
+   * same Snapshot's Skills achieve. `achieved` / `skillAchieved` are null when
+   * the caller gave no completion sources; `skillAchieved` is null too for a
+   * Target with one configuration or none found.
    */
   completionTargets: ExecutionCompletionTargetView[]
   /**
@@ -348,16 +353,18 @@ function actionKindFor(step: PlanStep): ExecutionStepActionKind {
 export interface ExecutionCompletionTargetView {
   label: string
   achieved: AchievedCompletionVariants | null
+  skillAchieved: AchievedCompletionSkillVariants | null
 }
 
 /**
  * What the achieved completion Variants of a Step's completions are judged
  * from: the Navigator snapshot's Build List Entries (whose Candidate Snapshot
- * is the completion result the Step confirms) and the Master. Display only.
+ * is the completion result the Step confirms) and the Master (its rank order,
+ * and the Skill names of the completion Skill configurations). Display only.
  */
 export interface ExecutionCompletionSources {
   buildListEntries: readonly BuildListEntry[]
-  master: TargetEvaluationMasterSubset
+  master: TargetEvaluationMasterSubset & Pick<MasterDataRoot, 'seriesSkills' | 'groupSkills'>
 }
 
 export function createExecutionStepPresentation(
@@ -402,16 +409,19 @@ export function createExecutionStepPresentation(
     completionTargetLabels: (effects?.targetCompletions ?? []).map(({ targetWeaponId }) =>
       targetWeaponLabel(targetWeaponId, targetWeapons),
     ),
-    completionTargets: (effects?.targetCompletions ?? []).map(({ targetWeaponId, buildListEntryId }) => ({
-      label: targetWeaponLabel(targetWeaponId, targetWeapons),
-      achieved: completionSources === null
-        ? null
-        : describeEntryAchievedCompletionVariants(
-            completionSources.buildListEntries.find(({ id }) => id === buildListEntryId),
-            targetWeapons.find(({ id }) => id === targetWeaponId),
-            completionSources.master,
-          ),
-    })),
+    completionTargets: (effects?.targetCompletions ?? []).map(({ targetWeaponId, buildListEntryId }) => {
+      const completingEntry = completionSources?.buildListEntries.find(({ id }) => id === buildListEntryId)
+      const completedTarget = targetWeapons.find(({ id }) => id === targetWeaponId)
+      return {
+        label: targetWeaponLabel(targetWeaponId, targetWeapons),
+        achieved: completionSources === null
+          ? null
+          : describeEntryAchievedCompletionVariants(completingEntry, completedTarget, completionSources.master),
+        skillAchieved: completionSources === null
+          ? null
+          : describeEntryAchievedCompletionSkillVariants(completingEntry, completedTarget, completionSources.master),
+      }
+    }),
     normalCreation: createNormalCreationGuidance(step, target, normalCreationSources),
   }
 }

@@ -18,11 +18,11 @@ import type {
 import { DialogFormError } from '../DialogFormError'
 import { RestorationBonusSlots } from '../RestorationBonusSlots'
 import { StatusChip } from '../StatusChip'
-import { AchievedCompletionVariants } from '../target/AchievedCompletionVariants'
 import {
-  ACHIEVED_COMPLETION_VARIANTS_LABEL,
+  describeAchievedCompletionSkillVariants,
   describeAchievedCompletionVariants,
 } from '../target/completionConditionPresentation'
+import { AchievedCompletionDefinitionItems } from './AchievedCompletionDefinitionItems'
 import {
   BUILD_LIST_REPLACEMENT_CONFIRM_LABEL,
   BUILD_LIST_REPLACEMENT_CURRENT_HEADING,
@@ -105,11 +105,10 @@ function CandidateSummary({
             {groupSkillLabel(candidate.groupSkillId, master)}
           </SearchDefinitionItem>
           {/* Both candidates are judged against the Target as it is now (`docs/REQUIREMENTS.md` 13.2). */}
-          <SearchDefinitionItem label={ACHIEVED_COMPLETION_VARIANTS_LABEL}>
-            <AchievedCompletionVariants
-              achieved={describeAchievedCompletionVariants(target, candidate.finalBonuses, candidate.restorationBonusScope, master)}
-            />
-          </SearchDefinitionItem>
+          <AchievedCompletionDefinitionItems
+            achieved={describeAchievedCompletionVariants(target, candidate.finalBonuses, candidate.restorationBonusScope, master)}
+            skill={describeAchievedCompletionSkillVariants(target, candidate.seriesSkillId, candidate.groupSkillId, master)}
+          />
           <SearchDefinitionItem label="操作回数">
             <span className="tabular-nums">{candidate.estimatedOperationCount}回</span>
           </SearchDefinitionItem>

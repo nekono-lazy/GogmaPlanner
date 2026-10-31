@@ -175,7 +175,7 @@ function PlannedCompletionVariantsItem({ row, master }: { row: PlannedCompletion
               {row.target.weaponLabel}
             </Typography>
           )}
-          <AchievedCompletionVariants achieved={row.achieved} layout="line" component="span" />
+          <AchievedCompletionVariants achieved={row.achieved} skill={row.skillAchieved} layout="line" component="span" />
         </Stack>
       }
     >

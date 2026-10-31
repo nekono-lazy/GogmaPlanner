@@ -27,10 +27,10 @@ import type {
   MaterialRequirement,
   OwnedWeapon,
   RouteOperation,
-  SkillCondition,
   TargetWeapon,
 } from './entities'
 import { completionConditionReviewReasons } from './common'
+import { findCompletionSkillVariantConflicts } from './completionSkillVariantIdentity'
 import type {
   LegacyAlternativeBonusRule,
   LegacyPracticalBonusCondition,
@@ -455,20 +455,60 @@ function validateSkillConditionIds(
   }
 }
 
-/** A completion Skill condition (`docs/DATA_MODEL.md` 8.4): `matchMode` is `all` only. */
-function validateSkillCondition(
-  condition: SkillCondition,
-  path: string,
-  issues: DomainValidationIssue[],
-) {
-  if (!isPlainObject(condition)) {
-    addIssue(issues, path, 'invalid_structure', 'Skill condition must be an object.')
+/**
+ * Structural validation of the completion Skill configurations
+ * (`docs/DATA_MODEL.md` 8.4, Issue #367): one or more configurations, each with
+ * a non-empty editing `id` unique in the Target and a Series / Group Skill that
+ * is `null` or an ID, and no former `matchMode` field (AND inside a
+ * configuration is structural; `any` and `all` no longer exist). Duplicate and
+ * included configurations - an unspecified side includes a specified one - are
+ * refused through `findCompletionSkillVariantConflicts()`, the authority the
+ * editor shows. No Master is read, and no configuration count cap exists.
+ */
+function validateCompletionSkillVariants(variants: unknown, issues: DomainValidationIssue[]) {
+  if (!Array.isArray(variants) || variants.length === 0) {
+    addIssue(issues, 'completionSkillVariants', 'invalid_structure', '完成スキル構成を1件以上設定してください。')
     return
   }
-  if (condition.matchMode !== 'all') {
-    addIssue(issues, `${path}.matchMode`, 'invalid_literal', '完成スキル条件の一致方法は「すべて満たす（all）」だけです。')
-  }
-  validateSkillConditionIds(condition, path, issues)
+  const seenIds = new Set<string>()
+  let variantsValid = true
+  variants.forEach((variant: unknown, index) => {
+    const path = `completionSkillVariants[${index}]`
+    if (!isPlainObject(variant)) {
+      addIssue(issues, path, 'invalid_structure', '完成スキル構成の形式が不正です。')
+      variantsValid = false
+      return
+    }
+    if (!isNonEmptyString(variant.id)) {
+      addIssue(issues, `${path}.id`, 'invalid_id', '完成スキル構成のIDが不正です。')
+    } else if (seenIds.has(variant.id)) {
+      addIssue(issues, `${path}.id`, 'invalid_id', '完成スキル構成のIDが重複しています。')
+    } else {
+      seenIds.add(variant.id)
+    }
+    if ('matchMode' in variant) {
+      addIssue(issues, `${path}.matchMode`, 'invalid_structure', '完成スキル構成は一致方法（matchMode）を持ちません（指定したスキルはすべて一致が必要です）。')
+    }
+    const before = issues.length
+    for (const field of ['seriesSkillId', 'groupSkillId'] as const) {
+      if (!(field in variant) || (variant[field] !== null && typeof variant[field] !== 'string')) {
+        addIssue(issues, `${path}.${field}`, 'invalid_structure', `${field} must be null or an ID.`)
+      }
+    }
+    if (issues.length === before) validateSkillConditionIds(variant as { seriesSkillId: unknown; groupSkillId: unknown }, path, issues)
+    if (issues.length !== before) variantsValid = false
+  })
+  if (!variantsValid) return
+  findCompletionSkillVariantConflicts(variants as { seriesSkillId: string | null; groupSkillId: string | null }[]).forEach(({ index, kind, otherIndex }) => {
+    addIssue(
+      issues,
+      `completionSkillVariants[${index}]`,
+      'invalid_structure',
+      kind === 'duplicate'
+        ? `完成スキル構成${index + 1}は完成スキル構成${otherIndex + 1}と同じ内容です。`
+        : `完成スキル構成${index + 1}は完成スキル構成${otherIndex + 1}に含まれます（「指定なし」の項目は、その項目を指定した構成を含みます）。`,
+    )
+  })
 }
 
 /** A legacy Skill condition, where `any` still existed (migration input only). */
@@ -658,10 +698,11 @@ function validateCompletionConditionReview(review: unknown, issues: DomainValida
 
 /**
  * Structural validation of a TargetWeapon (`docs/DATA_MODEL.md` 8): identity,
- * priority, lifecycle, the completion Variants, the completion Skill condition
- * (`all` only) and the review reasons. A body still carrying a legacy field
+ * priority, lifecycle, the completion Variants, the completion Skill
+ * configurations (8.4) and the review reasons. A body still carrying a legacy field
  * (`idealBonuses`, the compromise conditions, `compromiseNeedsReview`) is not a
- * current body and is refused rather than read. A non-empty review list is
+ * current body and is refused rather than read, and so is a body still
+ * carrying the schema 16 `completionSkillCondition` (Issue #367). A non-empty review list is
  * still a valid Target: valid and calculable are separate concepts (8.6).
  */
 export function validateTargetWeapon(
@@ -677,8 +718,11 @@ export function validateTargetWeapon(
   if (hasLegacyTargetWeaponField(target as unknown as Record<string, unknown>)) {
     addIssue(issues, '', 'invalid_structure', '旧形式の目標武器（理想5枠・妥協条件）は移行が必要です。')
   }
+  if ('completionSkillCondition' in target) {
+    addIssue(issues, 'completionSkillCondition', 'invalid_structure', '旧形式の完成スキル条件（1組）は移行が必要です。')
+  }
   validateCompletionBonusVariants(target.completionBonusVariants, issues)
-  validateSkillCondition(target.completionSkillCondition, 'completionSkillCondition', issues)
+  validateCompletionSkillVariants(target.completionSkillVariants, issues)
   validateCompletionConditionReview(target.completionConditionReview, issues)
   return result(issues)
 }

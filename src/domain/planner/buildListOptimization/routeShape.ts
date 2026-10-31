@@ -124,7 +124,7 @@ function rowOf(option: ReachOption, table: Pick<ReachTable, 'targets'>) {
 
 /**
  * The conversion continuation of one option, or null: a `conversion (c, s*)` with `c < s*` whose conversion position `c` is one of
- * the Target's Ideal Skill positions in the ReachTable (the same `evaluateSkillCondition()` judgement the Search's lane-start check
+ * the Target's Ideal Skill positions in the ReachTable (the same `satisfiesCompletionSkills()` judgement the Search's lane-start check
  * reads; conversion and Reset Skills draw the same Skills at one position). Decided from the ReachTable alone: no prediction, no
  * Search, no reservation.
  */
@@ -138,7 +138,7 @@ export function conversionSkillContinuationShapeOf(option: ReachOption, table: P
 /**
  * The owned-Gogma current-Ideal lane continuation of one option, or null. The source's current Skills / Bonuses (its Route base's
  * lane start) are Ideal for the Target - the ReachTable's `currentSkillIdeal` / `currentBonusIdeal`, judged by the same
- * `evaluateSkillCondition()` / `satisfiesCompletionBonuses()` the Search's lane-start check reads - and the option still operates that
+ * `satisfiesCompletionSkills()` / `satisfiesCompletionBonuses()` the Search's lane-start check reads - and the option still operates that
  * lane (`reset_skills`; `reset`, `keep_from_source` or `reset_then_keep`). Decided from the option and its row alone.
  */
 export function ownedGogmaContinuationShapeOf(option: ReachOption, table: Pick<ReachTable, 'targets'>): OwnedGogmaContinuationShape | null {

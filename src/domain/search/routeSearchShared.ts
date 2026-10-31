@@ -16,7 +16,7 @@ import type {
   TargetWeaponId,
 } from '../models/publicTypes'
 import type { RngEngine, RngPredictionUnsupportedReason } from '../rng/rngEngine'
-import { evaluateSkillCondition, satisfiesCompletionBonuses } from '../target'
+import { satisfiesCompletionBonuses, satisfiesCompletionSkills } from '../target'
 import { hasConfirmedGogmaInputs } from './searchRngInputs'
 import {
   nextOperationPositions,
@@ -415,8 +415,8 @@ export function partitionExcludedRouteSources<T extends { id: OwnedWeaponId }>(
 }
 
 /**
- * A Skill stream whose current Skills already satisfy the completion Skill
- * condition is finished: completion is a truth value, so no later Skill
+ * A Skill stream whose current Skills already satisfy any completion Skill
+ * configuration (`satisfiesCompletionSkills()`) is finished: completion is a truth value, so no later Skill
  * position can produce a better state (SEARCH_SPEC 5.6.1). Only the Skill stream
  * stops; the Bonus stream is unaffected.
  */
@@ -425,8 +425,8 @@ export function skillsSatisfyIdeal(
   seriesSkillId: SeriesSkillId | null,
   groupSkillId: GroupSkillId | null,
 ): boolean {
-  return evaluateSkillCondition(
-    context.target.completionSkillCondition,
+  return satisfiesCompletionSkills(
+    context.target,
     seriesSkillId,
     groupSkillId,
   )

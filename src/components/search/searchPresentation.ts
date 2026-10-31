@@ -3,7 +3,7 @@ import type {
   RestorationBonus,
   SkillCondition,
 } from '../../domain/models/publicTypes'
-import { skillMatchModeLabels } from '../../presentation/labels'
+import { SKILL_CONDITION_ALL_MATCH_LABEL } from '../../presentation/labels'
 export {
   getRouteOperationLabel as operationLabel,
   routeKindLabels,
@@ -87,7 +87,7 @@ export function skillConditionSummary(
   ].filter((part): part is string => part !== null)
   if (parts.length === 0) return '指定なし'
   return parts.length > 1
-    ? `${parts.join(' ／ ')}（${skillMatchModeLabels[condition.matchMode]}）`
+    ? `${parts.join(' ／ ')}（${SKILL_CONDITION_ALL_MATCH_LABEL}）`
     : parts[0]!
 }
 

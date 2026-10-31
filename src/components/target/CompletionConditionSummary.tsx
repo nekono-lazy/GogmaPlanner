@@ -9,6 +9,7 @@ import {
   COMPLETION_CONDITION_REVIEW_CHIP_LABEL,
   COMPLETION_CONDITION_REVIEW_LIST_HINT,
   completionConditionReviewReasonLabels,
+  completionSkillVariantHeading,
   completionVariantHeading,
   minimumRankSlotLabel,
 } from './completionConditionPresentation'
@@ -16,11 +17,12 @@ import {
 /**
  * The completion condition of one Target as a list shows it (`docs/UI_FLOW.md`
  * 8): how many Variants there are, every Variant's five slots with their
- * minimum ranks (each slot read as 「… III以上」, the highest rank as 「… EX」), and the completion Skill
- * condition. Display only.
+ * minimum ranks (each slot read as 「… III以上」, the highest rank as 「… EX」), and every completion Skill
+ * configuration (Issue #367): one reads as the former single condition, two or more are counted, named and
+ * said to complete with any one. No configuration is ever left out. Display only.
  */
 export function CompletionConditionSummary({ target, master }: {
-  target: Pick<TargetWeapon, 'weaponTypeId' | 'completionBonusVariants' | 'completionSkillCondition'>
+  target: Pick<TargetWeapon, 'weaponTypeId' | 'completionBonusVariants' | 'completionSkillVariants'>
   master: MasterDataRoot
 }) {
   const count = target.completionBonusVariants.length
@@ -43,9 +45,24 @@ export function CompletionConditionSummary({ target, master }: {
           formatLabel={(label, bonusRankId) => minimumRankSlotLabel(label, bonusRankId, master)}
         />
       ))}
-      <Typography variant="body2" sx={{ overflowWrap: 'anywhere' }}>
-        完成スキル: {skillConditionSummary(target.completionSkillCondition, master)}
-      </Typography>
+      {target.completionSkillVariants.length === 1 ? (
+        <Typography variant="body2" sx={{ overflowWrap: 'anywhere' }}>
+          完成スキル: {skillConditionSummary(target.completionSkillVariants[0]!, master)}
+        </Typography>
+      ) : (
+        <Stack spacing={0.25}>
+          <Typography variant="body2" color="text.secondary">
+            完成スキル構成 {target.completionSkillVariants.length}件（いずれかを満たせば完成）
+          </Typography>
+          <Box component="ul" sx={{ m: 0, pl: 2.5 }}>
+            {target.completionSkillVariants.map((variant, index) => (
+              <Typography component="li" key={variant.id} variant="body2" sx={{ overflowWrap: 'anywhere' }}>
+                {completionSkillVariantHeading(index)}: {skillConditionSummary(variant, master)}
+              </Typography>
+            ))}
+          </Box>
+        </Stack>
+      )}
     </Stack>
   )
 }

@@ -3,7 +3,6 @@ import type {
   BonusTypeId,
   CompletionBonusVariant,
   RestorationBonusSet,
-  SkillCondition,
   TargetWeapon,
 } from '../models/publicTypes'
 import {
@@ -12,6 +11,7 @@ import {
   completionBonusVariantKey,
   satisfiesVariant,
 } from './completionCondition'
+import { completionSkillVariantKey, completionSkillVariantsCompatible } from './completionSkillVariants'
 import type { TargetEvaluationMasterSubset } from './targetEvaluationTypes'
 
 /**
@@ -19,7 +19,8 @@ import type { TargetEvaluationMasterSubset } from './targetEvaluationTypes'
  * (`docs/DATA_MODEL.md` 8.8, Issue #338).
  *
  * - `identical`: the same weapon type and element, the same set of normalized
- *   completion Variants and the same completion Skill condition
+ *   completion Variants and the same set of normalized completion Skill
+ *   configurations (Issue #367)
  * - `overlapping`: not `identical`, but one weapon state (five `gogma_artian`
  *   slots and Series / Group Skills) can meet both completion conditions
  * - `disjoint`: neither
@@ -33,23 +34,29 @@ export type TargetCompletionOverlap = 'identical' | 'overlapping' | 'disjoint'
 /** The part of a Target the classification reads; nothing else of the Target matters. */
 export type TargetCompletionDefinition = Pick<
   TargetWeapon,
-  'weaponTypeId' | 'elementId' | 'completionBonusVariants' | 'completionSkillCondition'
+  'weaponTypeId' | 'elementId' | 'completionBonusVariants' | 'completionSkillVariants'
 >
-
-type CompletionSkillDefinition = Pick<SkillCondition, 'seriesSkillId' | 'groupSkillId'>
 
 function compareCodeUnits(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0
 }
 
-/** Series and Group are compatible when either side does not specify one (`null`) or both name the same ID. */
-function skillConditionsCompatible(left: CompletionSkillDefinition, right: CompletionSkillDefinition): boolean {
-  const compatible = <T>(a: T | null, b: T | null) => a === null || b === null || a === b
-  return compatible(left.seriesSkillId, right.seriesSkillId) && compatible(left.groupSkillId, right.groupSkillId)
+/**
+ * The completion Skill sides can hold together (`docs/DATA_MODEL.md` 8.8 rule
+ * 2): some configuration of one and some configuration of the other are
+ * compatible - each Skill unspecified (`null`) on either one or the same ID on
+ * both.
+ */
+function skillVariantsCompatible(
+  left: TargetCompletionDefinition['completionSkillVariants'],
+  right: TargetCompletionDefinition['completionSkillVariants'],
+): boolean {
+  return left.some((a) => right.some((b) => completionSkillVariantsCompatible(a, b)))
 }
 
-function skillConditionsEqual(left: CompletionSkillDefinition, right: CompletionSkillDefinition): boolean {
-  return left.seriesSkillId === right.seriesSkillId && left.groupSkillId === right.groupSkillId
+/** The normalized Skill configurations as a set: configuration order, `id` and a repeated configuration never matter. */
+function normalizedSkillKeySet(variants: TargetCompletionDefinition['completionSkillVariants']): Set<string> {
+  return new Set(variants.map((variant) => completionSkillVariantKey(variant)))
 }
 
 /** The normalized Variants as a set: Variant order, `id` and a repeated Variant never matter. */
@@ -113,9 +120,9 @@ function commonCompletionBonuses(
 /**
  * `classifyTargetCompletionOverlap(a, b, master)` (`docs/DATA_MODEL.md` 8.8):
  * the one authority of the Target registration confirmation. It reads the
- * weapon type, element, completion Variants and completion Skill condition
- * only - never the name, memo, priority, enablement, lifecycle, preferred
- * owned weapon, completion assignment, Variant order or Variant `id` - and
+ * weapon type, element, completion Variants and completion Skill
+ * configurations only - never the name, memo, priority, enablement, lifecycle, preferred
+ * owned weapon, completion assignment, Variant / configuration order or `id` - and
  * judges the definitions alone, never whether the RNG can produce the common
  * state. An unknown Bonus Rank reference raises the Master Domain Error.
  */
@@ -128,12 +135,12 @@ export function classifyTargetCompletionOverlap(
   assertCompletionVariantRankReferences(a.completionBonusVariants, master)
   assertCompletionVariantRankReferences(b.completionBonusVariants, master)
   if (
-    skillConditionsEqual(a.completionSkillCondition, b.completionSkillCondition) &&
+    sameKeySet(normalizedSkillKeySet(a.completionSkillVariants), normalizedSkillKeySet(b.completionSkillVariants)) &&
     sameKeySet(normalizedVariantKeySet(a.completionBonusVariants), normalizedVariantKeySet(b.completionBonusVariants))
   ) {
     return 'identical'
   }
-  if (!skillConditionsCompatible(a.completionSkillCondition, b.completionSkillCondition)) return 'disjoint'
+  if (!skillVariantsCompatible(a.completionSkillVariants, b.completionSkillVariants)) return 'disjoint'
   const overlaps = a.completionBonusVariants.some((left) =>
     b.completionBonusVariants.some((right) => commonCompletionBonuses(left, right, master) !== null),
   )

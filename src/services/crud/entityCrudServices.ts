@@ -405,14 +405,26 @@ export function targetWeaponSaveMutation(
   }
 }
 
-/** One TargetWeapon delete as a guarded mutation, under the existing reference protection. */
+/**
+ * One TargetWeapon delete as a guarded mutation (Issue #371, `docs/DATA_MODEL.md`
+ * 9.1). A Build List Entry or a ProductionPlan referencing the Target still
+ * refuses the delete (`ReferencedEntityDeleteError`) and is never deleted for
+ * it. The Target's saved Search results - every BuildCandidate the reference
+ * search finds for it, and no other - are deleted with it in the same
+ * transaction instead: no screen deletes a Candidate on its own, and a Candidate
+ * of a deleted Target would be a broken reference. The inspection and the
+ * delete run this one mutation, so both apply the same policy.
+ */
 export function targetWeaponDeleteMutation(id: TargetWeaponId): PlanGuardedMutation<void> {
   return (base) => {
     const references = findTargetWeaponReferencesIn(base, id)
-    if (references.length) throw new ReferencedEntityDeleteError(references)
+    const blocking = references.filter(({ kind }) => kind !== 'build_candidate')
+    if (blocking.length) throw new ReferencedEntityDeleteError(blocking)
+    const candidateIds = new Set(references.map(({ entityId }) => entityId))
     return {
       result: undefined,
       state: { ...unchangedMutableState(base), targetWeapons: base.targetWeapons.filter((target) => target.id !== id) },
+      deletedBuildCandidateIds: base.buildCandidates.filter((candidate) => candidateIds.has(candidate.id)).map(({ id: candidateId }) => candidateId),
     }
   }
 }

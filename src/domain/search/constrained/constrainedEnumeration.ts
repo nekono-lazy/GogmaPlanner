@@ -4,7 +4,7 @@ import type {
 } from '../../models/publicTypes'
 import { isBlindCreateNormalArtianOperation } from '../../models/publicTypes'
 import type { RngEngine } from '../../rng/rngEngine'
-import { evaluateSkillCondition, satisfiesCompletionBonuses } from '../../target'
+import { satisfiesCompletionBonuses, satisfiesCompletionSkills } from '../../target'
 import { createTargetBonusStream } from '../bonusStream'
 import { countRouteOperationUnits } from '../candidateFactory'
 import { createSearchPredictionSupport } from '../searchPredictionSupport'
@@ -206,8 +206,8 @@ export async function visitConstrainedCandidates(
     bonusesSatisfyIdeal: (bonuses, scope) =>
       satisfiesCompletionBonuses(target, bonuses, scope, origin.master),
     skillsSatisfyIdeal: (seriesSkillId, groupSkillId) =>
-      evaluateSkillCondition(
-        target.completionSkillCondition,
+      satisfiesCompletionSkills(
+        target,
         seriesSkillId,
         groupSkillId,
       ),

@@ -14,7 +14,10 @@ import {
   fillTargetWeaponCompletionAssignment,
   fillTargetWeaponListCompletionAssignment,
   isDraftProductionPlanRecord,
+  migrateTargetWeaponCompletionSkillVariants,
+  migrateTargetWeaponListCompletionSkillVariants,
   TargetCompletionAssignmentMigrationError,
+  TargetCompletionSkillVariantsMigrationError,
   upgradeAppSettingsToV2,
 } from '../domain/models/persistenceCompatibility'
 import type {
@@ -32,7 +35,7 @@ import type {
 } from '../domain/models/publicTypes'
 
 export const DATABASE_NAME = 'mh-wilds-gogma-artian-planner'
-export const DATABASE_SCHEMA_VERSION = 13
+export const DATABASE_SCHEMA_VERSION = 14
 
 export class AppDatabase extends Dexie {
   rngState!: Table<RngState, 'current'>
@@ -335,8 +338,49 @@ export class AppDatabase extends Dexie {
     // and `CURRENT_CALCULATION_APP_SCHEMA_VERSION` stays where it is. A body that
     // already carries the field is not a version 12 body: it throws, which
     // aborts the whole upgrade and leaves the database at version 12 for a retry.
-    this.version(DATABASE_SCHEMA_VERSION).stores({}).upgrade(upgradeTargetWeaponsToV13)
+    this.version(13).stores({}).upgrade(upgradeTargetWeaponsToV13)
+    // v14 moves every TargetWeapon body to the completion Skill configurations
+    // (Issue #367, `docs/DATA_MODEL.md` 8.4 / 14.2, `docs/PLANNER_SPEC.md` 22.7):
+    // the `targetWeapons` table, the Target bodies of every game save point, of
+    // every Undo body and of the save point an Undo body holds as
+    // `deletedExecutionSavePoint` turn their one `completionSkillCondition` into
+    // one configuration with the same Series / Group IDs, through the one
+    // conversion the Export schema 16 -> 17 migration shares. Lossless: no review
+    // reason is added and every other field keeps its value. No table or index
+    // changes (no Target index holds a performance definition), and no
+    // BuildCandidate, BuildListEntry, ProductionPlan or ExecutionHistory metadata
+    // body is rewritten; a version 10 record the version 11 upgrade kept (case 2)
+    // is left exactly as persisted. One configuration hashes exactly as the former
+    // condition did (`createTargetDefinitionHash()`), so no Entry goes stale, no
+    // running Plan stops and `CURRENT_CALCULATION_APP_SCHEMA_VERSION` stays where
+    // it is. A body that already carries the configurations, has no condition or
+    // a condition other than `matchMode: "all"` is not a version 13 body: it
+    // throws, which aborts the whole upgrade and leaves the database at version
+    // 13 for a retry.
+    this.version(DATABASE_SCHEMA_VERSION).stores({}).upgrade(upgradeTargetWeaponsToV14)
   }
+}
+
+async function upgradeTargetWeaponsToV14(transaction: Transaction): Promise<void> {
+  await transaction.table('targetWeapons').toCollection().modify((target: Record<string, unknown>) => {
+    migrateTargetWeaponCompletionSkillVariants(target, `targetWeapons[${String(target.id)}]`)
+  })
+  await transaction.table('executionSavePoints').toCollection().modify((savePoint: Record<string, unknown>) => {
+    migrateTargetWeaponListCompletionSkillVariants(
+      savePoint.targetWeapons,
+      `executionSavePoints[${String(savePoint.id)}].targetWeapons`,
+    )
+  })
+  await transaction.table('executionUndoSnapshots').toCollection().modify((snapshot: Record<string, unknown>) => {
+    const path = `executionUndoSnapshots[${String(snapshot.executionHistoryId)}]`
+    migrateTargetWeaponListCompletionSkillVariants(snapshot.affectedTargetWeaponsBefore, `${path}.affectedTargetWeaponsBefore`)
+    const deleted = snapshot.deletedExecutionSavePoint
+    if (deleted === null || deleted === undefined) return
+    if (!isPlainRecord(deleted)) {
+      throw new TargetCompletionSkillVariantsMigrationError(`${path}.deletedExecutionSavePoint`, 'A deleted save point must be an object or null.')
+    }
+    migrateTargetWeaponListCompletionSkillVariants(deleted.targetWeapons, `${path}.deletedExecutionSavePoint.targetWeapons`)
+  })
 }
 
 async function upgradeTargetWeaponsToV13(transaction: Transaction): Promise<void> {

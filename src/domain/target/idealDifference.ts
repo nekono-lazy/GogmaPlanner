@@ -6,6 +6,7 @@ import type {
   TargetWeapon,
 } from '../models/publicTypes'
 import { selectClosestVariant } from './completionCondition'
+import { selectClosestCompletionSkillVariant } from './completionSkillVariants'
 import type { TargetEvaluationMasterSubset } from './targetEvaluationTypes'
 
 /** The Bonus half of `IdealDifference`, decomposed per SEARCH_SPEC 5.4. */
@@ -40,11 +41,14 @@ export function createBonusIdealDifference(
 
 /**
  * The display-only difference between one concrete state and the Target's
- * completion condition (`docs/DATA_MODEL.md` 9.3). It never takes part in
+ * completion condition (`docs/DATA_MODEL.md` 9.3). The Skill side is measured
+ * against the closest completion Skill configuration
+ * (`selectClosestCompletionSkillVariant()`), so a state satisfying any
+ * configuration reads both Skills as matching. It never takes part in
  * acceptance, ordering, identity or hashing.
  */
 export function createIdealDifference(
-  target: Pick<TargetWeapon, 'completionBonusVariants' | 'completionSkillCondition'>,
+  target: Pick<TargetWeapon, 'completionBonusVariants' | 'completionSkillVariants'>,
   finalBonuses: readonly RestorationBonus[],
   seriesSkillId: SeriesSkillId | null,
   groupSkillId: GroupSkillId | null,
@@ -52,12 +56,15 @@ export function createIdealDifference(
 ): IdealDifference {
   const bonusDifference = createBonusIdealDifference(target, finalBonuses, master)
   const matchedBonusCount = bonusDifference.matchedBonusCount
+  const closestSkill = selectClosestCompletionSkillVariant(target.completionSkillVariants, seriesSkillId, groupSkillId)?.variant ?? null
   const seriesSkillMatches =
-    target.completionSkillCondition.seriesSkillId === null ||
-    target.completionSkillCondition.seriesSkillId === seriesSkillId
+    closestSkill === null ||
+    closestSkill.seriesSkillId === null ||
+    closestSkill.seriesSkillId === seriesSkillId
   const groupSkillMatches =
-    target.completionSkillCondition.groupSkillId === null ||
-    target.completionSkillCondition.groupSkillId === groupSkillId
+    closestSkill === null ||
+    closestSkill.groupSkillId === null ||
+    closestSkill.groupSkillId === groupSkillId
 
   return {
     missingBonuses: bonusDifference.missingBonuses,

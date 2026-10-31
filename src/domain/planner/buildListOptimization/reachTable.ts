@@ -7,7 +7,7 @@
  * which the Production RNG reaches the Target's Ideal, per stream and per source. Only the given
  * `RngEngine`'s public prediction API, `getPredictionSupport()`, the Keep family authority
  * (`keepFamilyLayoutKey()` / `completionVariantKeepFamilyMultisetKeys()`) and the Target evaluators
- * (`satisfiesCompletionBonuses()` / `evaluateSkillCondition()`) are read. No weight, Counter advance, Gate or
+ * (`satisfiesCompletionBonuses()` / `satisfiesCompletionSkills()`) are read. No weight, Counter advance, Gate or
  * game rule is computed here, no Route is built, and nothing outside the window is recorded as absent.
  *
  * Predictions are shared between Targets of one weapon type / element through a memo
@@ -30,7 +30,7 @@ import type { BuildListEntryId, ElementId, OwnedWeapon, OwnedWeaponId, Restorati
 import type { PlannerInput } from '../plannerTypes'
 import { completionVariantKeepFamilyMultisetKeys, keepFamilyLayoutKey } from '../../rng/gogmaBonusFamily'
 import type { NormalizedSeed, RngEngine, RngPredictionSupportInput } from '../../rng/rngEngine'
-import { evaluateSkillCondition } from '../../target/skillConditionEvaluator'
+import { satisfiesCompletionSkills } from '../../target/completionSkillVariants'
 import { collectCompletionAssignedOwnedWeaponIds, isCompletionAssignedElsewhere } from '../../target/completionAssignment'
 import { createCompletionBonusMatcher } from '../../target/completionCondition'
 import type { BuildListOptimizationUnsupportedReason } from './buildListOptimizationResult'
@@ -119,7 +119,7 @@ function classifyOwnedSource(
     if (weapon.isProtected) return { kind: 'excluded', reason: 'protected_normal' }
     return { kind: 'source', gogma: null }
   }
-  const currentSkillIdeal = evaluateSkillCondition(target.completionSkillCondition, weapon.seriesSkillId, weapon.groupSkillId)
+  const currentSkillIdeal = satisfiesCompletionSkills(target, weapon.seriesSkillId, weapon.groupSkillId)
   const currentBonusIdeal = createCompletionBonusMatcher(target, master).satisfies(weapon.restorationBonuses, weapon.restorationBonusScope)
   if (weapon.isProtected && !(currentSkillIdeal && currentBonusIdeal)) return { kind: 'excluded', reason: 'protected_gogma_not_ideal' }
   return { kind: 'source', gogma: { currentSkillIdeal, currentBonusIdeal } }
@@ -415,7 +415,8 @@ export async function buildReachTable(context: BuildListOptimizationContext, eng
 
         const idealPositions: number[] = []
         for (const [position, result] of skills) {
-          if (evaluateSkillCondition(target.completionSkillCondition, result.seriesSkillId, result.groupSkillId)) idealPositions.push(position)
+          // The union over every completion Skill configuration (`docs/PLANNER_SPEC.md` 22.5): one prediction per position, ID comparison only.
+          if (satisfiesCompletionSkills(target, result.seriesSkillId, result.groupSkillId)) idealPositions.push(position)
         }
         const resetIdealPositions: number[] = []
         const resetLayoutByPosition = new Map<number, LayoutKey>()

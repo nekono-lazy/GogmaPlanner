@@ -4,7 +4,7 @@ import type {
   RouteOperation,
   SkillAmendmentResult,
 } from '../models/publicTypes'
-import { createCompletionBonusMatcher, evaluateSkillCondition } from '../target'
+import { createCompletionBonusMatcher, satisfiesCompletionSkills } from '../target'
 import {
   bonusAmendmentOperations, bonusAmendmentResults, bonusStreamBaseKey,
   type BonusStreamBase, type UnsupportedAmendmentPrediction,
@@ -430,8 +430,8 @@ export class TargetSearchScheduler {
           const reserved = await this.context.skillStream.readReservedDepth(start, depth)
           runtime?.({ type: 'section_completed', section: 'skill_depth_read' })
           runtime?.({ type: 'section_started', section: 'skill_ideal_filter' })
-          const ideal = reserved.solutions.filter((solution) => evaluateSkillCondition(
-            this.context.target.completionSkillCondition, solution.seriesSkillId, solution.groupSkillId,
+          const ideal = reserved.solutions.filter((solution) => satisfiesCompletionSkills(
+            this.context.target, solution.seriesSkillId, solution.groupSkillId,
           ))
           runtime?.({ type: 'section_completed', section: 'skill_ideal_filter' })
           runtime?.({ type: 'section_started', section: 'skill_route_materialization' })

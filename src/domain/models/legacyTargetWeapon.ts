@@ -49,7 +49,7 @@ export interface LegacySkillCondition {
 export interface LegacyTargetWeapon
   extends Omit<
     TargetWeapon,
-    'completionBonusVariants' | 'completionSkillCondition' | 'completionConditionReview' | 'completedWithOwnedWeaponId'
+    'completionBonusVariants' | 'completionSkillVariants' | 'completionConditionReview' | 'completedWithOwnedWeaponId'
   > {
   idealBonuses: RestorationBonusSet
   practicalBonusConditions: LegacyPracticalBonusCondition[]
@@ -69,10 +69,15 @@ export const LEGACY_TARGET_WEAPON_FIELDS = [
   'compromiseNeedsReview',
 ] as const
 
-/** The fields only a current (Issue #100) Target body carries. */
+/**
+ * The fields only an Issue #100 Target body carries: the completion condition
+ * of Dexie 12..13 / Export 15..16 (`completionSkillCondition`) and of Dexie 14 /
+ * Export 17 (`completionSkillVariants`, Issue #367). A legacy body holds none.
+ */
 export const COMPLETION_CONDITION_TARGET_WEAPON_FIELDS = [
   'completionBonusVariants',
   'completionSkillCondition',
+  'completionSkillVariants',
   'completionConditionReview',
 ] as const
 

@@ -75,7 +75,7 @@ import {
   isEligiblePreferredOwnedWeapon,
   type TargetCompletionOverlapConfirmation,
 } from '../domain/target'
-import { SkillConditionEditor } from '../components/forms/SkillConditionEditor'
+import { CompletionSkillVariantsEditor } from '../components/forms/CompletionSkillVariantsEditor'
 import { MasterDataStatusAlert } from '../components/MasterDataStatusAlert'
 import { loadMasterData } from '../domain/master/loadMasterData'
 import {
@@ -277,13 +277,42 @@ export interface TargetWeaponsPageDependencies extends OwnedIdealCompletionApi {
   replanGuidance: RunningPlanReplanGuidanceReader
 }
 
+/**
+ * Why a Target cannot be deleted and what the user does to release it (Issue
+ * #371, `docs/UI_FLOW.md` 8). Saved Search results never refuse a delete - they
+ * are deleted with the Target - so a refusal names the Build List and the
+ * ProductionPlans by what releases them. The references carry no Plan status,
+ * so a Draft deletion is offered only as a condition, never as a sure way out.
+ */
 function deleteReferenceMessage(error: ReferencedEntityDeleteError) {
-  return `参照中のため削除できません: ${error.references
-    .map(
-      (reference) =>
-        `${getPersistenceReferenceKindLabel(reference.kind)}（${reference.entityId}）`,
+  const inBuildList = error.references.some(({ kind }) => kind === 'build_list_entry')
+  const inPlan = error.references.some(({ kind }) => kind === 'production_plan')
+  const others = error.references.filter(({ kind }) => kind !== 'build_list_entry' && kind !== 'production_plan')
+  const sentences: string[] = []
+  if (inBuildList || inPlan) {
+    sentences.push(
+      inBuildList && inPlan
+        ? 'この目標武器はビルドリストに登録され、生産計画でも使用されているため削除できません。'
+        : inBuildList
+          ? 'この目標武器はビルドリストに登録されているため削除できません。'
+          : 'この目標武器は生産計画で使用されているため削除できません。',
     )
-    .join(' / ')}`
+  }
+  if (inBuildList) sentences.push('「ビルドリスト」画面で、この目標武器の候補を削除してください。')
+  if (inPlan) {
+    sentences.push('「生産計画」画面で生産計画の状態を確認してください。未開始の下書きであれば、その下書きを削除すると参照を解除できます。')
+  }
+  if (others.length > 0) {
+    sentences.push(`参照中のため削除できません: ${others
+      .map((reference) => `${getPersistenceReferenceKindLabel(reference.kind)}（${reference.entityId}）`)
+      .join(' / ')}`)
+  }
+  return sentences.length > 0 ? sentences.join('') : '参照中のため削除できません。'
+}
+
+/** The delete confirmation (Issue #371): what goes with the Target and what never does. */
+function deleteTargetConfirmation(target: TargetWeapon): string {
+  return `${target.name}を削除しますか？\n\nこの目標武器の保存済みの検索候補も削除されます。ビルドリストと生産計画は自動では削除されません。`
 }
 
 export function TargetWeaponsPage({
@@ -623,7 +652,7 @@ export function TargetWeaponsPage({
   }
 
   const remove = async (target: TargetWeapon) => {
-    if (!api || planGuard.busy || !window.confirm(`${target.name}を削除しますか？`)) return
+    if (!api || planGuard.busy || !window.confirm(deleteTargetConfirmation(target))) return
     try {
       // The existing reference protection refuses inside the inspection, so a
       // referenced Target is reported as before and never warned about.
@@ -1230,13 +1259,15 @@ export function TargetWeaponsPage({
                       : null
                   }
                 />
-                <SkillConditionEditor
-                  label="完成スキル条件"
+                <CompletionSkillVariantsEditor
                   master={master}
-                  value={draft.completionSkillCondition}
-                  onChange={(completionSkillCondition) =>
-                    setDraft({ ...draft, completionSkillCondition })
-                  }
+                  value={draft.completionSkillVariants}
+                  onChange={(completionSkillVariants) => {
+                    setDraft({ ...draft, completionSkillVariants })
+                    // A save error names configurations by their former numbers.
+                    setFormError(null)
+                  }}
+                  createVariantId={() => crypto.randomUUID()}
                   reviewNote={
                     draft.completionConditionReview.includes('skill_condition_normalized')
                       ? completionConditionReviewSectionNotes.skill_condition_normalized

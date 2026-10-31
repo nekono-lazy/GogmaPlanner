@@ -61,13 +61,6 @@ export type RouteKind =
   | 'existing_gogma_reset_skills'
   | 'existing_gogma_mixed'
 /**
- * How a completion Skill condition combines its specified Series / Group
- * Skills. Only `all` exists (`docs/DATA_MODEL.md` 8.4, Issue #100): the former
- * `any` appears only as a legacy migration input and is normalized to `all`.
- */
-export type SkillMatchMode = 'all'
-export const skillMatchModes = ['all'] as const
-/**
  * Why a Target's completion condition needs the user's review
  * (`docs/DATA_MODEL.md` 8.6). A non-empty list keeps the Target out of every
  * calculation until the user explicitly saves it.

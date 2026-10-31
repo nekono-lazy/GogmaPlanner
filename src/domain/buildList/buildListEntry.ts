@@ -3,6 +3,7 @@ import type {
   BuildListEntry,
   BuildListEntryId,
   BuildRoute,
+  CompletionSkillVariant,
   GroupSkillId,
   RestorationBonus,
   RestorationBonusScope,
@@ -14,6 +15,7 @@ import type {
 import { hashStableValue, stableStringify } from '../models/hashing'
 import { isBuildResultCalculationContextCompatible } from '../models/domainRules'
 import { normalizeCompletionBonusVariants } from '../target/completionCondition'
+import { normalizeCompletionSkillVariants } from '../target/completionSkillVariants'
 
 function compareStable(left: unknown, right: unknown): number {
   const leftValue = stableStringify(left)
@@ -32,7 +34,7 @@ function normalizeBonuses(bonuses: readonly RestorationBonus[]) {
  * what it means (`docs/PLANNER_SPEC.md` 16.11, `docs/DATA_MODEL.md` 9.4).
  *
  * Only the weapon type, element, the normalized completion Variants and the
- * completion Skill condition enter. The Variants are normalized as a multiset
+ * completion Skill configurations enter (see `completionSkillDefinition()`). The Variants are normalized as a multiset
  * per Variant (slot order ignored, duplicate counts kept) and sorted, and the
  * Variant `id` is dropped, so reordering Variants or slots or renaming an `id`
  * changes nothing, while adding, removing or lowering a Variant does.
@@ -50,12 +52,34 @@ export function createTargetDefinitionHash(target: TargetWeapon): string {
     weaponTypeId: target.weaponTypeId,
     elementId: target.elementId,
     completionBonusVariants: normalizeCompletionBonusVariants(target.completionBonusVariants),
-    completionSkillCondition: {
-      seriesSkillId: target.completionSkillCondition.seriesSkillId,
-      groupSkillId: target.completionSkillCondition.groupSkillId,
-      matchMode: target.completionSkillCondition.matchMode,
-    },
+    ...completionSkillDefinition(target.completionSkillVariants),
   })
+}
+
+/**
+ * The completion Skill part of the Target definition hash (`docs/DATA_MODEL.md`
+ * 9.4, Issue #367). One configuration hashes with exactly the calculation
+ * schema 20 input, `completionSkillCondition: { seriesSkillId, groupSkillId,
+ * matchMode: "all" }` - a deliberate compatibility normalization, so every
+ * migrated Target keeps its hash, no BuildListEntry turns
+ * `target_definition_changed` and no running Plan goes stale without a
+ * calculation version change. Two or more hash as the normalized configuration
+ * set under another key, so the shapes never collide. Reordering configurations
+ * or renaming their `id` changes nothing; adding, removing or changing a
+ * configuration's Series / Group Skill changes the hash.
+ */
+function completionSkillDefinition(variants: readonly CompletionSkillVariant[]) {
+  if (variants.length === 1) {
+    const [variant] = variants
+    return {
+      completionSkillCondition: {
+        seriesSkillId: variant!.seriesSkillId,
+        groupSkillId: variant!.groupSkillId,
+        matchMode: 'all',
+      },
+    }
+  }
+  return { completionSkillVariants: normalizeCompletionSkillVariants(variants) }
 }
 
 /**

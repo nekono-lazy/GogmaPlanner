@@ -1,6 +1,7 @@
 import { createInitialRngState } from '../models/factories'
 import type {
   BuildCandidate,
+  BuildCandidateId,
   BuildListEntry,
   CalculationContext,
   ExecutionHistory,
@@ -221,6 +222,14 @@ export interface PlanGuardedMutation<R> {
   (base: PlanGuardedMutationBase): {
     state: PlanBreakingMutableState
     result: R
+    /**
+     * BuildCandidates of `base` the save deletes in the same transaction: the
+     * saved Search results of a deleted TargetWeapon (Issue #371,
+     * `docs/DATA_MODEL.md` 9.1). A Candidate is no Plan premise, so the
+     * deletion never takes part in the Plan-breaking judgement. Absent means
+     * none.
+     */
+    deletedBuildCandidateIds?: readonly BuildCandidateId[]
   }
   /**
    * The mutation reads every ExecutionHistory Undo body (the OwnedWeapon delete
@@ -316,6 +325,8 @@ export interface PlanBreakingChangeTermination {
 export interface PlanGuardedMutationWrite<R> {
   result: R
   state: PlanBreakingMutableState
+  /** The mutation's `deletedBuildCandidateIds`; empty when it deletes none. */
+  deletedBuildCandidateIds: readonly BuildCandidateId[]
   planTermination: PlanBreakingChangeTermination | null
 }
 
@@ -455,7 +466,12 @@ export function preparePlanGuardedMutation<R>(input: PlanGuardedMutationInput<R>
   const { state, approval, now } = input
   const { applied, activePlan, breaking } = evaluateApprovedMutation(input)
   if (activePlan === null || !breaking.breaksPlan) {
-    return { result: applied.result, state: applied.state, planTermination: null }
+    return {
+      result: applied.result,
+      state: applied.state,
+      deletedBuildCandidateIds: applied.deletedBuildCandidateIds ?? [],
+      planTermination: null,
+    }
   }
   if (approval === null) {
     throw new PlanBreakingChangeApprovalRequiredError(
@@ -578,6 +594,7 @@ function terminate<R>(
   return {
     result: applied.result,
     state: { ...applied.state, ownedWeapons },
+    deletedBuildCandidateIds: applied.deletedBuildCandidateIds ?? [],
     planTermination: { plan, ...handling },
   }
 }

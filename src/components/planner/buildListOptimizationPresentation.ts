@@ -31,7 +31,9 @@ import type {
 } from '../../services/planner/buildListOptimizationService'
 import type { BuildListOptimizationCancelReason } from '../../services/planner/buildListOptimizationWorkerClient'
 import {
+  describeEntryAchievedCompletionSkillVariants,
   describeEntryAchievedCompletionVariants,
+  type AchievedCompletionSkillVariants,
   type AchievedCompletionVariants,
 } from '../target/completionConditionPresentation'
 import { createProductionPlanSummary } from './productionPlanPresentation'
@@ -268,7 +270,7 @@ export const UNRESOLVED_TARGET_LABEL = '参照できない目標武器'
 
 export const PLANNED_COMPLETION_VARIANTS_TITLE = '完成予定の目標武器と達成する完成構成'
 export const PLANNED_COMPLETION_VARIANTS_DESCRIPTION =
-  '各目標武器の完成時の復元ボーナスを、試算を始めた時点の目標武器の完成構成で判定しています。複数の構成を同時に満たす場合はすべて示します（構成の番号は呼び名で、優先順位ではありません）。'
+  '各目標武器の完成時の復元ボーナスを、試算を始めた時点の目標武器の完成構成で判定しています。完成スキル構成が2件以上ある目標武器は、完成時のスキルが満たす完成スキル構成も示します。複数の構成を同時に満たす場合はすべて示します（構成の番号は呼び名で、優先順位ではありません）。'
 export const PLANNED_COMPLETION_VARIANTS_EMPTY = 'この計画には、完成予定の目標武器の記録がありません。'
 export const PLANNED_COMPLETION_PREDICTION_GUIDE = '各目標武器を開くと、完成時に付く予定の復元ボーナスとスキルを確認できます。'
 export const PLANNED_COMPLETION_PREDICTION_LEAD = 'この計画で完成する時点の予測結果です（目標武器に登録した完成条件ではありません）。'
@@ -375,6 +377,8 @@ export interface PlannedCompletionVariantsRow {
   key: TargetWeaponId
   target: BuildListOptimizationTargetDisplay | null
   achieved: AchievedCompletionVariants
+  /** The completion Skill configurations it achieves; `null` for a Target with one configuration (Issue #367: nothing extra shown). */
+  skillAchieved: AchievedCompletionSkillVariants | null
   /** The completing Entry's Candidate Snapshot as recorded (Issue #360): one result per Target, however many Variants it achieves. */
   prediction: PlannedCompletionPrediction
 }
@@ -408,6 +412,8 @@ export function createPlannedCompletionVariantRows(
         key: targetWeaponId,
         target: resolve(targetWeaponId),
         achieved: achievedOfCompletingEntry(entry, target, master),
+        // The same Snapshot's recorded Skills, only for a Target with two or more completion Skill configurations (Issue #367).
+        skillAchieved: describeEntryAchievedCompletionSkillVariants(entry, target, master),
         prediction: describePlannedCompletionPrediction(entry, target, master),
       })
     }

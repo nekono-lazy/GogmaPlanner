@@ -37,8 +37,11 @@ import {
   isLegacyAppSettingsRecord,
   isTerminalProductionPlanRecord,
   RNG_STATE_PROVENANCE_SCHEMA_VERSION,
+  migrateTargetWeaponListCompletionSkillVariants,
   TARGET_COMPLETION_ASSIGNMENT_FIELD,
+  TARGET_COMPLETION_SKILL_VARIANTS_FIELD,
   TargetCompletionAssignmentMigrationError,
+  TargetCompletionSkillVariantsMigrationError,
   upgradeAppSettingsToV2,
 } from './persistenceCompatibility'
 import {
@@ -96,8 +99,14 @@ import {
  * top-level, in a game save point, in an Undo body and in the save point an
  * Undo body holds; a schema 15 root's bodies get `null` ("not recorded") by
  * the one fill the Dexie version(13) upgrade shares, never an inferred weapon.
+ * Version 17 replaces every TargetWeapon body's one `completionSkillCondition`
+ * with the completion Skill configurations `completionSkillVariants` (Issue
+ * #367, `docs/DATA_MODEL.md` 8.4 / 15.1) - top-level, in a game save point, in
+ * an Undo body and in the save point an Undo body holds; a schema 16 root's
+ * bodies are converted losslessly into one configuration each by the one
+ * conversion the Dexie version(14) upgrade shares.
  */
-export const EXPORT_SCHEMA_VERSION = 16
+export const EXPORT_SCHEMA_VERSION = 17
 
 export const EXPORT_APP_NAME = 'mh-wilds-gogma-artian-planner'
 
@@ -120,8 +129,33 @@ export interface ExportRoot {
   settings: AppSettings
 }
 
-/** A schema 15 TargetWeapon body: the current body before the completion assignment existed. */
-export type TargetWeaponV15 = Omit<TargetWeapon, 'completedWithOwnedWeaponId'>
+/**
+ * A schema 16 TargetWeapon body: the current body before the completion Skill
+ * configurations existed - one `completionSkillCondition` whose `matchMode` is
+ * always `all`.
+ */
+export type TargetWeaponV16 = Omit<TargetWeapon, 'completionSkillVariants'> & {
+  completionSkillCondition: {
+    seriesSkillId: TargetWeapon['completionSkillVariants'][number]['seriesSkillId']
+    groupSkillId: TargetWeapon['completionSkillVariants'][number]['groupSkillId']
+    matchMode: 'all'
+  }
+}
+
+/**
+ * The schema 16 Export shape: every TargetWeapon body has the Issue #100
+ * completion condition with one completion Skill condition and the completion
+ * assignment. The nested save point and Undo body types are the current ones
+ * only for reading convenience; their Target bodies have the schema 16 shape
+ * too.
+ */
+export interface ExportRootV16 extends Omit<ExportRoot, 'schemaVersion' | 'targetWeapons'> {
+  schemaVersion: 16
+  targetWeapons: TargetWeaponV16[]
+}
+
+/** A schema 15 TargetWeapon body: the schema 16 body before the completion assignment existed. */
+export type TargetWeaponV15 = Omit<TargetWeaponV16, 'completedWithOwnedWeaponId'>
 
 /**
  * The schema 15 Export shape: every TargetWeapon body has the Issue #100
@@ -1018,7 +1052,9 @@ export function migrateExportRootV14ToV15(
  * Fails closed, applying nothing, when a Target body already carries the field
  * (a root claiming schema 15 whose bodies are not schema 15 bodies).
  */
-export function migrateExportRootV15ToV16(root: ExportRootV15): ExportRootMigrationResult {
+export function migrateExportRootV15ToV16(
+  root: ExportRootV15,
+): { ok: true; root: ExportRootV16 } | { ok: false; issues: DomainValidationIssue[] } {
   if (!isRecord(root)) {
     return { ok: false, issues: [structureIssue('', 'Export root must be an object.')] }
   }
@@ -1054,6 +1090,65 @@ export function migrateExportRootV15ToV16(root: ExportRootV15): ExportRootMigrat
     })
   } catch (error) {
     if (error instanceof TargetCompletionAssignmentMigrationError) {
+      return { ok: false, issues: [structureIssue(error.path, error.message)] }
+    }
+    throw error
+  }
+  return { ok: true, root: { ...(migrated as unknown as ExportRootV16), schemaVersion: 16 } }
+}
+
+/**
+ * Pure migration from Export schema 16 to 17 (Issue #367, `docs/DATA_MODEL.md`
+ * 8.4 / 15.1, `docs/PLANNER_SPEC.md` 22.7): every TargetWeapon body - top-level,
+ * in a game save point, in an Undo body and in the save point an Undo body
+ * holds - turns its one `completionSkillCondition` into one completion Skill
+ * configuration with the same Series / Group IDs through
+ * `migrateTargetWeaponCompletionSkillVariants()`, the conversion the Dexie
+ * version(14) upgrade shares. Lossless and guessing nothing: no review reason is
+ * added, every other collection and field keeps its exact contents, and the
+ * Target definition hash does not move.
+ *
+ * Fails closed, applying nothing, when a Target body already carries
+ * `completionSkillVariants`, has no `completionSkillCondition`, or holds one
+ * whose `matchMode` is not `"all"` (a root claiming schema 16 whose bodies are
+ * not schema 16 bodies).
+ */
+export function migrateExportRootV16ToV17(root: ExportRootV16): ExportRootMigrationResult {
+  if (!isRecord(root)) {
+    return { ok: false, issues: [structureIssue('', 'Export root must be an object.')] }
+  }
+  const record = root as unknown as Record<string, unknown>
+  const shapeIssues = ['targetWeapons', 'executionSavePoints', 'executionUndoSnapshots']
+    .flatMap((field) => collectionShapeIssues(record, field))
+  if (shapeIssues.length > 0) return { ok: false, issues: shapeIssues }
+
+  const issues: DomainValidationIssue[] = []
+  targetWeaponBodyLists(record).forEach(({ owner, field, path }) => {
+    const list = owner[field]
+    if (!Array.isArray(list)) {
+      issues.push(structureIssue(path, `${path} must be an array.`))
+      return
+    }
+    list.forEach((target: unknown, index) => {
+      if (isRecord(target) && TARGET_COMPLETION_SKILL_VARIANTS_FIELD in target) {
+        issues.push(structureIssue(`${path}[${index}]`, 'A schema 16 TargetWeapon cannot carry the schema 17 completionSkillVariants field.'))
+      }
+    })
+  })
+  if (issues.length > 0) return { ok: false, issues }
+
+  let migrated: Record<string, unknown>
+  try {
+    migrated = structuredClone(record)
+  } catch {
+    return { ok: false, issues: [structureIssue('', 'Export root cannot be copied.')] }
+  }
+  try {
+    targetWeaponBodyLists(migrated).forEach(({ owner, field, path }) => {
+      migrateTargetWeaponListCompletionSkillVariants(owner[field], path)
+    })
+  } catch (error) {
+    if (error instanceof TargetCompletionSkillVariantsMigrationError) {
       return { ok: false, issues: [structureIssue(error.path, error.message)] }
     }
     throw error
@@ -1211,18 +1306,19 @@ export function validateCurrentExportRoot(root: ExportRoot): DomainValidationRes
 /**
  * Brings a parsed Export object to the current schema and validates its
  * Execution lifecycle state and root-level RNG persistent state, failing closed
- * on anything else. Schema 16 is read as is; schema 15 goes through
- * `migrateExportRootV15ToV16()`; schema 14 through `migrateExportRootV14ToV15()`
- * and then 15 -> 16; schema 13 through `migrateExportRootV13ToV14()` and then
- * 14 -> 15 -> 16; schema 12 through `migrateExportRootV12ToV13()` and then
- * 13 -> 14 -> 15 -> 16; schema 11 through `migrateExportRootV11ToV12()` and then
- * 12 -> 13 -> 14 -> 15 -> 16 (its one Draft is current data and is never deleted);
+ * on anything else. Schema 17 is read as is; schema 16 goes through
+ * `migrateExportRootV16ToV17()`; schema 15 through `migrateExportRootV15ToV16()`
+ * and then 16 -> 17; schema 14 through `migrateExportRootV14ToV15()` and then
+ * 15 -> 16 -> 17; schema 13 through `migrateExportRootV13ToV14()` and then
+ * 14 -> 15 -> 16 -> 17; schema 12 through `migrateExportRootV12ToV13()` and then
+ * 13 -> ... -> 17; schema 11 through `migrateExportRootV11ToV12()` and then
+ * 12 -> ... -> 17 (its one Draft is current data and is never deleted);
  * schema 10, 9, 8, 7 and 6 go through the pure migrations in order
  * (`migrateExportRootV6ToV7()`, `migrateExportRootV7ToV8()`,
  * `migrateExportRootV8ToV9()`, `migrateExportRootV9ToV10()`,
  * `migrateExportRootV10ToV11()`, `migrateExportRootV11ToV12()`,
  * `migrateExportRootV12ToV13()`, `migrateExportRootV13ToV14()`,
- * `migrateExportRootV14ToV15()`, `migrateExportRootV15ToV16()`), and every other version is refused. Nothing is applied here: the caller replaces its data only
+ * `migrateExportRootV14ToV15()`, `migrateExportRootV15ToV16()`, `migrateExportRootV16ToV17()`), and every other version is refused. Nothing is applied here: the caller replaces its data only
  * after a successful result.
  */
 export function prepareExportRootForImport(
@@ -1243,8 +1339,12 @@ export function prepareExportRootForImport(
   }
   // Each step of the chain runs the pure migrations in order and stops at the
   // first refusal.
-  const fromV15 = (v15: ExportRootV15): ExportRootMigrationResult =>
-    migrateExportRootV15ToV16(v15)
+  const fromV16 = (v16: ExportRootV16): ExportRootMigrationResult =>
+    migrateExportRootV16ToV17(v16)
+  const fromV15 = (v15: ExportRootV15): ExportRootMigrationResult => {
+    const toV16 = migrateExportRootV15ToV16(v15)
+    return toV16.ok ? fromV16(toV16.root) : toV16
+  }
   const fromV14 = (v14: ExportRootV14): ExportRootMigrationResult => {
     const toV15 = migrateExportRootV14ToV15(v14)
     return toV15.ok ? fromV15(toV15.root) : toV15
@@ -1293,6 +1393,8 @@ export function prepareExportRootForImport(
     } catch {
       return { ok: false, issues: [structureIssue('', 'Export root cannot be copied.')] }
     }
+  } else if (candidate.schemaVersion === 16) {
+    migrated = fromV16(input as ExportRootV16)
   } else if (candidate.schemaVersion === 15) {
     migrated = fromV15(input as ExportRootV15)
   } else if (candidate.schemaVersion === 14) {

@@ -1,4 +1,5 @@
 import { APP_SETTINGS_SCHEMA_VERSION, recommendedCandidateSearchDefaults } from './common'
+import { completionSkillVariantFromCondition } from './completionSkillVariantIdentity'
 import type { OwnedWeapon, RestorationBonusScope } from './publicTypes'
 
 type LegacyOwnedWeapon = Omit<OwnedWeapon, 'restorationBonusScope'> & {
@@ -207,4 +208,78 @@ export function fillTargetWeaponListCompletionAssignment(value: unknown, path: s
     throw new TargetCompletionAssignmentMigrationError(path, 'A TargetWeapon body list must be an array.')
   }
   value.forEach((target: unknown, index) => fillTargetWeaponCompletionAssignment(target, `${path}[${index}]`))
+}
+
+/** The completion Skill configurations every TargetWeapon body carries since Dexie v14 / Export 17 (Issue #367). */
+export const TARGET_COMPLETION_SKILL_VARIANTS_FIELD = 'completionSkillVariants'
+
+/** The schema 16 completion Skill condition (one Series / Group pair) the Dexie v14 / Export 17 conversion replaces. */
+export const LEGACY_COMPLETION_SKILL_CONDITION_FIELD = 'completionSkillCondition'
+
+/**
+ * A Target body the completion Skill configuration migration cannot convert:
+ * it is not an object, it already carries `completionSkillVariants`, it has no
+ * `completionSkillCondition`, or that condition is not a schema 16 one
+ * (`matchMode: "all"` with `null` or string Series / Group IDs). Nothing is
+ * guessed and nothing is overwritten.
+ */
+export class TargetCompletionSkillVariantsMigrationError extends Error {
+  readonly path: string
+  constructor(path: string, message: string) {
+    super(`${path}: ${message}`)
+    this.name = 'TargetCompletionSkillVariantsMigrationError'
+    this.path = path
+  }
+}
+
+function isSkillIdValue(value: unknown): value is string | null {
+  return value === null || typeof value === 'string'
+}
+
+/**
+ * Moves one schema 16 TargetWeapon body to the completion Skill configurations
+ * (Issue #367, `docs/DATA_MODEL.md` 8.4 / 14.2 / 15.1, `docs/PLANNER_SPEC.md`
+ * 22.7): its one `completionSkillCondition` becomes one configuration with the
+ * same Series / Group IDs and the fixed `id` `DEFAULT_COMPLETION_SKILL_VARIANT_ID`,
+ * and the condition (with its only possible `matchMode`, `"all"`) is removed.
+ * The conversion is lossless: `completionConditionReview`, the lifecycle, the
+ * completion assignment, the preference and every other field keep their exact
+ * values, and the Target definition hash does not move (one configuration
+ * hashes as the former condition, 9.4). Shared by the Dexie version(14) upgrade
+ * and the Export schema 16 -> 17 migration. Mutates the body in place; a body
+ * that is not a schema 16 body throws.
+ */
+export function migrateTargetWeaponCompletionSkillVariants(target: unknown, path: string): void {
+  if (!isRecordValue(target)) {
+    throw new TargetCompletionSkillVariantsMigrationError(path, 'A TargetWeapon body must be an object.')
+  }
+  if (TARGET_COMPLETION_SKILL_VARIANTS_FIELD in target) {
+    throw new TargetCompletionSkillVariantsMigrationError(path, 'A TargetWeapon body written before the completion Skill configurations cannot carry completionSkillVariants.')
+  }
+  const condition = target[LEGACY_COMPLETION_SKILL_CONDITION_FIELD]
+  if (!isRecordValue(condition)) {
+    throw new TargetCompletionSkillVariantsMigrationError(`${path}.${LEGACY_COMPLETION_SKILL_CONDITION_FIELD}`, 'A schema 16 TargetWeapon body must carry its completionSkillCondition.')
+  }
+  if (condition.matchMode !== 'all') {
+    throw new TargetCompletionSkillVariantsMigrationError(`${path}.${LEGACY_COMPLETION_SKILL_CONDITION_FIELD}.matchMode`, 'A schema 16 completion Skill condition must have matchMode "all".')
+  }
+  if (!isSkillIdValue(condition.seriesSkillId) || !isSkillIdValue(condition.groupSkillId)) {
+    throw new TargetCompletionSkillVariantsMigrationError(`${path}.${LEGACY_COMPLETION_SKILL_CONDITION_FIELD}`, 'A schema 16 completion Skill condition must hold null or string Series / Group Skill IDs.')
+  }
+  delete target[LEGACY_COMPLETION_SKILL_CONDITION_FIELD]
+  target[TARGET_COMPLETION_SKILL_VARIANTS_FIELD] = [
+    completionSkillVariantFromCondition({ seriesSkillId: condition.seriesSkillId, groupSkillId: condition.groupSkillId }),
+  ]
+}
+
+/**
+ * `migrateTargetWeaponCompletionSkillVariants()` over every body of a Target
+ * list in place (a save point's `targetWeapons`, an Undo body's
+ * `affectedTargetWeaponsBefore`). A non-array throws.
+ */
+export function migrateTargetWeaponListCompletionSkillVariants(value: unknown, path: string): void {
+  if (!Array.isArray(value)) {
+    throw new TargetCompletionSkillVariantsMigrationError(path, 'A TargetWeapon body list must be an array.')
+  }
+  value.forEach((target: unknown, index) => migrateTargetWeaponCompletionSkillVariants(target, `${path}[${index}]`))
 }

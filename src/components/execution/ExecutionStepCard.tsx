@@ -285,12 +285,13 @@ export function ExecutionStepCard({
           )}
         </Box>
 
-        {presentation.completionTargets.map(({ label, achieved }, index) => (
+        {presentation.completionTargets.map(({ label, achieved, skillAchieved }, index) => (
           <Alert key={`${label}:${index}`} severity="success" sx={{ '& .MuiAlert-message': { minWidth: 0 } }}>
             このStepで「{label}」が完成します
             {/* Re-judged at display time from the completion result the Step
-                confirms and the current Target (`docs/REQUIREMENTS.md` 13.2). */}
-            {achieved !== null && <AchievedCompletionVariants achieved={achieved} layout="line" />}
+                confirms and the current Target (`docs/REQUIREMENTS.md` 13.2);
+                the Skill configurations only for a Target with two or more. */}
+            {achieved !== null && <AchievedCompletionVariants achieved={achieved} skill={skillAchieved} layout="line" />}
           </Alert>
         ))}
 

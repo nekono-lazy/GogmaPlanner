@@ -16,7 +16,6 @@ import type {
   ArtianWeaponKind,
 } from '../domain/models/publicTypes'
 import { isBlindCreateNormalArtianOperation } from '../domain/models/publicTypes'
-import type { SkillMatchMode } from '../domain/models/common'
 import type { ArtianBonusScope } from '../domain/master/masterTypes'
 import type {
   CandidateRouteFilter,
@@ -60,9 +59,11 @@ export const restorationBonusScopeFieldLabel = '復元ボーナスの種類'
 export const restorationBonusScopeGogmaHelpText =
   '巨戟化直後、まだ復元ボーナス変更前は「通常アーティア系」です。'
 
-export const skillMatchModeLabels: Record<SkillMatchMode, string> = {
-  all: 'すべて一致',
-}
+/**
+ * Said beside a completion Skill configuration naming both Skills: inside one
+ * configuration every specified Skill must match (`docs/DATA_MODEL.md` 8.4).
+ */
+export const SKILL_CONDITION_ALL_MATCH_LABEL = 'すべて一致'
 
 /**
  * How one compromise checkpoint state rated on each Target axis.

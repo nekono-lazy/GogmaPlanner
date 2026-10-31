@@ -21,7 +21,6 @@ import type {
   RestorationBonusScope,
   RouteKind,
   SeriesSkillId,
-  SkillMatchMode,
   TargetWeaponId,
   WeaponTypeId,
 } from './common'
@@ -137,8 +136,13 @@ export interface TargetWeapon {
    * Their order carries no meaning.
    */
   completionBonusVariants: CompletionBonusVariant[]
-  /** The completion Skill condition; `matchMode` is always `all` (8.4). */
-  completionSkillCondition: SkillCondition
+  /**
+   * The completion Skill configurations (`docs/DATA_MODEL.md` 8.4, Issue #367):
+   * one or more equal configurations, any one of which completes the Skill
+   * side. Inside a configuration every specified Skill must match (AND);
+   * between configurations it is OR. Their order carries no meaning.
+   */
+  completionSkillVariants: CompletionSkillVariant[]
   /**
    * Why the completion condition needs the user's review (8.6). Non-empty keeps
    * the Target out of every calculation until the user explicitly saves it.
@@ -179,10 +183,25 @@ export interface CompletionBonusVariant {
   slots: CompletionBonusSlots
 }
 
+/**
+ * The evaluation input of `evaluateSkillCondition()` (`docs/DATA_MODEL.md`
+ * 8.4): every specified Skill must match, and `null` constrains nothing. Inside
+ * one condition the Skills are always combined with AND, so it holds no match
+ * mode (the former `matchMode` / `SkillMatchMode` is gone, Issue #367).
+ */
 export interface SkillCondition {
   seriesSkillId: SeriesSkillId | null
   groupSkillId: GroupSkillId | null
-  matchMode: SkillMatchMode
+}
+
+/**
+ * One completion Skill configuration of a Target (`docs/DATA_MODEL.md` 8.4,
+ * Issue #367): a Series and a Group Skill, each specified or not (`null`),
+ * combined with AND. `id` is a UI editing key only and never enters a hash, an
+ * identity or a judgement.
+ */
+export interface CompletionSkillVariant extends SkillCondition {
+  id: string
 }
 
 /**

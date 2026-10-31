@@ -9,7 +9,7 @@ import {
   ownedIdealWeaponSummary,
 } from './ownedIdealPresentation'
 import { AchievedCompletionVariants } from './AchievedCompletionVariants'
-import { describeAchievedCompletionVariants } from './completionConditionPresentation'
+import { describeAchievedCompletionSkillVariants, describeAchievedCompletionVariants } from './completionConditionPresentation'
 
 export interface OwnedIdealWeaponNoticeProps {
   target: TargetWeapon
@@ -58,10 +58,11 @@ export function OwnedIdealWeaponNotice({ target, weapons, master, onComplete, di
                 <Typography component="p" variant="caption" color="text.secondary" sx={{ overflowWrap: 'anywhere' }}>
                   {ownedIdealWeaponSummary(weapon, master)}
                 </Typography>
-                {/* The weapon's own current slots against the Target as it is now
-                    (`docs/REQUIREMENTS.md` 13.2) - never its status. */}
+                {/* The weapon's own current slots and Skills against the Target as it
+                    is now (`docs/REQUIREMENTS.md` 13.2) - never its status. */}
                 <AchievedCompletionVariants
                   achieved={describeAchievedCompletionVariants(target, weapon.restorationBonuses, weapon.restorationBonusScope, master)}
+                  skill={describeAchievedCompletionSkillVariants(target, weapon.seriesSkillId, weapon.groupSkillId, master)}
                   layout="line"
                 />
               </Box>

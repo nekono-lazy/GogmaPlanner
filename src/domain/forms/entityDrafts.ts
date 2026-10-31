@@ -12,6 +12,7 @@ import type {
 } from '../models/publicTypes'
 import { V1_NORMAL_ARTIAN_RARITY } from '../models/publicTypes'
 import { completionBonusVariantFromBonuses } from '../target/completionCondition'
+import { completionSkillVariantFromCondition } from '../target/completionSkillVariants'
 import type { OwnedWeaponDraft, TargetWeaponDraft } from '../../services/crud/entityCrudServices'
 
 export class MasterOptionsUnavailableError extends Error {
@@ -167,7 +168,7 @@ export function createTargetWeaponDraft(master: MasterDataRoot): TargetWeaponDra
     completionBonusVariants: [
       completionBonusVariantFromBonuses(createDefaultBonusSet(master, base.weaponTypeId, base.elementId)),
     ],
-    completionSkillCondition: { seriesSkillId: null, groupSkillId: null, matchMode: 'all' },
+    completionSkillVariants: [completionSkillVariantFromCondition({ seriesSkillId: null, groupSkillId: null })],
     completionConditionReview: [],
     memo: null,
   }

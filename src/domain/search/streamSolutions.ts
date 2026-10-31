@@ -12,9 +12,10 @@ import { stableStringify } from '../models/publicTypes'
 import { bonusOutcomeKey, bonusSolutionRetentionKey, compareStableKeys } from './semanticKeys'
 export { compareStableKeys } from './semanticKeys'
 import {
+  closestCompletionSkillVariantMatchedCount,
   closestVariantMatchedCount,
-  evaluateSkillCondition,
   satisfiesCompletionBonuses,
+  satisfiesCompletionSkills,
 } from '../target'
 import { totalMaterialQuantity } from './candidateFactory'
 import type { CandidateSearchInput } from './searchTypes'
@@ -91,24 +92,17 @@ export interface EvaluatedBonusSolution {
 }
 
 /**
- * SEARCH_SPEC 5.5.2 stream-local ideal closeness. A `null` side of
- * `completionSkillCondition` is unconstrained, so it is never counted as a match.
+ * SEARCH_SPEC 5.5.2 stream-local ideal closeness: the partial match count of
+ * the closest completion Skill configuration (its maximum over every
+ * configuration). A `null` side of a configuration is unconstrained, so it is
+ * never counted as a match. One configuration gives exactly its own count.
  */
 function skillIdealCloseness(
   target: TargetWeapon,
   seriesSkillId: SeriesSkillId | null,
   groupSkillId: GroupSkillId | null,
 ): number {
-  const condition = target.completionSkillCondition
-  return (
-    Number(
-      condition.seriesSkillId !== null &&
-        condition.seriesSkillId === seriesSkillId,
-    ) +
-    Number(
-      condition.groupSkillId !== null && condition.groupSkillId === groupSkillId,
-    )
-  )
+  return closestCompletionSkillVariantMatchedCount(target, seriesSkillId, groupSkillId)
 }
 
 function evaluateSkillSolution(
@@ -117,8 +111,8 @@ function evaluateSkillSolution(
 ): Omit<EvaluatedSkillSolution, 'index'> {
   return {
     solution,
-    idealMatch: evaluateSkillCondition(
-      target.completionSkillCondition,
+    idealMatch: satisfiesCompletionSkills(
+      target,
       solution.seriesSkillId,
       solution.groupSkillId,
     ),

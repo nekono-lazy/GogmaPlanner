@@ -1,15 +1,21 @@
+import type { MasterDataRoot } from '../../domain/master/masterTypes'
 import type {
   BonusRankId,
   BuildListEntry,
   CompletionConditionReviewReason,
   RestorationBonus,
   RestorationBonusScope,
+  SkillCondition,
   TargetWeapon,
 } from '../../domain/models/publicTypes'
 import {
   satisfiedCompletionBonusVariants,
   type CompletionVariantConflict,
 } from '../../domain/target/completionCondition'
+import {
+  satisfiedCompletionSkillVariants,
+  type CompletionSkillVariantConflict,
+} from '../../domain/target/completionSkillVariants'
 import type { TargetEvaluationMasterSubset } from '../../domain/target/targetEvaluationTypes'
 
 /**
@@ -104,6 +110,99 @@ export function achievedCompletionVariantsText(achieved: AchievedCompletionVaria
 export const ACHIEVED_COMPLETION_VARIANTS_NOT_ACHIEVED_NOTE =
   'この結果が作られた後に、目標武器の完成条件が変更された可能性があります。'
 
+/**
+ * Which completion Skill configurations of a Target one concrete result's
+ * Series / Group Skills satisfy, judged at display time (`docs/REQUIREMENTS.md`
+ * 13.2, `docs/PLANNER_SPEC.md` 22.2, Issue #367). Only a Target with two or more
+ * configurations gets one (22.10 S4): with one configuration the Skill side
+ * reads as it always did, so the describers return `null` - also without a
+ * Target, which the completion Variants beside it already report.
+ *
+ * - `achieved`: every satisfied configuration in the Target's order, each named
+ *   (「完成スキル構成3」 - a name, never a preference) and spelled out
+ *   (「雷顎竜の闘志 ＋ ヌシの魂」), so the user sees which pair the result holds
+ * - `not_achieved`: the result satisfies no configuration of the current Target
+ * - `unavailable`: the result's Skills cannot be read (a missing completing
+ *   Entry, or a recorded Skill that is neither an ID nor `null`)
+ *
+ * The judgement is the Domain's `satisfiedCompletionSkillVariants()` alone, the
+ * configurations are never inferred from a Route or a PlanStep, and nothing -
+ * no configuration ID, number or result - is persisted.
+ */
+export type AchievedCompletionSkillVariants =
+  | { kind: 'achieved'; variants: { heading: string; label: string }[] }
+  | { kind: 'not_achieved' }
+  | { kind: 'unavailable'; reason: 'result_missing' }
+
+/** A recorded Skill a configuration can be judged against: an ID, or the recorded "none". */
+function isRecordedSkill(value: unknown): value is string | null {
+  return value === null || typeof value === 'string'
+}
+
+/** Whether the Target's Skill side gets its own achieved line: two or more configurations (S4). */
+function showsAchievedCompletionSkillVariants(
+  target: Pick<TargetWeapon, 'completionSkillVariants'> | null | undefined,
+): target is Pick<TargetWeapon, 'completionSkillVariants'> {
+  return target !== null && target !== undefined && Array.isArray(target.completionSkillVariants) && target.completionSkillVariants.length >= 2
+}
+
+/**
+ * The achieved completion Skill configurations of one concrete result: a
+ * Candidate's `seriesSkillId` / `groupSkillId`, or an owned weapon's current
+ * Skills, against the given Target. `null` when the Target has one
+ * configuration or none is given (see `AchievedCompletionSkillVariants`).
+ */
+export function describeAchievedCompletionSkillVariants(
+  target: Pick<TargetWeapon, 'completionSkillVariants'> | null | undefined,
+  seriesSkillId: unknown,
+  groupSkillId: unknown,
+  master: Pick<MasterDataRoot, 'seriesSkills' | 'groupSkills'>,
+): AchievedCompletionSkillVariants | null {
+  if (!showsAchievedCompletionSkillVariants(target)) return null
+  if (!isRecordedSkill(seriesSkillId) || !isRecordedSkill(groupSkillId)) return { kind: 'unavailable', reason: 'result_missing' }
+  const satisfied = new Set(satisfiedCompletionSkillVariants(target, seriesSkillId, groupSkillId))
+  if (satisfied.size === 0) return { kind: 'not_achieved' }
+  return {
+    kind: 'achieved',
+    variants: target.completionSkillVariants.flatMap((variant, index) =>
+      satisfied.has(variant) ? [{ heading: completionSkillVariantHeading(index), label: completionSkillVariantLabel(variant, master) }] : [],
+    ),
+  }
+}
+
+/**
+ * The achieved completion Skill configurations of what one Build List Entry
+ * completes: its Candidate Snapshot's Series / Group Skills - the completion
+ * result a Plan confirms - against the given Target. The Snapshot is read
+ * defensively; nothing is reconstructed from a Route or a PlanStep.
+ */
+export function describeEntryAchievedCompletionSkillVariants(
+  entry: Pick<BuildListEntry, 'candidateSnapshot'> | null | undefined,
+  target: Pick<TargetWeapon, 'completionSkillVariants'> | null | undefined,
+  master: Pick<MasterDataRoot, 'seriesSkills' | 'groupSkills'>,
+): AchievedCompletionSkillVariants | null {
+  if (!showsAchievedCompletionSkillVariants(target)) return null
+  const snapshot: unknown = entry?.candidateSnapshot
+  if (snapshot === null || typeof snapshot !== 'object') return { kind: 'unavailable', reason: 'result_missing' }
+  const { seriesSkillId, groupSkillId } = snapshot as { seriesSkillId?: unknown; groupSkillId?: unknown }
+  return describeAchievedCompletionSkillVariants(target, seriesSkillId, groupSkillId, master)
+}
+
+/** The label of the achieved completion Skill configurations wherever a concrete result is shown. */
+export const ACHIEVED_COMPLETION_SKILL_VARIANTS_LABEL = '達成した完成スキル構成'
+
+/** The words of `describeAchievedCompletionSkillVariants()`; the state is always in text, never colour alone. */
+export function achievedCompletionSkillVariantsText(achieved: AchievedCompletionSkillVariants): string {
+  switch (achieved.kind) {
+    case 'achieved':
+      return achieved.variants.map(({ heading, label }) => `${heading}（${label}）`).join('、')
+    case 'not_achieved':
+      return '現在の完成条件では満たしません'
+    case 'unavailable':
+      return '完成時のスキルが見つからないため確認できません'
+  }
+}
+
 /** The chip a Target whose completion condition needs review carries (text, never colour alone). */
 export const COMPLETION_CONDITION_REVIEW_CHIP_LABEL = '完成条件の再設定が必要'
 
@@ -118,7 +217,7 @@ export const completionConditionReviewGuidance: Record<CompletionConditionReview
   compromise_conditions_removed:
     '旧仕様の実用・代替・実用スキルの条件は、新しい完成条件では使えないため削除しました。より低いランクでも完成としてよい枠は、その枠の最低ランクを下げてください。別の種類のボーナスを含む構成でも完成としてよい場合は、その構成を「完成ボーナス構成」に追加してください。',
   skill_condition_normalized:
-    '旧条件の「どちらか一方を満たす」は新しい完成条件では使えません。現在は、指定したシリーズスキルとグループスキルを「すべて満たす」条件として設定しています。「完成スキル条件」で、シリーズ・グループの指定を確認してください。',
+    '旧条件の「どちらか一方を満たす」は新しい完成条件では使えません。現在は、指定したシリーズスキルとグループスキルを「すべて満たす」条件として設定しています。「完成スキル構成」で、シリーズ・グループの指定を確認してください。',
 }
 
 /** Where in the edit dialog each reason asks the user to look: the section it names. */
@@ -237,7 +336,85 @@ export function completionVariantConflictMessage(
  * `completionBonusVariants[n]` path. Nothing is judged here.
  */
 export function targetFormValidationIssuesText(issues: readonly string[]): string {
-  return [...new Set(issues.map((issue) => issue.replace(/^completionBonusVariants(?:\[\d+\])?: /, '')))].join(' / ')
+  return [...new Set(issues.map((issue) => issue.replace(/^completion(?:Bonus|Skill)Variants(?:\[\d+\])?: /, '')))].join(' / ')
+}
+
+/**
+ * The name of one completion Skill configuration (`docs/UI_FLOW.md` 8, Issue
+ * #367): 「完成スキル構成2」. The number only names it by its place in the
+ * Target; it carries no preference.
+ */
+export function completionSkillVariantHeading(index: number): string {
+  return `完成スキル構成${index + 1}`
+}
+
+/** Said above two or more completion Skill configurations: any one completes the Skill side. */
+export const COMPLETION_SKILL_VARIANTS_MULTIPLE_HELP_TEXT =
+  'いずれか1件の構成を満たせばスキル側の完成条件を満たします。構成の順番に意味はありません。'
+
+/** Said beside the disabled 「削除」 of the one remaining configuration. */
+export const COMPLETION_SKILL_VARIANTS_MINIMUM_NOTE = '完成スキル構成は1件以上必要です。'
+
+/** What 「新しいスキル構成を追加」 and 「この構成を複製」 do. */
+export const COMPLETION_SKILL_VARIANTS_ADD_HELP_TEXT =
+  '「新しいスキル構成を追加」は、シリーズ・グループとも「指定なし」の構成を末尾に追加します。片方のスキルだけが異なる構成を作るときは、元にする構成の「この構成を複製」を使います。'
+
+/**
+ * One configuration's Skills in words: 「巨戟龍の黙示録 ＋ 指定なし」. An unknown
+ * ID falls back to the stored ID rather than being dropped, so a configuration
+ * never reads weaker than it is.
+ */
+export function completionSkillVariantLabel(variant: SkillCondition, master: Pick<MasterDataRoot, 'seriesSkills' | 'groupSkills'>): string {
+  const series = variant.seriesSkillId === null
+    ? '指定なし'
+    : master.seriesSkills.find(({ id }) => id === variant.seriesSkillId)?.displayNameJa ?? variant.seriesSkillId
+  const group = variant.groupSkillId === null
+    ? '指定なし'
+    : master.groupSkills.find(({ id }) => id === variant.groupSkillId)?.displayNameJa ?? variant.groupSkillId
+  return `${series} ＋ ${group}`
+}
+
+/** The short state of a configuration that cannot be saved, next to its heading (text, never colour alone). */
+export function completionSkillVariantConflictBadge(conflict: CompletionSkillVariantConflict): string {
+  return conflict.kind === 'duplicate' ? '重複・保存できません' : '包含・保存できません'
+}
+
+/**
+ * The reason and the way out for one conflicting configuration, from the
+ * Domain's `findCompletionSkillVariantConflicts()` result alone.
+ * `justDuplicatedFrom` is the index of the configuration it was duplicated from
+ * while it is still that untouched copy: the duplicate it is right after
+ * 「この構成を複製」 is said as such (it is still a duplicate that cannot be saved).
+ */
+export function completionSkillVariantConflictMessage(
+  conflict: CompletionSkillVariantConflict,
+  variants: readonly SkillCondition[],
+  master: Pick<MasterDataRoot, 'seriesSkills' | 'groupSkills'>,
+  justDuplicatedFrom: number | null = null,
+): string {
+  const self = completionSkillVariantHeading(conflict.index)
+  const other = completionSkillVariantHeading(conflict.otherIndex)
+  const otherVariant = variants[conflict.otherIndex]
+  const otherLabel = otherVariant === undefined ? '' : `（${completionSkillVariantLabel(otherVariant, master)}）`
+  if (conflict.kind === 'duplicate') {
+    if (justDuplicatedFrom === conflict.otherIndex) {
+      return `${self}は${other}${otherLabel}を複製した直後のため、同じ内容です。このままでは保存できません。シリーズかグループのスキルを変更してください。`
+    }
+    return `${self}は${other}${otherLabel}と同じ内容です。このままでは保存できません。シリーズかグループのスキルを変更するか、不要な方を削除してください。`
+  }
+  return `${self}は${other}${otherLabel}に含まれるため保存できません。${other}の「指定なし」を具体的なスキルにするか、${self}を削除してください。`
+}
+
+/** One line of the configuration conflict summary: the configuration and the one it conflicts with. */
+export function completionSkillVariantConflictShortReason(conflict: CompletionSkillVariantConflict): string {
+  const self = completionSkillVariantHeading(conflict.index)
+  const other = completionSkillVariantHeading(conflict.otherIndex)
+  return conflict.kind === 'duplicate' ? `${self}: ${other}と同じ内容` : `${self}: ${other}に含まれる`
+}
+
+/** The summary above the configurations while any of them cannot be saved. */
+export function completionSkillVariantConflictSummary(count: number): string {
+  return `保存できない完成スキル構成が${count}件あります。`
 }
 
 /** The summary above the Variants while any of them cannot be saved. */
