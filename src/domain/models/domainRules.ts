@@ -151,6 +151,15 @@ export function isCalculationContextCompatible(
  * entry. Version 1..18 stay incompatible, and no ProductionPlan exception exists
  * for 20: every version 1..19 Plan fails closed.
  *
+ * App schema 21 changes only the deterministic scheduler's frontier: a pending
+ * holding unit holds its stream position even behind an earlier unit of its
+ * own lane (Issue #373, `docs/PLANNER_SPEC.md` 7). Candidate Search, Route
+ * generation, BuildCandidate and BuildListEntry snapshot semantics and
+ * staleness are untouched, so a version 19 or 20 BuildCandidate or
+ * BuildListEntry stays usable under version 21 through the explicit
+ * `21 -> [19, 20]` entry. Version 1..18 stay incompatible, and no ProductionPlan
+ * exception exists for 21: every version 1..20 Plan fails closed.
+ *
  * Each exception is directional and deliberately narrow: version 1 stays
  * incompatible, it is never a general forward compatibility for future
  * versions, every other CalculationContext field must still be equal, and the
@@ -168,6 +177,7 @@ const COMPATIBLE_BUILD_RESULT_APP_SCHEMA_VERSIONS: ReadonlyMap<number, readonly 
     [17, [12, 13, 14, 15, 16]],
     [18, [12, 13, 14, 15, 16, 17]],
     [20, [19]],
+    [21, [19, 20]],
   ])
 
 export function isBuildResultCalculationContextCompatible(

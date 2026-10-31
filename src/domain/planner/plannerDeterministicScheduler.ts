@@ -34,7 +34,6 @@ import {
   remainingPlannerLaneUnits,
   type PlannerEntryLanes,
   type PlannerLaneProgress,
-  type PlannerRouteLane,
 } from './plannerRouteLanes'
 import {
   currentPlannerCounterValue,
@@ -143,7 +142,10 @@ function compareStableStrings(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0
 }
 
-/** One Counter stream frontier unit (7.2) and its classification. */
+/**
+ * One Counter stream frontier unit (7.2) and its classification: a pending unit
+ * of a committed Entry at its stream's current position (`frontierUnitsOf()`).
+ */
 interface FrontierUnit {
   readonly entry: BuildListEntry
   readonly unit: PlannerRouteUnit
@@ -152,7 +154,10 @@ interface FrontierUnit {
    * consume this position (5).
    */
   readonly holding: boolean
-  /** Runnable now: next lane unit, preconditions met, not resolution-blocked. */
+  /**
+   * Runnable now: next lane unit, preconditions met, not resolution-blocked.
+   * A unit behind an earlier unit of its own lane is never ready.
+   */
   readonly ready: boolean
 }
 
@@ -434,41 +439,46 @@ export class PlannerDeterministicScheduleRun {
   }
 
   /**
-   * The unit of `lane` that stands at or ahead of the lane's current Counter
-   * position: the lane head, or - past the skippable units whose position
-   * another Entry already consumed - the first unit the Counter has not
-   * passed yet (or a passed holding unit, which is lost).
+   * The units of one committed Entry that stand in a stream frontier (7.2):
+   * every pending unit whose stream's current Counter position is its
+   * `counterBefore`, whether or not it is the head of its lane, plus a blind
+   * forge at the head of the base lane, which has no stream position (7.3
+   * case 3). Lane order: base, bonus, skill.
    *
-   * Every passed skippable head is already fast-forwarded
+   * A Bonus or Skill lane uses one stream and its positions increase, and every
+   * passed skippable head is already fast-forwarded
    * (`fastForwardPlannerRouteProgress()` runs after every route action and on
-   * the initial state), so this is the lane head itself; calculation schema
-   * 11..18 also kept a skippable head behind a checkpoint pin, which Issue #100
-   * removed (`docs/PLANNER_SPEC.md` 20.10). A holding unit still makes its
-   * position wait, and a passed one still fails the Route closed.
+   * the initial state), so its unit at the current position is its head. The
+   * base lane spans two streams (Issue #373): its `convert_normal_to_gogma`
+   * (Skill stream) follows the Normal or blind forges, so it can stand at the
+   * Skill stream's current position while a forge is still the lane head. It
+   * is a frontier unit all the same and holds that position. Such a unit is
+   * never one of `nextPlannerLaneUnits()`, so it is never ready: its stream
+   * position waits until the Entry's own earlier units ran, and only then can
+   * the holding action run it.
    */
-  private laneFrontierUnit(
-    lanes: PlannerEntryLanes,
-    progress: PlannerLaneProgress,
-    lane: PlannerRouteLane,
-  ): PlannerRouteUnit | undefined {
-    for (let index = progress[lane]; index < lanes[lane].length; index += 1) {
-      const unit = lanes[lane][index]
-      if (isPlannerLaneUnitHolding(unit) || unit.counterBefore === null) return unit
-      const current = currentPlannerCounterValue(this.state, unit)
-      if (current === null || current <= unit.counterBefore) return unit
+  private frontierUnitsOf(lanes: PlannerEntryLanes, progress: PlannerLaneProgress): PlannerRouteUnit[] {
+    const units: PlannerRouteUnit[] = []
+    const baseHead = lanes.base[progress.base]
+    if (baseHead !== undefined && plannerScheduleStreamKey(baseHead) === null) units.push(baseHead)
+    for (const unit of remainingPlannerLaneUnits(lanes, progress)) {
+      if (plannerScheduleStreamKey(unit) === null) continue
+      if (currentPlannerCounterValue(this.state, unit) === unit.counterBefore) units.push(unit)
     }
-    return undefined
+    return units
   }
 
   /**
-   * Why a committed Entry's Route can no longer run (6.8), judged at its lane
-   * frontier units (`laneFrontierUnit()`) - a lane is sequential, so a holding
-   * unit behind the current Counter is always one of them, and every unit of
-   * one Route operates the same source weapon: a holding unit whose position
-   * the Counter already passed, or a lane head whose source weapon is gone,
-   * protected, or superseded (`plannerRouteUnitSourceRejection()`, the
-   * precondition the unit meets when it actually runs). A passed skippable
-   * unit is never a reason: it is fast-forwarded.
+   * Why a committed Entry's Route can no longer run (6.8): a pending holding
+   * unit whose position the Counter already passed - judged over every
+   * pending unit, because a holding unit of the base lane can sit behind a
+   * unit of another stream (`frontierUnitsOf()`); the frontier never lets a
+   * scheduled action pass such a position, so this keeps the judgement
+   * complete rather than adding a case - or a lane head whose source weapon is
+   * gone, protected, or superseded (`plannerRouteUnitSourceRejection()`, the
+   * precondition the unit meets when it actually runs; every unit of one Route
+   * operates the same source weapon). A passed skippable unit is never a
+   * reason: it is fast-forwarded.
    */
   private laneHeadRejection(entry: BuildListEntry): PlannerSearchRejection | null {
     const lanes = this.lanesOf(entry)
@@ -478,11 +488,7 @@ export class PlannerDeterministicScheduleRun {
       const head = lanes[lane][progress[lane]]
       return head === undefined ? [] : [head]
     })
-    const frontierUnits = (['base', 'bonus', 'skill'] as const).flatMap((lane) => {
-      const unit = this.laneFrontierUnit(lanes, progress, lane)
-      return unit === undefined ? [] : [unit]
-    })
-    for (const unit of frontierUnits) {
+    for (const unit of remainingPlannerLaneUnits(lanes, progress)) {
       if (!isPlannerLaneUnitHolding(unit)) continue
       if (unit.counterStream === null || unit.counterBefore === null) continue
       const current = currentPlannerCounterValue(this.state, unit)
@@ -543,22 +549,17 @@ export class PlannerDeterministicScheduleRun {
           pendingNormalCounterIds.add(unit.counterId)
         }
       })
-      // Each lane's unit at or ahead of the current Counter (`laneFrontierUnit()`).
-      const heads = (['base', 'bonus', 'skill'] as const).flatMap((lane) => {
-        const unit = this.laneFrontierUnit(lanes, progress, lane)
-        return unit === undefined ? [] : [unit]
-      })
-      for (const unit of heads) {
+      // Every pending unit at its stream's current position, lane head or not
+      // (`frontierUnitsOf()`), and a blind forge at the head of the base lane.
+      for (const unit of this.frontierUnitsOf(lanes, progress)) {
         const streamKey = plannerScheduleStreamKey(unit)
+        const ready = this.isReady(entry, unit, next)
         if (streamKey === null) {
-          if (unit.lane !== 'base' || !next.includes(unit)) continue
-          blindUnits.push({ entry, unit, holding: true, ready: this.isReady(entry, unit, next) })
+          blindUnits.push({ entry, unit, holding: true, ready })
           continue
         }
-        if (currentPlannerCounterValue(this.state, unit) !== unit.counterBefore) continue
-        const holding = isPlannerLaneUnitHolding(unit)
         const frontier = frontiers.get(streamKey) ?? []
-        frontier.push({ entry, unit, holding, ready: this.isReady(entry, unit, next) })
+        frontier.push({ entry, unit, holding: isPlannerLaneUnitHolding(unit), ready })
         frontiers.set(streamKey, frontier)
       }
     }
@@ -568,7 +569,9 @@ export class PlannerDeterministicScheduleRun {
       const holdings = frontier.filter(({ holding }) => holding)
       if (holdings.length > 0) {
         // Only the one physical action that runs every holding unit here is
-        // safe; a holding unit that is not ready makes the position wait.
+        // safe; a holding unit that is not ready - a lane head whose
+        // precondition is unmet, or a base-lane conversion still behind its
+        // own forges - makes the position wait.
         const primary = holdings.find(({ ready }) => ready)
         if (!primary) continue
         const progressed = mergedPlannerProgressedEntries(

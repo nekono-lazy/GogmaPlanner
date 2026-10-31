@@ -427,7 +427,26 @@ export interface KnownValue<T> {
 // `DATABASE_SCHEMA_VERSION` stays 13, `ExportRoot.schemaVersion` stays 16, and
 // `AppSettings.schemaVersion`, `RngState.schemaVersion`,
 // `PRODUCTION_RNG_ENGINE_VERSION` and the Master `dataVersion` are unchanged.
-export const CURRENT_CALCULATION_APP_SCHEMA_VERSION = 20
+//
+// Version 21 fixes the deterministic scheduler's frontier (Issue #373,
+// `docs/PLANNER_SPEC.md` 7, `docs/ISSUE_103_DETERMINISTIC_PLANNER_DESIGN.md`
+// 7.2): a committed Entry's pending holding unit holds its stream position even
+// when it is not the head of its lane. The base lane spans two streams, so a
+// `convert_normal_to_gogma` behind its own Normal (or blind) forges now makes
+// its Skill position wait instead of letting another Entry's skippable unit
+// consume it and drop the Route with `counter_before_current`. For the same
+// PlannerInput the selected / rejected Entries, Steps, Conflicts and completed
+// Targets can differ, and a persisted Plan records no generation strategy, so
+// every version 1..20 ProductionPlan fails closed with
+// `calculation_context_changed`, with no Plan exception. Candidate Search,
+// Route generation, BuildCandidate and BuildListEntry snapshot semantics and
+// staleness do not change, so the explicit build-result exception
+// `21 -> [19, 20]` keeps version 19 and 20 Candidates and Build List Entries
+// usable; version 1..18 stay incompatible. No persisted shape changes:
+// `DATABASE_SCHEMA_VERSION` stays 14, `ExportRoot.schemaVersion` stays 17, and
+// `AppSettings.schemaVersion`, `RngState.schemaVersion`,
+// `PRODUCTION_RNG_ENGINE_VERSION` and the Master `dataVersion` are unchanged.
+export const CURRENT_CALCULATION_APP_SCHEMA_VERSION = 21
 
 export interface CalculationContext {
   gameVersion: string

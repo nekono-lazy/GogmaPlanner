@@ -38,10 +38,13 @@ import {
  * 18 (`docs/DATA_MODEL.md` 3.5). Version 20 (Issue #334 PR-3, one completed
  * weapon per Target) keeps it too: the release that produced
  * `already_satisfied` no longer happens, and every other reason and cause means
- * what it meant under 19 (`docs/PLANNER_SPEC.md` 21.9).
+ * what it meant under 19 (`docs/PLANNER_SPEC.md` 21.9). Version 21 (Issue #373,
+ * the scheduler holding a pending holding unit's position behind its own lane
+ * head) keeps it as well: no reason, cause or Conflict record changes meaning;
+ * the fix only removes the drops a passed hidden holding position caused.
  */
 export const PLAN_COMPLETION_RATIO_CALCULATION_APP_SCHEMA_VERSIONS: ReadonlySet<number> = new Set([
-  14, 15, 16, 17, 18, 19, 20,
+  14, 15, 16, 17, 18, 19, 20, 21,
 ])
 
 /** Why the ratio cannot be told from the records (`docs/PLANNER_SPEC.md` 9.6.9.1 conditions 2 - 5). */
