@@ -6,9 +6,11 @@ import {
 } from '../artian/productionBonusAvailability'
 import type {
   ArtianWeaponKind,
+  CompletionBonusSlots,
   OwnedWeaponStatus,
   RestorationBonusSet,
   RestorationBonusScope,
+  TargetWeapon,
 } from '../models/publicTypes'
 import { V1_NORMAL_ARTIAN_RARITY } from '../models/publicTypes'
 import { completionBonusVariantFromBonuses } from '../target/completionCondition'
@@ -171,5 +173,44 @@ export function createTargetWeaponDraft(master: MasterDataRoot): TargetWeaponDra
     completionSkillVariants: [completionSkillVariantFromCondition({ seriesSkillId: null, groupSkillId: null })],
     completionConditionReview: [],
     memo: null,
+  }
+}
+
+/**
+ * A new Target draft that starts from a registered Target (Issue #377,
+ * `docs/UI_FLOW.md` 8.6): a new registration, never an edit of `source`.
+ *
+ * Only what the Target Weapons form edits is carried over - name, weapon type,
+ * element, priority, enablement, memo and every completion Variant and Skill
+ * configuration, in their order. Each Variant and configuration gets a fresh
+ * editing ID from `createVariantId` and its own objects, so the draft shares
+ * nothing with `source`. The preferred owned weapon, the lifecycle and its
+ * completion records, and the completion condition review start empty as in
+ * any new Target; the save assigns the ID and timestamps.
+ */
+export function createTargetWeaponDuplicateDraft(
+  source: TargetWeapon,
+  createVariantId: () => string,
+): TargetWeaponDraft {
+  return {
+    name: source.name,
+    weaponTypeId: source.weaponTypeId,
+    elementId: source.elementId,
+    priority: source.priority,
+    isEnabled: source.isEnabled,
+    preferredOwnedWeaponId: null,
+    lifecycleStatus: 'active',
+    completedAt: null,
+    completedByProductionPlanId: null,
+    completedWithOwnedWeaponId: null,
+    completionBonusVariants: source.completionBonusVariants.map((variant) => ({
+      id: createVariantId(),
+      slots: variant.slots.map(({ bonusTypeId, minimumRankId }) => ({ bonusTypeId, minimumRankId })) as CompletionBonusSlots,
+    })),
+    completionSkillVariants: source.completionSkillVariants.map(({ seriesSkillId, groupSkillId }) =>
+      completionSkillVariantFromCondition({ seriesSkillId, groupSkillId }, createVariantId()),
+    ),
+    completionConditionReview: [],
+    memo: source.memo,
   }
 }

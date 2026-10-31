@@ -1,5 +1,5 @@
 import type { ArtianBonusScope, MasterDataRoot } from '../master/masterTypes'
-import type { OwnedWeapon, RestorationBonus, TargetWeapon } from '../models/publicTypes'
+import type { CompletionBonusVariant, OwnedWeapon, RestorationBonus, TargetWeapon } from '../models/publicTypes'
 import {
   getProductionAvailableBonusDefinitions,
   ProductionBonusAvailabilityError,
@@ -29,6 +29,44 @@ function bonusKey(bonus: RestorationBonus): string {
   return `${bonus.bonusTypeId}\u0000${bonus.bonusRankId}`
 }
 
+/**
+ * The save-time availability of one weapon type / element / scope: the
+ * Production-available bonus keys, or why they cannot be decided. The save
+ * validation and the editor's display-only `findUnavailableCompletionBonusSlots()`
+ * share it, so the screen never judges availability differently from the save.
+ */
+type BonusAvailabilityKeys =
+  | { readonly kind: 'available'; readonly keys: ReadonlySet<string> }
+  | { readonly kind: 'master_unavailable' }
+  | { readonly kind: 'undeterminable' }
+
+function productionAvailableBonusKeys(
+  master: MasterDataRoot,
+  weaponTypeId: string,
+  elementId: string,
+  scope: ArtianBonusScope,
+): BonusAvailabilityKeys {
+  if (
+    !master.weaponTypes.some(
+      ({ id, isEnabled }) => id === weaponTypeId && isEnabled,
+    ) ||
+    !master.elements.some(
+      ({ id, isEnabled }) => id === elementId && isEnabled,
+    )
+  ) {
+    return { kind: 'master_unavailable' }
+  }
+  try {
+    return {
+      kind: 'available',
+      keys: new Set(getProductionAvailableBonusDefinitions(master, weaponTypeId, elementId, scope).map(bonusKey)),
+    }
+  } catch (caught) {
+    if (caught instanceof ProductionBonusAvailabilityError) return { kind: 'undeterminable' }
+    throw caught
+  }
+}
+
 function validateBonuses(
   master: MasterDataRoot,
   weaponTypeId: string,
@@ -38,29 +76,16 @@ function validateBonuses(
   issues: string[],
 ) {
   if (checks.length === 0) return
-  if (
-    !master.weaponTypes.some(
-      ({ id, isEnabled }) => id === weaponTypeId && isEnabled,
-    ) ||
-    !master.elements.some(
-      ({ id, isEnabled }) => id === elementId && isEnabled,
-    )
-  ) {
+  const availability = productionAvailableBonusKeys(master, weaponTypeId, elementId, scope)
+  if (availability.kind === 'master_unavailable') {
     checks.forEach(({ path }) => issues.push(`${path}: 武器種または属性のマスターデータが利用できません。`))
     return
   }
-  let available: ReadonlySet<string>
-  try {
-    available = new Set(
-      getProductionAvailableBonusDefinitions(master, weaponTypeId, elementId, scope).map(bonusKey),
-    )
-  } catch (caught) {
-    if (caught instanceof ProductionBonusAvailabilityError) {
-      checks.forEach(({ path }) => issues.push(`${path}: この武器種・属性の復元ボーナス抽選対象を判定できないため保存できません。`))
-      return
-    }
-    throw caught
+  if (availability.kind === 'undeterminable') {
+    checks.forEach(({ path }) => issues.push(`${path}: この武器種・属性の復元ボーナス抽選対象を判定できないため保存できません。`))
+    return
   }
+  const available = availability.keys
   checks.forEach(({ bonus, path }) => {
     if (!available.has(bonusKey(bonus))) {
       issues.push(`${path}: この武器種・属性ではProductionで抽選されない復元ボーナス／ランクです。選択肢から選び直してください。`)
@@ -144,4 +169,34 @@ export function validateTargetWeaponMasterReferences(
     }))),
     issues)
   return issues
+}
+
+/** The slots of one completion Variant outside the Production availability (`slotIndexes` 0-based, in slot order). */
+export interface UnavailableCompletionBonusSlots {
+  readonly index: number
+  readonly slotIndexes: readonly number[]
+}
+
+/**
+ * The completion Variant slots the save would refuse as outside the Production
+ * availability of the weapon type / element (`docs/UI_FLOW.md` 8.6, Issue
+ * #377), judged with the very availability `validateTargetWeaponMasterReferences()`
+ * uses. Display only: the save validation still runs as it is. `null` when the
+ * availability cannot be decided at all (the save then refuses every slot with
+ * its own reason, and the slot editor shows that error).
+ */
+export function findUnavailableCompletionBonusSlots(
+  master: MasterDataRoot,
+  weaponTypeId: string,
+  elementId: string,
+  variants: readonly Pick<CompletionBonusVariant, 'slots'>[],
+): UnavailableCompletionBonusSlots[] | null {
+  const availability = productionAvailableBonusKeys(master, weaponTypeId, elementId, 'gogma_artian')
+  if (availability.kind !== 'available') return null
+  return variants.flatMap((variant, index) => {
+    const slotIndexes = variant.slots.flatMap((slot, slotIndex) =>
+      availability.keys.has(bonusKey({ bonusTypeId: slot.bonusTypeId, bonusRankId: slot.minimumRankId })) ? [] : [slotIndex],
+    )
+    return slotIndexes.length === 0 ? [] : [{ index, slotIndexes }]
+  })
 }

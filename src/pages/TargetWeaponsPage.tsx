@@ -85,6 +85,7 @@ import {
 import {
   createDefaultBonusSet,
   createTargetWeaponDraft,
+  createTargetWeaponDuplicateDraft,
   MasterOptionsUnavailableError,
 } from '../domain/forms/entityDrafts'
 import type {
@@ -310,6 +311,33 @@ function deleteReferenceMessage(error: ReferencedEntityDeleteError) {
   return sentences.length > 0 ? sentences.join('') : '参照中のため削除できません。'
 }
 
+/**
+ * The notice that opens a duplicated new registration (Issue #377,
+ * `docs/UI_FLOW.md` 8.6): which Target it starts from, that saving adds a new
+ * Target and leaves the source alone, and what does not carry over. It is the
+ * dialog's description, so it is read with the 「目標武器を追加」 title.
+ */
+function DuplicateSourceNotice({ id, source }: { id: string; source: TargetWeapon }) {
+  return (
+    <Alert severity="info" id={id} role="note">
+      <Stack spacing={0.5}>
+        <Typography component="p" variant="body2" sx={{ fontWeight: 700, overflowWrap: 'anywhere' }}>
+          「{source.name}」を複製しています
+        </Typography>
+        <Typography component="p" variant="body2">
+          保存すると、新しい目標武器として追加されます。複製元の目標武器は変更されません。
+        </Typography>
+        <Typography component="p" variant="body2">
+          優先する所持武器は引き継ぎません（「指定なし」から始まります）。
+        </Typography>
+        <Typography component="p" variant="body2">
+          属性を変えても完成ボーナス構成はそのまま残ります。この武器種・属性で抽選されない枠があれば選び直してください。武器種を変えると、完成ボーナス構成は初期値に戻ります。
+        </Typography>
+      </Stack>
+    </Alert>
+  )
+}
+
 /** The delete confirmation (Issue #371): what goes with the Target and what never does. */
 function deleteTargetConfirmation(target: TargetWeapon): string {
   return `${target.name}を削除しますか？\n\nこの目標武器の保存済みの検索候補も削除されます。ビルドリストと生産計画は自動では削除されません。`
@@ -356,6 +384,10 @@ export function TargetWeaponsPage({
   const [loading, setLoading] = useState(api !== null)
   const [loadFailed, setLoadFailed] = useState(false)
   const [editing, setEditing] = useState<TargetWeapon | null>(null)
+  // The registered Target a new registration was duplicated from (Issue #377,
+  // `docs/UI_FLOW.md` 8.6). Only the draft's starting point and the element
+  // change rule: the save is an ordinary new registration (`editing` is null).
+  const [duplicateSource, setDuplicateSource] = useState<TargetWeapon | null>(null)
   const [draft, setDraft] = useState<TargetWeaponDraft | null>(null)
   const [error, setError] = useState<string | null>(
     api ? null : 'マスターデータが利用できません。',
@@ -408,6 +440,7 @@ export function TargetWeaponsPage({
   const listHeadingId = useId()
   const completedHeadingId = useId()
   const preferredHelpId = useId()
+  const duplicateNoticeId = useId()
   // 「この武器で目標を完了にする」 (`docs/UI_FLOW.md` 8.2): the Service result is
   // mirrored into the lists without a reload - the completed Target, the
   // protected weapon and the released preferences alike.
@@ -525,6 +558,7 @@ export function TargetWeaponsPage({
   const openNew = () => {
     try {
       setEditing(null)
+      setDuplicateSource(null)
       setDraft(createTargetWeaponDraft(master))
       setFormError(null)
       setError(null)
@@ -546,8 +580,22 @@ export function TargetWeaponsPage({
     void _createdAt
     void _updatedAt
     setEditing(target)
+    setDuplicateSource(null)
     setDraft(structuredClone(value))
     setFormError(null)
+  }
+
+  /**
+   * 「複製」 (Issue #377, `docs/UI_FLOW.md` 8.6): the 「目標武器を追加」 dialog -
+   * a new registration, never an edit of `target` - starting from what the
+   * form edits of it. Nothing is written until 保存.
+   */
+  const openDuplicate = (target: TargetWeapon) => {
+    setEditing(null)
+    setDuplicateSource(target)
+    setDraft(createTargetWeaponDuplicateDraft(target, () => crypto.randomUUID()))
+    setFormError(null)
+    setError(null)
   }
 
   const closeDialog = () => {
@@ -555,6 +603,7 @@ export function TargetWeaponsPage({
     // breaking-change warning both return to it.
     if (savePendingRef.current) return
     setDraft(null)
+    setDuplicateSource(null)
     setFormError(null)
   }
 
@@ -608,6 +657,7 @@ export function TargetWeaponsPage({
           // The edit is left unsaved: the dialog closes, then the replan opens.
           setDraft(null)
           setEditing(null)
+          setDuplicateSource(null)
           setFormError(null)
           openReplanExclusion(outcome.replanExclusion)
         }
@@ -633,6 +683,7 @@ export function TargetWeaponsPage({
       )
       setDraft(null)
       setEditing(null)
+      setDuplicateSource(null)
       setFormError(null)
       setNotice(outcome.planAbandoned ? `目標武器を保存し、${PLAN_ABANDONED_SUFFIX}` : '目標武器を保存しました。')
       setError(null)
@@ -725,6 +776,7 @@ export function TargetWeaponsPage({
     value: TargetWeaponDraft,
     weaponTypeId: string,
     elementId: string,
+    keepCompletionBonusVariants = false,
   ): TargetWeaponDraft => {
     // Changing the Target's own definition can make its preferred weapon
     // incompatible. Clearing it here touches the draft only; nothing is written
@@ -745,13 +797,18 @@ export function TargetWeaponsPage({
         : null,
       // The weapon type / element decides every slot's choices, so the
       // completion Variants restart from one default Variant
-      // (`docs/UI_FLOW.md` 8).
-      completionBonusVariants: [
-        completionBonusVariantFromBonuses(
-          createDefaultBonusSet(master, weaponTypeId, elementId, 'gogma_artian'),
-          crypto.randomUUID(),
-        ),
-      ],
+      // (`docs/UI_FLOW.md` 8). The one exception is an element change of a
+      // duplicated new registration (`docs/UI_FLOW.md` 8.6): every Variant is
+      // kept as it is, a slot the new element cannot draw included, and the
+      // editor and the save validation name such a slot instead.
+      completionBonusVariants: keepCompletionBonusVariants
+        ? value.completionBonusVariants
+        : [
+            completionBonusVariantFromBonuses(
+              createDefaultBonusSet(master, weaponTypeId, elementId, 'gogma_artian'),
+              crypto.randomUUID(),
+            ),
+          ],
     }
   }
 
@@ -942,6 +999,7 @@ export function TargetWeaponsPage({
                     </Stack>
                   }
                   onEdit={() => openEdit(target)}
+                  onDuplicate={() => openDuplicate(target)}
                   onDelete={() => void remove(target)}
                 />
               ))}
@@ -1024,6 +1082,7 @@ export function TargetWeaponsPage({
           onClose={closeDialog}
           fullWidth
           maxWidth="md"
+          aria-describedby={duplicateSource !== null ? duplicateNoticeId : undefined}
           slotProps={{ paper: { sx: dialogPaperSx } }}
         >
           <DialogTitle sx={{ px: { xs: 2, sm: 3 } }}>
@@ -1032,6 +1091,7 @@ export function TargetWeaponsPage({
           {draft && (
             <DialogContent dividers sx={{ px: { xs: 2, sm: 3 } }}>
               <Stack spacing={3}>
+                {duplicateSource !== null && <DuplicateSourceNotice id={duplicateNoticeId} source={duplicateSource} />}
                 {draft.completionConditionReview.length > 0 && (
                   // `docs/UI_FLOW.md` 8.4: the reasons, in words, what to check
                   // for each, and that the explicit save - never closing - is
@@ -1111,6 +1171,8 @@ export function TargetWeaponsPage({
                                 draft,
                                 draft.weaponTypeId,
                                 event.target.value,
+                                // Issue #377: a duplicate keeps its Variants across an element change.
+                                duplicateSource !== null,
                               ),
                             )
                           } catch (caught) {

@@ -4,15 +4,21 @@ import type { MasterDataRoot } from '../../domain/master/masterTypes'
 import type { CompletionBonusVariant, RestorationBonusSet } from '../../domain/models/publicTypes'
 import { createDefaultBonusSet } from '../../domain/forms/entityDrafts'
 import {
+  findUnavailableCompletionBonusSlots,
+  type UnavailableCompletionBonusSlots,
+} from '../../domain/artian/entityMasterValidation'
+import {
   completionBonusVariantFromBonuses,
   completionVariantMinimumBonuses,
   findCompletionVariantConflicts,
   type CompletionVariantConflict,
 } from '../../domain/target/completionCondition'
 import { BonusSlotList } from '../ManagementListItem'
+import { bonusLabel } from '../search/searchPresentation'
 import { StatusChip } from '../StatusChip'
 import { BonusSetEditor } from './BonusSetEditor'
 import {
+  COMPLETION_VARIANT_UNAVAILABLE_BADGE,
   COMPLETION_VARIANTS_ADD_HELP_TEXT,
   COMPLETION_VARIANTS_HELP_TEXT,
   COMPLETION_VARIANTS_MINIMUM_NOTE,
@@ -22,6 +28,9 @@ import {
   completionVariantConflictShortReason,
   completionVariantConflictSummary,
   completionVariantHeading,
+  completionVariantUnavailableShortReason,
+  completionVariantUnavailableSlotsMessage,
+  completionVariantUnavailableSummary,
   minimumRankSlotLabel,
 } from '../target/completionConditionPresentation'
 
@@ -114,6 +123,18 @@ export function CompletionBonusVariantsEditor({
     conflicts = []
   }
   const conflictOf = (index: number) => conflicts.find((conflict) => conflict.index === index) ?? null
+  // The slots the save would refuse as outside the Production availability of
+  // this weapon type / element - typically after a duplicated Target's element
+  // changed (`docs/UI_FLOW.md` 8.6) - from the availability the save validation
+  // itself uses. Display only: they are never rewritten, and the save still decides.
+  let unavailable: UnavailableCompletionBonusSlots[] = []
+  try {
+    unavailable = findUnavailableCompletionBonusSlots(master, weaponTypeId, elementId, value) ?? []
+  } catch {
+    // The slot editor and the save validation report a Master they cannot read.
+    unavailable = []
+  }
+  const unavailableOf = (index: number) => unavailable.find((entry) => entry.index === index) ?? null
   const justDuplicatedFrom = (variant: CompletionBonusVariant, conflict: CompletionVariantConflict | null): number | null => {
     const sourceId = duplicatedFrom.get(variant.id)
     if (conflict === null || conflict.kind !== 'duplicate' || sourceId === undefined) return null
@@ -124,6 +145,7 @@ export function CompletionBonusVariantsEditor({
     heading: `${baseId}-variant-${index}-heading`,
     editor: `${baseId}-variant-${index}-editor`,
     error: `${baseId}-variant-${index}-error`,
+    unavailable: `${baseId}-variant-${index}-unavailable`,
   })
 
   const focusHeading = (id: string) => headingRefs.current.get(id)?.focus()
@@ -246,6 +268,34 @@ export function CompletionBonusVariantsEditor({
           </Box>
         </Alert>
       )}
+      {!single && unavailable.length > 0 && (
+        // Folded cards show only their summaries, so the slots the save would
+        // refuse are named here too, each item moving to its card. A lone
+        // Variant is always open, and its slot editor says so itself.
+        <Alert severity="warning">
+          <Typography variant="body2" sx={{ fontWeight: 700 }}>
+            {completionVariantUnavailableSummary(unavailable.length)}
+          </Typography>
+          <Box component="ul" sx={{ m: 0, mt: 0.5, p: 0, listStyle: 'none' }}>
+            {unavailable.map(({ index, slotIndexes }) => {
+              const variant = value[index]
+              if (variant === undefined) return null
+              return (
+                <li key={variant.id}>
+                  <Button
+                    variant="text"
+                    color="inherit"
+                    onClick={() => focusHeading(variant.id)}
+                    sx={{ minHeight: 44, px: 0.5, textAlign: 'left', textDecoration: 'underline' }}
+                  >
+                    {completionVariantUnavailableShortReason(index, slotIndexes)}
+                  </Button>
+                </li>
+              )
+            })}
+          </Box>
+        </Alert>
+      )}
       {!single && (
         <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: 'wrap' }}>
           <Button variant="text" onClick={() => setExpanded(value.map(({ id }) => id), true)} sx={{ minHeight: 44 }}>
@@ -263,7 +313,14 @@ export function CompletionBonusVariantsEditor({
           const expanded = isExpanded(variant)
           const ids = variantIds(index)
           const heading = completionVariantHeading(index)
-          const describedBy = conflict ? `${ids.heading} ${ids.error}` : ids.heading
+          const unavailableSlots = unavailableOf(index)
+          // While the card is open, the slot Selects name these slots themselves.
+          const unavailableMessageShown = unavailableSlots !== null && !expanded
+          const describedBy = [
+            ids.heading,
+            ...(conflict ? [ids.error] : []),
+            ...(unavailableMessageShown ? [ids.unavailable] : []),
+          ].join(' ')
           return (
             <Box
               component="li"
@@ -275,7 +332,7 @@ export function CompletionBonusVariantsEditor({
                 border: expanded && !single ? 2 : 1,
                 borderColor: conflict
                   ? duplicatedFromIndex === null ? 'error.main' : 'warning.main'
-                  : expanded && !single ? 'primary.main' : 'divider',
+                  : unavailableSlots !== null ? 'warning.main' : expanded && !single ? 'primary.main' : 'divider',
                 borderRadius: 1,
               }}
             >
@@ -300,6 +357,7 @@ export function CompletionBonusVariantsEditor({
                       tone="caution"
                     />
                   )}
+                  {unavailableSlots !== null && <StatusChip label={COMPLETION_VARIANT_UNAVAILABLE_BADGE} tone="caution" />}
                   {expanded && !single && <StatusChip label="編集中" tone="info" />}
                 </Stack>
                 {!expanded && (
@@ -320,6 +378,24 @@ export function CompletionBonusVariantsEditor({
                     sx={{ color: duplicatedFromIndex === null ? 'error.main' : 'warning.main', overflowWrap: 'anywhere' }}
                   >
                     {completionVariantConflictMessage(conflict, duplicatedFromIndex)}
+                  </Typography>
+                )}
+                {unavailableMessageShown && (
+                  <Typography
+                    id={ids.unavailable}
+                    variant="body2"
+                    sx={{ color: 'warning.main', overflowWrap: 'anywhere' }}
+                  >
+                    {completionVariantUnavailableSlotsMessage(
+                      unavailableSlots.slotIndexes.map((slotIndex) => {
+                        const slot = variant.slots[slotIndex]!
+                        const bonus = { bonusTypeId: slot.bonusTypeId, bonusRankId: slot.minimumRankId }
+                        return {
+                          slotIndex,
+                          label: minimumRankSlotLabel(bonusLabel(bonus, weaponTypeId, master, 'gogma_artian'), slot.minimumRankId, master),
+                        }
+                      }),
+                    )}
                   </Typography>
                 )}
                 {expanded && (

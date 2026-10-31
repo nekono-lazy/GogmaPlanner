@@ -333,10 +333,18 @@ export function completionVariantConflictMessage(
  * the Service's own (`path: message`); only the display changes: an issue
  * repeated by two validations is shown once, and a completion Variant issue,
  * whose message already names its Variant (「完成構成3は…」), drops the internal
- * `completionBonusVariants[n]` path. Nothing is judged here.
+ * `completionBonusVariants[n]` path. A slot issue, whose message does not name
+ * its slot (a slot the weapon type / element cannot draw, Issue #377), reads
+ * 「完成構成2の枠1: …」 instead of `completionBonusVariants[1].slots[0]`.
+ * Nothing is judged here.
  */
 export function targetFormValidationIssuesText(issues: readonly string[]): string {
-  return [...new Set(issues.map((issue) => issue.replace(/^completion(?:Bonus|Skill)Variants(?:\[\d+\])?: /, '')))].join(' / ')
+  return [...new Set(issues.map((issue) => issue
+    .replace(
+      /^completionBonusVariants\[(\d+)\]\.slots\[(\d+)\]: /,
+      (_, variantIndex: string, slotIndex: string) => `${completionVariantHeading(Number(variantIndex))}の枠${Number(slotIndex) + 1}: `,
+    )
+    .replace(/^completion(?:Bonus|Skill)Variants(?:\[\d+\])?: /, '')))].join(' / ')
 }
 
 /**
@@ -420,4 +428,29 @@ export function completionSkillVariantConflictSummary(count: number): string {
 /** The summary above the Variants while any of them cannot be saved. */
 export function completionVariantConflictSummary(count: number): string {
   return `保存できない完成構成が${count}件あります。`
+}
+
+/**
+ * The short state of a Variant holding a slot the weapon type / element cannot
+ * draw (Issue #377, `docs/UI_FLOW.md` 8.6), next to its heading.
+ */
+export const COMPLETION_VARIANT_UNAVAILABLE_BADGE = '抽選対象外の枠あり・保存できません'
+
+/**
+ * Which slots of a folded Variant cannot be drawn and how to fix it. Each slot
+ * is named by its number and its summary label (「枠3（属性強化EX）」).
+ */
+export function completionVariantUnavailableSlotsMessage(slots: readonly { slotIndex: number; label: string }[]): string {
+  const named = slots.map(({ slotIndex, label }) => `枠${slotIndex + 1}（${label}）`).join('、')
+  return `${named}は、この武器種・属性では抽選されないため保存できません。「5枠を編集」で選び直すか、この構成を削除してください。`
+}
+
+/** One line of the unavailable slot summary: 「完成構成2: 枠1・枠3が抽選対象外」. */
+export function completionVariantUnavailableShortReason(index: number, slotIndexes: readonly number[]): string {
+  return `${completionVariantHeading(index)}: ${slotIndexes.map((slotIndex) => `枠${slotIndex + 1}`).join('・')}が抽選対象外`
+}
+
+/** The summary above two or more Variants while any of them holds a slot the weapon type / element cannot draw. */
+export function completionVariantUnavailableSummary(count: number): string {
+  return `この武器種・属性で抽選されない枠を含む完成構成が${count}件あります。`
 }

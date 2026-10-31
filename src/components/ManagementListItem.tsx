@@ -18,9 +18,11 @@ import { bonusLabel } from './search/searchPresentation'
  * stacks into a card on a smartphone, uses two columns from `md`, and becomes a
  * table-like row from `lg` where the content column is wide enough. Nothing is
  * rendered twice and hidden with CSS, so every control is exposed exactly once
- * to assistive technology. The edit / delete buttons keep their short visible
- * names and are described by the entity heading, so a screen reader can tell
- * which entity they act on.
+ * to assistive technology. The edit / (duplicate) / delete buttons keep their
+ * short visible names and are described by the entity heading, so a screen
+ * reader can tell which entity they act on. 「複製」 appears only for a list that
+ * passes `onDuplicate` (the Target Weapons list, `docs/UI_FLOW.md` 8.6), between
+ * 編集 and the destructive 削除, which stays last.
  */
 export function ManagementListItem({
   title,
@@ -30,6 +32,7 @@ export function ManagementListItem({
   status,
   muted = false,
   onEdit,
+  onDuplicate,
   onDelete,
 }: {
   title: string
@@ -39,6 +42,7 @@ export function ManagementListItem({
   status: ReactNode
   muted?: boolean
   onEdit(): void
+  onDuplicate?(): void
   onDelete(): void
 }) {
   const headingId = useId()
@@ -95,6 +99,16 @@ export function ManagementListItem({
         >
           編集
         </Button>
+        {onDuplicate && (
+          <Button
+            variant="outlined"
+            onClick={onDuplicate}
+            aria-describedby={headingId}
+            sx={{ minHeight: 44, flex: { xs: 1, md: 'none' }, minWidth: 88 }}
+          >
+            複製
+          </Button>
+        )}
         <Button
           color="error"
           onClick={onDelete}
