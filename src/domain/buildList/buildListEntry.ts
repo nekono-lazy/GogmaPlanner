@@ -4,7 +4,6 @@ import type {
   BuildListEntryId,
   BuildRoute,
   GroupSkillId,
-  IntermediateStateSelection,
   RestorationBonus,
   RestorationBonusScope,
   RestorationBonusSet,
@@ -14,6 +13,7 @@ import type {
 } from '../models/publicTypes'
 import { hashStableValue, stableStringify } from '../models/hashing'
 import { isBuildResultCalculationContextCompatible } from '../models/domainRules'
+import { normalizeCompletionBonusVariants } from '../target/completionCondition'
 
 function compareStable(left: unknown, right: unknown): number {
   const leftValue = stableStringify(left)
@@ -29,33 +29,32 @@ function normalizeBonuses(bonuses: readonly RestorationBonus[]) {
 
 /**
  * The Target performance definition that decides whether a Candidate exists and
- * what it means (`docs/PLANNER_SPEC.md` 16.11).
+ * what it means (`docs/PLANNER_SPEC.md` 16.11, `docs/DATA_MODEL.md` 9.4).
+ *
+ * Only the weapon type, element, the normalized completion Variants and the
+ * completion Skill condition enter. The Variants are normalized as a multiset
+ * per Variant (slot order ignored, duplicate counts kept) and sorted, and the
+ * Variant `id` is dropped, so reordering Variants or slots or renaming an `id`
+ * changes nothing, while adding, removing or lowering a Variant does.
  *
  * `priority`, `isEnabled`, `preferredOwnedWeaponId`, the lifecycle
- * (`lifecycleStatus`, `completedAt`, `completedByProductionPlanId`), `name`,
- * `memo` and timestamps are deliberately excluded: they are planning input or
- * execution state, not what a Candidate satisfies, so changing them never stales
- * a BuildListEntry with `target_definition_changed`. The planning-input hashes of
- * a ProductionPlan carry them separately.
+ * (`lifecycleStatus`, `completedAt`, `completedByProductionPlanId`),
+ * `completionConditionReview`, `name`, `memo` and timestamps are deliberately
+ * excluded: they are planning input or execution state, not what a Candidate
+ * satisfies, so changing them never stales a BuildListEntry with
+ * `target_definition_changed`. The planning-input hashes of a ProductionPlan
+ * carry them separately.
  */
 export function createTargetDefinitionHash(target: TargetWeapon): string {
   return hashStableValue({
     weaponTypeId: target.weaponTypeId,
     elementId: target.elementId,
-    idealBonuses: normalizeBonuses(target.idealBonuses),
-    practicalBonusConditions: target.practicalBonusConditions
-      .map((condition) => ({ ...condition }))
-      .sort(compareStable),
-    alternativeBonusRules: target.alternativeBonusRules
-      .map((group) => ({
-        id: group.id,
-        sourceBonusTypeId: group.sourceBonusTypeId,
-        maxReplacementCount: group.maxReplacementCount,
-        options: group.options.map((option) => ({ ...option })).sort(compareStable),
-      }))
-      .sort(compareStable),
-    idealSkillCondition: { ...target.idealSkillCondition },
-    practicalSkillCondition: { ...target.practicalSkillCondition },
+    completionBonusVariants: normalizeCompletionBonusVariants(target.completionBonusVariants),
+    completionSkillCondition: {
+      seriesSkillId: target.completionSkillCondition.seriesSkillId,
+      groupSkillId: target.completionSkillCondition.groupSkillId,
+      matchMode: target.completionSkillCondition.matchMode,
+    },
   })
 }
 
@@ -108,43 +107,30 @@ export function isSameBuildListCandidate(
   )
 }
 
+/**
+ * A new Entry carries no `intermediateStateSelection` (Issue #100,
+ * `docs/PLANNER_SPEC.md` 20.7 / 20.10): the lane selection and the improvement
+ * preference were abolished, so there is no option to set one. A legacy Entry
+ * that holds one keeps it exactly as persisted; nothing here writes or clears it.
+ */
 export interface CreateBuildListEntryOptions {
   id?: BuildListEntryId
   createdAt?: string
-  /**
-   * The intermediate states and improvement preference the user chose on the
-   * Search screen.
-   *
-   * They are the Entry's own Planner input, so they never take part in
-   * `createEntryId()` or `createBuildCandidateMeaningFingerprint()`: two Entries
-   * differing only in their selection would otherwise be two different
-   * Candidates, which they are not (`docs/DATA_MODEL.md` 9.4).
-   */
-  intermediateStateSelection?: IntermediateStateSelection
-}
-
-/** Nothing selected on either lane, and the improvement order left to the Planner. */
-export function defaultIntermediateStateSelection(): IntermediateStateSelection {
-  return { skillOpportunityId: null, bonusOpportunityId: null, improvementPreference: 'planner' }
 }
 
 /**
- * Replaces one Entry's intermediate state selection and improvement preference.
- *
- * It is an ordinary Build List edit, not a recalculation: the Candidate
- * Snapshot, both hashes and the `CalculationContext` are untouched, so the
- * Entry does not become stale. What it does change is the Plan's build-list
- * semantic hash, which is what makes an existing Plan a recalculation target
- * (`docs/PLANNER_SPEC.md` 7.5.5).
+ * Whether a legacy Entry selected an intermediate state on at least one lane
+ * (calculation schema 11..18, `docs/PLANNER_SPEC.md` 7.5, abolished by Issue
+ * #100). Schema 19 Entries carry no selection; the Planner fails an input with
+ * such a valid Entry closed instead of reading the selection as empty
+ * (`docs/PLANNER_SPEC.md` 20.7 / 20.10).
  */
-export function withIntermediateStateSelection(
-  entry: BuildListEntry,
-  selection: IntermediateStateSelection,
-): BuildListEntry {
-  return {
-    ...entry,
-    intermediateStateSelection: { ...selection },
-  }
+export function hasIntermediateStateSelection(entry: BuildListEntry): boolean {
+  const selection = entry.intermediateStateSelection
+  return (
+    selection !== undefined &&
+    (selection.skillOpportunityId !== null || selection.bonusOpportunityId !== null)
+  )
 }
 
 function createEntryId(candidate: BuildCandidate, createdAt: string): BuildListEntryId {
@@ -169,9 +155,9 @@ export function createBuildListEntry(
     candidateId: candidate.id,
     targetWeaponId: target.id,
     candidateSnapshot: structuredClone(candidate),
-    intermediateStateSelection: {
-      ...(options.intermediateStateSelection ?? defaultIntermediateStateSelection()),
-    },
+    // Issue #100: no `intermediateStateSelection`. An absent field normalizes
+    // to the same Plan hash as the legacy empty selection
+    // (`docs/PLANNER_SPEC.md` 20.3).
     targetDefinitionHash: createTargetDefinitionHash(target),
     searchStateHash: candidate.searchStateHash,
     referencedOwnedWeaponsHash: candidate.referencedOwnedWeaponsHash,

@@ -1,98 +1,45 @@
-import type {
-  BonusRankId,
-  GroupSkillId,
-  SeriesSkillId,
-  SkillCondition,
-  TargetWeapon,
-} from '../models/publicTypes'
+import type { BonusRankId, TargetWeapon } from '../models/publicTypes'
 import type {
   DomainValidationIssue,
   DomainValidationResult,
 } from '../models/validation'
-import { evaluateBonusCondition } from './bonusConditionEvaluator'
 import { validateTargetWeapon } from '../models/validation'
-import { hasPracticalSkillCondition } from './targetEvaluator'
-import { evaluateSkillCondition } from './skillConditionEvaluator'
+import { findCompletionVariantConflicts } from './completionCondition'
 import type { TargetEvaluationMasterSubset } from './targetEvaluationTypes'
 
-const UNMATCHED_SKILL_ID = 'skill.unmatched.ideal_implies_practical'
-
-function referencedBonusRankIds(target: TargetWeapon): BonusRankId[] {
-  return [
-    ...target.idealBonuses.map((bonus) => bonus.bonusRankId),
-    ...target.practicalBonusConditions.map(
-      (condition) => condition.minimumRankId,
-    ),
-    ...target.alternativeBonusRules.flatMap((group) =>
-      group.options.map((option) => option.minimumRankId),
-    ),
-  ]
-}
-
+/**
+ * The minimum ranks missing from Master Data. Only existence is read: a rank
+ * the Master keeps with `isEnabled = false` still has its `order` and stays a
+ * valid reference here, exactly as the Import Master ID check treats it
+ * (`docs/DATA_MODEL.md` 8.2 / 15.2). Whether a rank may be chosen when the
+ * user saves is the Production availability of
+ * `validateTargetWeaponMasterReferences()`, which this never stands in for.
+ */
 function unresolvableBonusRankIds(
   target: TargetWeapon,
   master: TargetEvaluationMasterSubset,
 ): BonusRankId[] {
-  const known = new Set(master.bonusRanks.filter((rank) => rank.isEnabled).map((rank) => rank.id))
+  const known = new Set(master.bonusRanks.map((rank) => rank.id))
   return [
-    ...new Set(referencedBonusRankIds(target).filter((id) => !known.has(id))),
+    ...new Set(
+      target.completionBonusVariants
+        .flatMap((variant) => variant.slots.map((slot) => slot.minimumRankId))
+        .filter((id) => !known.has(id)),
+    ),
   ]
 }
 
 /**
- * Finite symbolic universe for one skill slot.
- *
- * `evaluateSkillCondition` observes a skill value only through the equality
- * predicates `value === ideal.<slot>` and `value === practical.<slot>`, so the
- * mentioned IDs plus one value matching neither and `null` realize every
- * combination those two predicates can take. This is a logical implication
- * check over the SkillCondition expressions themselves, not an enumeration of
- * the Skill IDs that currently exist in Master Data.
+ * The completion condition invariants that need Master Data
+ * (`docs/DATA_MODEL.md` 8.2): the structural `validateTargetWeapon()` first,
+ * then every minimum rank must resolve, and no Variant may be included in
+ * another (a Variant accepting a subset of what another accepts adds nothing,
+ * Owner decision D2). Rank comparison uses the Master `order` as its only
+ * authority, so this validation and the completion judgement can never
+ * disagree. The save Service, Import and the Candidate Search input all read
+ * this one function.
  */
-function symbolicSkillValues(
-  idealSkillId: string | null,
-  practicalSkillId: string | null,
-): (string | null)[] {
-  const mentioned = [idealSkillId, practicalSkillId].filter(
-    (id): id is string => id !== null,
-  )
-  let unmatched = UNMATCHED_SKILL_ID
-  while (mentioned.includes(unmatched)) unmatched = `${unmatched}.x`
-  return [...new Set<string | null>([...mentioned, unmatched, null])]
-}
-
-export function skillConditionImplies(
-  ideal: SkillCondition,
-  practical: SkillCondition,
-): boolean {
-  const seriesValues = symbolicSkillValues(
-    ideal.seriesSkillId,
-    practical.seriesSkillId,
-  ) as (SeriesSkillId | null)[]
-  const groupValues = symbolicSkillValues(
-    ideal.groupSkillId,
-    practical.groupSkillId,
-  ) as (GroupSkillId | null)[]
-
-  return seriesValues.every((seriesSkillId) =>
-    groupValues.every((groupSkillId) => {
-      if (!evaluateSkillCondition(ideal, seriesSkillId, groupSkillId)) {
-        return true
-      }
-      return evaluateSkillCondition(practical, seriesSkillId, groupSkillId)
-    }),
-  )
-}
-
-/**
- * Ideal ⇒ Practical containment invariant (`docs/DATA_MODEL.md` 8.1).
- *
- * Requires Master Data because Bonus Rank comparison uses the Master `order`
- * as its authority. The Bonus side reuses the Target evaluators verbatim, so
- * validation and Target evaluation can never disagree about the same
- * condition.
- */
-export function validateTargetIdealImpliesPractical(
+export function validateTargetCompletionConditions(
   target: TargetWeapon,
   master: TargetEvaluationMasterSubset,
 ): DomainValidationResult {
@@ -103,36 +50,22 @@ export function validateTargetIdealImpliesPractical(
   const unresolvable = unresolvableBonusRankIds(target, master)
   if (unresolvable.length > 0) {
     issues.push({
-      path: 'idealBonuses',
+      path: 'completionBonusVariants',
       code: 'invalid_reference',
-      message: `Ideal ⇒ Practical containment cannot be evaluated because Bonus Rank ID(s) ${unresolvable.join(', ')} are missing from Master Data.`,
+      message: `The completion Variants cannot be evaluated because Bonus Rank ID(s) ${unresolvable.join(', ')} are missing from Master Data.`,
     })
-  } else {
-    target.practicalBonusConditions.forEach((condition, index) => {
-      if (evaluateBonusCondition(condition, target.idealBonuses, master)) return
+    return { isValid: false, issues }
+  }
+
+  findCompletionVariantConflicts(target.completionBonusVariants, master)
+    .filter(({ kind }) => kind === 'included')
+    .forEach(({ index, otherIndex }) => {
       issues.push({
-        path: `practicalBonusConditions[${index}]`,
+        path: `completionBonusVariants[${index}]`,
         code: 'invalid_structure',
-        message:
-          'Ideal ⇒ Practical containment violated on the Bonus side: idealBonuses does not satisfy this practical bonus condition.',
+        message: `完成構成${index + 1}は完成構成${otherIndex + 1}に含まれます（完成構成${otherIndex + 1}を満たさずにこの構成だけを満たす武器はありません）。`,
       })
     })
-
-  }
-
-  if (
-    hasPracticalSkillCondition(target) && !skillConditionImplies(
-      target.idealSkillCondition,
-      target.practicalSkillCondition,
-    )
-  ) {
-    issues.push({
-      path: 'practicalSkillCondition',
-      code: 'invalid_structure',
-      message:
-        'Ideal ⇒ Practical containment violated on the Skill side: a skill result satisfying idealSkillCondition does not always satisfy practicalSkillCondition.',
-    })
-  }
 
   return { isValid: issues.length === 0, issues }
 }

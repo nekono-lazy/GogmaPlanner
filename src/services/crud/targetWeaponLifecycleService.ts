@@ -13,7 +13,12 @@ import {
   type TargetWeapon,
   type TargetWeaponId,
 } from '../../domain/models/publicTypes'
-import { isOwnedIdealForTarget, validateTargetPreferredOwnedWeapons } from '../../domain/target'
+import {
+  collectCompletionAssignedOwnedWeaponIds,
+  isCompletionAssignedElsewhere,
+  isOwnedIdealForTarget,
+  validateTargetOwnedWeaponCollections,
+} from '../../domain/target'
 import {
   defaultPlanGuardedPersistence,
   type PlanGuardedPersistence,
@@ -31,19 +36,28 @@ export type TargetWeaponLifecycleErrorCode =
   | 'target_not_found'
   | 'target_not_active'
   | 'target_not_completed'
+  | 'target_completion_condition_review_required'
   | 'owned_weapon_not_found'
   | 'owned_weapon_not_gogma'
   | 'owned_weapon_incompatible'
   | 'owned_weapon_no_longer_ideal'
+  /**
+   * The weapon is already the completion of another Target (Issue #334,
+   * `docs/DATA_MODEL.md` 8.7): one weapon completes at most one Target, so it
+   * cannot complete this one too, however it performs.
+   */
+  | 'owned_weapon_completion_assigned'
 
 const lifecycleErrorMessages: Record<TargetWeaponLifecycleErrorCode, string> = {
   target_not_found: 'この目標武器はすでに存在しません。一覧を更新してください。',
   target_not_active: 'この目標武器はすでに完了済みです。一覧を更新してください。',
   target_not_completed: 'この目標武器はすでに未完了です。一覧を更新してください。',
+  target_completion_condition_review_required: 'この目標武器は完成条件の再設定が必要です。内容を確認して保存してから、目標を完了にしてください。',
   owned_weapon_not_found: 'この所持武器はすでに存在しません。一覧を更新してください。',
   owned_weapon_not_gogma: 'この所持武器は巨戟アーティアではないため、目標の完了に使えません。一覧を更新してください。',
   owned_weapon_incompatible: 'この所持武器の武器種または属性が目標武器と一致しなくなったため、目標を完了にできません。一覧を更新してください。',
-  owned_weapon_no_longer_ideal: 'この所持武器の現在の性能は目標武器の理想条件を満たしていないため、目標を完了にできません。一覧を更新してください。',
+  owned_weapon_no_longer_ideal: 'この所持武器の現在の性能は目標武器の完成条件を満たしていないため、目標を完了にできません。一覧を更新してください。',
+  owned_weapon_completion_assigned: 'この所持武器はすでに別の目標武器の完成品として使われているため、この目標の完了には使えません。別の武器を選ぶか、一覧を更新してください。',
 }
 
 export class TargetWeaponLifecycleError extends Error {
@@ -100,10 +114,21 @@ export function completeTargetWithOwnedIdealMutation(
   return (base) => {
     const target = base.targetWeapons.find(({ id }) => id === targetId) ?? lifecycleFailure('target_not_found')
     if (target.lifecycleStatus !== 'active') lifecycleFailure('target_not_active')
+    // A Target whose migrated completion condition awaits the user's review is
+    // not completed with an owned weapon before that explicit save
+    // (`docs/DATA_MODEL.md` 8.6).
+    if (target.completionConditionReview.length > 0) lifecycleFailure('target_completion_condition_review_required')
     const weapon = base.ownedWeapons.find(({ id }) => id === ownedWeaponId) ?? lifecycleFailure('owned_weapon_not_found')
     if (weapon.kind !== 'gogma') lifecycleFailure('owned_weapon_not_gogma')
     if (weapon.weaponTypeId !== target.weaponTypeId || weapon.elementId !== target.elementId) {
       lifecycleFailure('owned_weapon_incompatible')
+    }
+    // The completion of another Target is never this Target's completion,
+    // whatever its performance and protection (Issue #334,
+    // `docs/PLANNER_SPEC.md` 21.4): the one authority decides it from the state
+    // the mutation runs on, so a list read before another completion is refused.
+    if (isCompletionAssignedElsewhere(collectCompletionAssignedOwnedWeaponIds(base.targetWeapons), weapon.id, target.id)) {
+      lifecycleFailure('owned_weapon_completion_assigned')
     }
     if (!isOwnedIdealForTarget(target, weapon, master)) lifecycleFailure('owned_weapon_no_longer_ideal')
 
@@ -113,6 +138,9 @@ export function completeTargetWithOwnedIdealMutation(
       lifecycleStatus: 'completed',
       completedAt: now,
       completedByProductionPlanId: null,
+      // The completion assignment is written in the same transaction as the
+      // completion (`docs/DATA_MODEL.md` 8.7).
+      completedWithOwnedWeaponId: weapon.id,
       preferredOwnedWeaponId: null,
       updatedAt: now,
     }
@@ -128,7 +156,7 @@ export function completeTargetWithOwnedIdealMutation(
     const issues = [
       ...domainMessages(validateTargetWeapon(completedTarget)),
       ...domainMessages(validateOwnedWeapon(completedWeapon)),
-      ...domainMessages(validateTargetPreferredOwnedWeapons(targetWeapons, ownedWeapons)),
+      ...domainMessages(validateTargetOwnedWeaponCollections(targetWeapons, ownedWeapons)),
     ]
     if (issues.length) throw new EntityFormValidationError(issues)
     return {
@@ -141,9 +169,10 @@ export function completeTargetWithOwnedIdealMutation(
 /**
  * 「未完了に戻す」 as a guarded mutation (`docs/UI_FLOW.md` 8.3, `docs/DATA_MODEL.md`
  * 8.1): the Target, re-read from the state the mutation runs on and required to
- * be `completed`, returns to `active` with no completion metadata and no
+ * be `completed`, returns to `active` with no completion metadata, no completion
+ * assignment (`completedWithOwnedWeaponId = null`, Issue #334 8.7) and no
  * preference. No owned weapon is touched - the weapon that completed it is
- * never guessed, un-protected or relabelled.
+ * never un-protected or relabelled, and it simply stops being assigned.
  */
 export function reopenTargetWeaponMutation(
   targetId: TargetWeaponId,
@@ -157,13 +186,14 @@ export function reopenTargetWeaponMutation(
       lifecycleStatus: 'active',
       completedAt: null,
       completedByProductionPlanId: null,
+      completedWithOwnedWeaponId: null,
       preferredOwnedWeaponId: null,
       updatedAt: now,
     }
     const targetWeapons = base.targetWeapons.map((stored) => (stored.id === target.id ? reopened : stored))
     const issues = [
       ...domainMessages(validateTargetWeapon(reopened)),
-      ...domainMessages(validateTargetPreferredOwnedWeapons(targetWeapons, base.ownedWeapons)),
+      ...domainMessages(validateTargetOwnedWeaponCollections(targetWeapons, base.ownedWeapons)),
     ]
     if (issues.length) throw new EntityFormValidationError(issues)
     return { result: reopened, state: { ...unchangedMutableState(base), targetWeapons } }

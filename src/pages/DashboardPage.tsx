@@ -99,6 +99,14 @@ function presentNextAction(
         primary: { label: '実行ナビを再開する', to: `/plans/${action.planId}/run` },
         secondary: { label: '作成プランを見る', to: `/plans/${action.planId}` },
       }
+    case 'review_unsafe_plan':
+      return {
+        title: '実行中の作成プランは続行できません',
+        description:
+          '1本の所持武器を2件の目標武器の完成品にする予定が含まれているため、この作成プランのままでは進められません。作成プランで理由と再計画の導線を確認してください。',
+        primary: { label: '作成プランを見る', to: `/plans/${action.planId}` },
+        secondary: { label: 'ビルドリストを開く', to: '/build-list' },
+      }
     case 'review_incompatible_plan':
       return {
         title: '実行中の作成プランは再計算が必要です',
@@ -485,18 +493,20 @@ function DashboardContent({ summary }: { summary: DashboardSummary }) {
                 作成プランを見る
               </Button>
             )}
-            {activePlan?.isCalculationCompatible ? (
+            {activePlan?.isCalculationCompatible && !activePlan.hasCompletionAssignmentConflict ? (
               <ActionLink label="実行ナビを再開する" to={`/plans/${activePlan.id}/run`} />
             ) : (
               <Button variant="outlined" fullWidth disabled sx={actionButtonSx}>
                 実行ナビを再開する
               </Button>
             )}
-            {!activePlan?.isCalculationCompatible && (
+            {(!activePlan?.isCalculationCompatible || activePlan.hasCompletionAssignmentConflict) && (
               <Typography variant="body2" color="text.secondary">
                 {activePlan === null
                   ? '作成プランの確認と実行ナビは、実行中の作成プランがある場合に利用できます。'
-                  : '実行中の作成プランは現在の計算契約と互換性がないため、実行ナビを再開できません。'}
+                  : !activePlan.isCalculationCompatible
+                    ? '実行中の作成プランは現在の計算契約と互換性がないため、実行ナビを再開できません。'
+                    : '実行中の作成プランは、1本の所持武器を2件の目標武器の完成品にする予定を含むため、実行ナビを再開できません。'}
               </Typography>
             )}
           </Stack>

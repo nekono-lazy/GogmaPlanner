@@ -1,4 +1,5 @@
 import type { DomainValidationIssue } from '../models/validation'
+import type { ProductionPlanCompletionAssignmentIssue } from '../planner/productionPlanCompletionAssignmentSafety'
 
 /**
  * Why an Execution runtime operation refused to change anything
@@ -29,6 +30,17 @@ export type ExecutionRuntimeErrorCode =
   | 'plan_dependency_changed'
   /** The persisted state differs from the current Step's `expectedStateBefore`. */
   | 'execution_state_mismatch'
+  /**
+   * Continuing the Plan could make one owned weapon the completion of two
+   * Targets (Issue #334, `docs/PLANNER_SPEC.md` 21.4.1): its recorded
+   * completions name one weapon for two Targets on an incomplete Step, name a
+   * weapon another Target is already completed with, or cannot be read
+   * unambiguously. The whole Plan is not continuable from that moment - start,
+   * Step confirmations and the Current Position Recovery refuse it before the
+   * conflicting completion Step is reached. Nothing was written and the Plan's
+   * status is unchanged; the error carries the typed issues.
+   */
+  | 'completion_assignment_conflict'
   /** A blind production-target Normal needs the user's observed five slots. */
   | 'observation_required'
   /** The Step has no observation binding, so no observation may be supplied. */
@@ -52,19 +64,6 @@ export type ExecutionRuntimeErrorCode =
   | 'collection_validation_failed'
   /** A resulting entity fails Domain validation. */
   | 'entity_validation_failed'
-  /**
-   * The Plan has no selected compromise checkpoint the request can finish at:
-   * the named BuildListEntry is not a selected Entry of the Plan, no longer
-   * exists, plans another Target, selected no intermediate state, or holds its
-   * checkpoint with another weapon (`docs/PLANNER_SPEC.md` 16.12).
-   */
-  | 'compromise_finish_not_applicable'
-  /**
-   * The Entry's selected compromise checkpoint is not the current state (16.12):
-   * it is either not reached yet, or already left behind by a confirmed Step on
-   * the same tracked weapon.
-   */
-  | 'compromise_checkpoint_not_current'
   /** The ExecutionHistory to undo does not exist or belongs to another Plan. */
   | 'undo_history_not_found'
   /** The ExecutionHistory to undo is not the Plan's latest ExecutionHistory. */
@@ -78,6 +77,25 @@ export type ExecutionRuntimeErrorCode =
   | 'undo_snapshot_invalid'
   /** The state restored from the snapshot fails entity, collection or reference validation. */
   | 'undo_result_invalid'
+  /**
+   * The ExecutionHistory records the operation judges with include a record the
+   * Dexie version 11 upgrade could not convert (`docs/DATA_MODEL.md` 14.2, case
+   * 2): it is kept exactly as persisted, never read as ordinary metadata, and
+   * nothing that depends on it is decided or written.
+   */
+  | 'execution_history_unconvertible'
+  /**
+   * The ExecutionHistory records an operation must read in full - every
+   * metadata record and every Undo body - do not form complete 12.2 records
+   * (`docs/DATA_MODEL.md` 12.2 / 14.6, `validateExecutionRecordCollection()`): a
+   * metadata record without its Undo body, an Undo body without its metadata
+   * record, or a malformed body. Unlike `execution_history_unconvertible` (a
+   * version 10 record the Dexie upgrade kept), these are records of the current
+   * shape. What the missing or broken body held is unknown, so nothing that
+   * depends on it is decided and nothing is written; no body is filled in,
+   * deleted or read as empty.
+   */
+  | 'execution_history_record_invalid'
   /** A game save point is recorded only for an active Plan (`docs/PLANNER_SPEC.md` 16.9). */
   | 'save_point_record_not_allowed'
   /** A game save point is restored only for an active or stale Plan (16.9). */
@@ -89,7 +107,8 @@ export type ExecutionRuntimeErrorCode =
   /**
    * The game save point cannot be restored exactly: it fails Domain validation,
    * its ExecutionHistory boundary is missing or foreign, its snapshot Plan is not
-   * active, or it does not cover its execution scope.
+   * active, it does not cover its execution scope, or a record after it has no
+   * Undo body to restore from.
    */
   | 'save_point_snapshot_invalid'
   /**
@@ -188,16 +207,20 @@ export type ExecutionRuntimeErrorCode =
 export class ExecutionRuntimeError extends Error {
   readonly code: ExecutionRuntimeErrorCode
   readonly validationIssues: readonly DomainValidationIssue[]
+  /** The typed completion assignment issues of a `completion_assignment_conflict`; empty otherwise. */
+  readonly completionAssignmentIssues: readonly ProductionPlanCompletionAssignmentIssue[]
 
   constructor(
     code: ExecutionRuntimeErrorCode,
     message: string,
     validationIssues: readonly DomainValidationIssue[] = [],
+    completionAssignmentIssues: readonly ProductionPlanCompletionAssignmentIssue[] = [],
   ) {
     super(message)
     this.name = 'ExecutionRuntimeError'
     this.code = code
     this.validationIssues = validationIssues
+    this.completionAssignmentIssues = completionAssignmentIssues
   }
 }
 

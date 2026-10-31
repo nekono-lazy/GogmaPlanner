@@ -59,6 +59,7 @@ import {
 import { productionRngRuntime } from '../domain/rng/production/productionRngRuntime'
 import {
   createImportExportService,
+  type ExportBackup,
   type ImportPreparationResult,
 } from '../services/dataTransfer/importExportService'
 import {
@@ -81,7 +82,8 @@ const masterData = loadMasterData()
  * `prepareImportJson()` alone decides whether a file is importable.
  */
 export interface SettingsPageDependencies {
-  serializeExport(): Promise<string>
+  /** One Export: the JSON text and its summary, from one root read and serialized once. */
+  exportBackup(): Promise<ExportBackup>
   prepareImportJson(json: string): ImportPreparationResult
   applyImport(root: ExportRoot): Promise<void>
   clearAllData(): Promise<AppSettings>
@@ -225,7 +227,7 @@ export function SettingsPage({
     if (!masterData.ok) return null
     const service = createImportExportService(masterData.data)
     return {
-      serializeExport: () => service.serializeExport(),
+      exportBackup: () => service.exportBackup(),
       prepareImportJson: (json) => service.prepareImportJson(json),
       applyImport: (root) => service.applyImport(root),
       clearAllData: () => service.clearAllData(),
@@ -251,7 +253,9 @@ export function SettingsPage({
   const [clearDialogOpen, setClearDialogOpen] = useState(false)
   const [feedback, setFeedback] = useState<DataTransferFeedback | null>(null)
   // The Export Dialog keeps the one snapshot it was opened with; `serial`
-  // remounts it for the next Export so its feedback starts empty.
+  // remounts it for the next Export so its feedback starts empty. The snapshot
+  // is dropped once the Dialog has closed, so a large JSON text is not held
+  // until the next Export.
   const [exportSnapshot, setExportSnapshot] = useState<(ExportSnapshot & { serial: number }) | null>(null)
   const [exportDialogOpen, setExportDialogOpen] = useState(false)
   const exportSerialRef = useRef(0)
@@ -353,20 +357,25 @@ export function SettingsPage({
       })
   }
 
-  // Export serializes exactly once, here. The Dialog's copy and file output
+  // Export serializes exactly once, here. The Dialog's copy and file save
   // reuse this string and never call the Service again.
   const handleExport = async () => {
     if (api === null || !beginOperation('export')) return
     try {
-      const json = await api.serializeExport()
+      const { json, summary } = await api.exportBackup()
       exportSerialRef.current += 1
-      setExportSnapshot({ serial: exportSerialRef.current, json, filename: backupFilename(browser.now()) })
+      setExportSnapshot({ serial: exportSerialRef.current, json, summary, filename: backupFilename(browser.now()) })
       setExportDialogOpen(true)
     } catch (error: unknown) {
       setFeedback(exportFailedFeedback(error))
     } finally {
       endOperation()
     }
+  }
+
+  /** Drops the closed Dialog's snapshot, unless a newer Export replaced it meanwhile. */
+  const releaseExportSnapshot = (serial: number) => {
+    setExportSnapshot((current) => (current !== null && current.serial === serial ? null : current))
   }
 
   const openImportDialog = () => {
@@ -530,7 +539,7 @@ export function SettingsPage({
             {feedback !== null && <DataTransferFeedbackAlert feedback={feedback} />}
             <DataManagementGroup title="バックアップ">
               <Typography id={exportHelpId} variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
-                RNG状態、通常アーティアCounter、所持武器、目標武器、候補と作成リスト、生産計画、実行履歴、ゲーム内セーブ地点、設定を含む全ユーザーデータを1つのJSONとして表示し、クリップボードへのコピーまたはJSONファイルとして保存します。別の端末へ移行するときや、インポート・全削除の前の控えとして使用します。
+                RNG状態、通常アーティアCounter、所持武器、目標武器、候補と作成リスト、生産計画、実行履歴、ゲーム内セーブ地点、設定を含む全ユーザーデータのバックアップを作成し、JSONファイルとして保存します。クリップボードへコピーすることもできます。別の端末へ移行するときや、インポート・全削除の前の控えとして使用します。
               </Typography>
               <Button
                 variant="contained"
@@ -612,6 +621,7 @@ export function SettingsPage({
         snapshot={exportSnapshot}
         writeClipboardText={browser.writeClipboardText}
         onClose={() => setExportDialogOpen(false)}
+        onExited={exportSnapshot === null ? undefined : () => releaseExportSnapshot(exportSnapshot.serial)}
       />
       <ImportDataDialog
         open={importDialogOpen}

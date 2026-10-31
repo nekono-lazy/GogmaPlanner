@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode, type Ref } from 'react'
 import {
   Alert,
   AlertTitle,
@@ -16,10 +16,30 @@ import { PageShell } from '../components/PageShell'
 import { StatusChip } from '../components/StatusChip'
 import { PlanBreakingChangeDialog } from '../components/execution/PlanBreakingChangeDialog'
 import { savePointPositionLabel } from '../components/execution/executionStepPresentation'
-import { ProductionPlanReplanPreviewPanel } from '../components/execution/ProductionPlanReplanPreviewPanel'
+import { RunningPlanReplanPanel } from '../components/execution/RunningPlanReplanPanel'
+import { CompletionAssignmentConflictAlert } from '../components/execution/CompletionAssignmentConflictAlert'
+import { COMPLETION_ASSIGNMENT_REPLAN_NOTE, completionAssignmentNamesOf } from '../components/execution/completionAssignmentConflictPresentation'
+import {
+  RUNNING_PLAN_IN_USE_STALE_GROUP_CHIP,
+  RUNNING_PLAN_IN_USE_STALE_LINES,
+  RUNNING_PLAN_IN_USE_STALE_REASONS_LABEL,
+  RUNNING_PLAN_IN_USE_STALE_TITLE,
+  RUNNING_PLAN_REPLAN_REQUEST_NO_RUNNING_PLAN_MESSAGE,
+  runningPlanReplanAdditionalCandidateCountText,
+} from '../components/execution/runningPlanReplanGuidancePresentation'
+import {
+  runningPlanReplanExclusionRequest,
+  useRunningPlanReplanNavigationRequest,
+  type RunningPlanReplanOpenRequest,
+} from '../components/execution/runningPlanReplanRequest'
 import { usePlanBreakingChangeApproval } from '../components/execution/usePlanBreakingChangeApproval'
-import type { PlanBreakingChangeApproval, PlanBreakingChangeInspection } from '../domain/execution'
-import { useProductionPlanReplanPreview } from '../components/execution/useProductionPlanReplanPreview'
+import {
+  deriveRunningPlanInUseStaleBuildListEntryIds,
+  evaluateProductionPlanContinuation,
+  type PlanBreakingChangeApproval,
+  type PlanBreakingChangeInspection,
+} from '../domain/execution'
+import { useRunningPlanReplan } from '../components/execution/useRunningPlanReplan'
 import { CandidateCard } from '../components/search/CandidateCard'
 import { BuildListPlanCreationSection } from '../components/planner/BuildListPlanCreationSection'
 import { PLAN_CREATION_BUILD_LIST_LOCKED_NOTE } from '../components/planner/planCreationPresentation'
@@ -28,7 +48,6 @@ import {
   productionPlannerDetailSettingsDescriptionLines,
   productionPlannerDetailSettingsTitle,
   productionPlannerMaxPlanStepsField,
-  productionPlannerOptionsInvalidMessage,
 } from '../components/planner/productionPlannerSettingsPresentation'
 import { useBuildListPlanCreation } from '../components/planner/useBuildListPlanCreation'
 import { loadMasterData } from '../domain/master/loadMasterData'
@@ -37,15 +56,23 @@ import type {
   BuildListEntry,
   BuildListEntryId,
   CalculationContext,
-  IntermediateStateSelection,
   OwnedWeapon,
   ProductionPlan,
+  ProductionPlanId,
   TargetWeapon,
   TargetWeaponId,
 } from '../domain/models/publicTypes'
 import type { PlannerOptions, PlannerResult } from '../domain/planner'
-import { defaultIntermediateStateSelection, findBuildListTargetDuplicates } from '../domain/buildList'
+import { findBuildListTargetDuplicates } from '../domain/buildList'
 import { productionPlanStatusLabels, staleReasonLabels } from '../presentation/labels'
+import {
+  createProductionRunningPlanReplanDependencies,
+  type RunningPlanReplanDependencies,
+} from '../services/execution/runningPlanReplanDependencies'
+import {
+  createRunningPlanReplanGuidanceReader,
+  type RunningPlanReplanGuidanceReader,
+} from '../services/execution/runningPlanReplanGuidanceService'
 import { compareByRegistrationOrder, sortByRegistrationOrder } from '../presentation/managementListOrder'
 import {
   emptyWeaponListFilter,
@@ -133,26 +160,6 @@ export interface BuildListPageDependencies {
   /** The read-only breaking-change inspection of that very delete. */
   inspectEntryDelete(id: BuildListEntryId): Promise<PlanBreakingChangeInspection>
   /**
-   * Replaces one Entry's intermediate state selection and improvement
-   * preference.
-   *
-   * Editing it here is what makes a Counter conflict recoverable without
-   * re-searching: the user moves a selected state to another arrival, turns
-   * it off, or changes the improvement order, and runs the Planner again
-   * (`docs/UI_FLOW.md` 10). `approval` is the breaking-change approval when
-   * the inspection required one.
-   */
-  updateIntermediateStateSelection(
-    id: BuildListEntryId,
-    selection: IntermediateStateSelection,
-    approval?: PlanBreakingChangeApproval | null,
-  ): Promise<BuildListEntry>
-  /** The read-only breaking-change inspection of that very selection change. */
-  inspectIntermediateStateSelectionUpdate(
-    id: BuildListEntryId,
-    selection: IntermediateStateSelection,
-  ): Promise<PlanBreakingChangeInspection>
-  /**
    * The one running (`active` / `stale`) Plan, or `undefined`
    * (`docs/PLANNER_SPEC.md` 16.2). It decides which Planner entry the page
    * offers: the ordinary Draft creation, or the 16.8 replan Preview. More than
@@ -170,8 +177,23 @@ export interface BuildListPageDependencies {
    * something the page resolves or reads as "no Draft".
    */
   getDraftProductionPlan(): Promise<ProductionPlan | undefined>
-  /** 「現在地点から再計画を試算」 / 「この再計画を採用」 (16.8, `docs/UI_FLOW.md` 16.4). */
+  /**
+   * The ordinary Planner replan (16.8, `docs/UI_FLOW.md` 16.4). Since Issue #276 PR-6A it is reached only as the running Plan
+   * replan's explicit auxiliary 「登録済みの候補で再計画を試算」 (its Preview and adoption; its input comes from `runningPlanReplan`).
+   */
   replan: ProductionPlanReplanDependencies
+  /**
+   * 「現在地点からの再計画」 (`docs/PLANNER_SPEC.md` 18, `docs/UI_FLOW.md` 16.5, Issue #276 PR-6A): the target confirmation, the
+   * re-optimization session, its adoption and the auxiliary's press-time input.
+   */
+  runningPlanReplan: RunningPlanReplanDependencies
+  /**
+   * The read-only replan guidance (`docs/PLANNER_SPEC.md` 18.3, Issue #276
+   * PR-6B): the passive additional candidate count of the running Plan, and
+   * whether the breaking-change warning of a Plan-dependent Entry may offer to
+   * exclude its Target in a replan instead.
+   */
+  replanGuidance: RunningPlanReplanGuidanceReader
 }
 
 function createDefaultDependencies(master: MasterDataRoot): BuildListPageDependencies {
@@ -197,13 +219,11 @@ function createDefaultDependencies(master: MasterDataRoot): BuildListPageDepende
     },
     deleteEntry: (id, approval) => buildListService.deleteEntry(id, approval ?? null),
     inspectEntryDelete: (id) => buildListService.inspectEntryDelete(id),
-    updateIntermediateStateSelection: (id, selection, approval) =>
-      buildListService.updateIntermediateStateSelection(id, selection, approval ?? null),
-    inspectIntermediateStateSelectionUpdate: (id, selection) =>
-      buildListService.inspectIntermediateStateSelectionUpdate(id, selection),
     getRunningProductionPlan: () => productionPlanRepository.getRunningProductionPlan(),
     getDraftProductionPlan: () => productionPlanRepository.getDraftProductionPlan(),
     replan: createProductionPlanReplanDependencies(master),
+    runningPlanReplan: createProductionRunningPlanReplanDependencies(master),
+    replanGuidance: createRunningPlanReplanGuidanceReader(),
   }
 }
 
@@ -254,25 +274,9 @@ function parsePlannerOptions(inputs: PlannerOptionInputs): PlannerOptions | null
   return maxPlanSteps === null ? null : { maxPlanSteps }
 }
 
-/**
- * Feedback about the last intermediate state selection save, kept apart from
- * the Planner run and from load / remove failures so each message stays next
- * to the action that caused it.
- */
-interface CheckpointFeedback {
-  severity: 'info' | 'error'
-  message: string
-}
-
 /** The operation-specific line under the breaking-change warning (`docs/UI_FLOW.md` 16.3). */
-const BUILD_LIST_SELECTION_PLAN_BREAKING_NOTE =
-  'この作成リスト項目の条件を変更すると、現在の生産計画の前提と一致しなくなります。'
 const BUILD_LIST_DELETE_PLAN_BREAKING_NOTE =
   'この作成リスト項目を削除すると、現在の生産計画の前提と一致しなくなります。'
-const SELECTION_UPDATED_MESSAGE = '途中採用する状態と改善優先を更新しました。生産計画を再作成してください。'
-const SELECTION_UPDATED_PLAN_ABANDONED_MESSAGE =
-  '途中採用する状態と改善優先を更新し、実行中の生産計画を破棄しました。生産計画を再作成してください。'
-const SELECTION_CANCELLED_MESSAGE = '途中採用する状態の変更を保存しませんでした。生産計画は変更されていません。'
 const ENTRY_DELETED_PLAN_ABANDONED_MESSAGE = 'ビルドリストから削除し、実行中の生産計画を破棄しました。'
 /**
  * A Target holding two or more Entries - a legacy duplicate of the Build List
@@ -353,16 +357,6 @@ function groupEntriesByTarget(
   })
 }
 
-function entrySelection(entry: BuildListEntry): IntermediateStateSelection {
-  return entry.intermediateStateSelection ?? defaultIntermediateStateSelection()
-}
-
-/** How many lanes of this Entry hold a selected intermediate state. */
-function selectedIntermediateStateCount(entry: BuildListEntry): number {
-  const selection = entrySelection(entry)
-  return Number(selection.skillOpportunityId !== null) + Number(selection.bonusOpportunityId !== null)
-}
-
 /** One figure of the page summary. Display only, never a Planner authority. */
 function SummaryTile({ label, value, note }: { label: string; value: number; note?: string }) {
   return (
@@ -395,15 +389,20 @@ function SummaryTile({ label, value, note }: { label: string; value: number; not
   )
 }
 
-/** A titled, border-based page section. */
+/**
+ * A titled, border-based page section. `headingRef` makes the heading a focus
+ * target (`tabIndex={-1}`), for a section the user explicitly asked to open.
+ */
 function PageSection({
   title,
   children,
   accent = false,
+  headingRef,
 }: {
   title: string
   children: ReactNode
   accent?: boolean
+  headingRef?: Ref<HTMLHeadingElement>
 }) {
   const headingId = useId()
   return (
@@ -418,7 +417,13 @@ function PageSection({
       }}
     >
       <Stack spacing={2}>
-        <Typography id={headingId} component="h2" variant="h2">
+        <Typography
+          id={headingId}
+          component="h2"
+          variant="h2"
+          ref={headingRef}
+          {...(headingRef === undefined ? {} : { tabIndex: -1 })}
+        >
           {title}
         </Typography>
         {children}
@@ -435,9 +440,9 @@ const MISSING_TARGET_WEAPON_LABEL = '武器種・属性: 目標武器が見つ�
  *
  * Closed, the group still names its Target - the name, the weapon type and the
  * element - with the priority, the Entry count and every state that needs the
- * user's attention as text chips: the legacy duplicate 「要整理」, the stale
- * Entries and the selected intermediate states. Open, it shows the legacy
- * duplicate guidance and the Entries exactly as before. The open state is the
+ * user's attention as text chips: the legacy duplicate 「要整理」 and the stale
+ * Entries. Open, it shows the legacy duplicate guidance and the Entries
+ * exactly as before. The open state is the
  * page's runtime UI state, keyed by the Target ID; it is never persisted and
  * decides nothing the Planner reads.
  *
@@ -450,6 +455,7 @@ const MISSING_TARGET_WEAPON_LABEL = '武器種・属性: 目標武器が見つ�
 function TargetGroupSection({
   group,
   legacyDuplicate,
+  inUseStaleEntryIds,
   weaponLabel,
   expanded,
   onExpandedChange,
@@ -458,14 +464,19 @@ function TargetGroupSection({
   group: BuildListTargetGroup
   /** The Target holds two or more Entries, as `findBuildListTargetDuplicates()` decided. */
   legacyDuplicate: boolean
+  /**
+   * The stale Entries the `active` Plan keeps using, stale only from its planned progress
+   * (`deriveRunningPlanInUseStaleBuildListEntryIds()`): named as in use instead of 「再検索が必要」.
+   */
+  inUseStaleEntryIds: ReadonlySet<BuildListEntryId>
   /** The Target's weapon type and element, or `null` when the Target no longer exists. */
   weaponLabel: string | null
   expanded: boolean
   onExpandedChange: (expanded: boolean) => void
   children: ReactNode
 }) {
-  const staleCount = group.entries.filter(({ isStale }) => isStale).length
-  const selectionCount = group.entries.filter((entry) => selectedIntermediateStateCount(entry) > 0).length
+  const inUseStaleCount = group.entries.filter(({ id }) => inUseStaleEntryIds.has(id)).length
+  const staleCount = group.entries.filter(({ id, isStale }) => isStale && !inUseStaleEntryIds.has(id)).length
   const summary = (
     <Stack component="span" spacing={0.75} sx={{ minWidth: 0 }}>
       <Typography
@@ -493,8 +504,8 @@ function TargetGroupSection({
         {staleCount > 0 && (
           <StatusChip component="span" label={`再検索が必要 ${staleCount}件`} tone="caution" />
         )}
-        {selectionCount > 0 && (
-          <StatusChip component="span" label={`途中採用状態を選択中 ${selectionCount}件`} tone="info" />
+        {inUseStaleCount > 0 && (
+          <StatusChip component="span" label={`${RUNNING_PLAN_IN_USE_STALE_GROUP_CHIP} ${inUseStaleCount}件`} tone="info" />
         )}
       </Stack>
     </Stack>
@@ -508,9 +519,8 @@ function TargetGroupSection({
       expanded={expanded}
       onExpandedChange={onExpandedChange}
       // A closed group holds no Candidate card: a long Build List keeps only
-      // its headers in the DOM. Nothing is lost on close, because every
-      // selection and its save chain live in the page, and the warning dialog
-      // is the page's own.
+      // its headers in the DOM. Nothing is lost on close, because the Entries
+      // and the warning dialog are the page's own.
       unmountOnExit
     >
       <Stack spacing={2} sx={{ minWidth: 0 }}>
@@ -550,13 +560,17 @@ export function BuildListPage({ dependencies = defaultDependencies ?? undefined 
   // (UI_FLOW 10.0, Issue #130).
   const [editedOptionInputs, setEditedOptionInputs] =
     useState<PlannerOptionInputs | null>(null)
+  // Whether the user opened 「詳細設定（通常Planner用）」. The Accordion is
+  // rendered only while an ordinary Planner operation is offered or shown
+  // (Issue #359), so its open state lives here: hiding and showing it again
+  // keeps both the value and how the user left it. Runtime UI state only.
+  const [plannerSettingsExpanded, setPlannerSettingsExpanded] = useState(false)
   // The failure and notice sources stay separate: a load failure is never
-  // shown as an empty Build List, and a Planner, selection, or remove problem
-  // stays next to the control that caused it (`docs/UI_FLOW.md` 10).
+  // shown as an empty Build List, and a Planner or remove problem stays next
+  // to the control that caused it (`docs/UI_FLOW.md` 10).
   const [loadError, setLoadError] = useState<string | null>(
     dependencies ? null : 'マスターデータを読み込めません。',
   )
-  const [checkpointFeedback, setCheckpointFeedback] = useState<CheckpointFeedback | null>(null)
   const [removeError, setRemoveError] = useState<string | null>(null)
   // An Entry delete that also ended the running Plan, reported at the top:
   // the Entry list may be empty afterwards.
@@ -567,10 +581,17 @@ export function BuildListPage({ dependencies = defaultDependencies ?? undefined 
   const [draftPlan, setDraftPlan] = useState<DraftPlanState>(
     dependencies ? { status: 'loading' } : { status: 'error' },
   )
-  // The breaking-change warning of a selected Entry's selection change or
-  // delete (`docs/UI_FLOW.md` 16.3). While it decides, no other guarded
-  // change is queued: the selection controls and the delete buttons wait.
-  const planGuard = usePlanBreakingChangeApproval()
+  // The breaking-change warning of a selected Entry's delete
+  // (`docs/UI_FLOW.md` 16.3). While it decides, no other guarded change is
+  // queued: the delete buttons wait.
+  // For a Plan-dependent Entry it may also offer to leave the change unsaved
+  // and exclude the Target in the replan below (Issue #276 PR-6B).
+  const replanGuidance = dependencies?.replanGuidance
+  const planGuard = usePlanBreakingChangeApproval({
+    replanExclusion: replanGuidance === undefined
+      ? undefined
+      : (planId, targetWeaponId) => replanGuidance.canExcludeInReplan(planId, targetWeaponId),
+  })
   // A runtime change against the running Plan (a save point restore, a refused
   // adoption) re-reads the Build List and the running Plan.
   const [loadSequence, setLoadSequence] = useState(0)
@@ -586,23 +607,6 @@ export function BuildListPage({ dependencies = defaultDependencies ?? undefined 
     onPersistedStateChanged: () => setLoadSequence((sequence) => sequence + 1),
   })
   const { refreshPreStart } = planCreation
-  /**
-   * Per-Entry serialization of intermediate state selection saves.
-   *
-   * The chain holds, per Entry, a continuation that resolves to the *last
-   * selection known to be persisted*: the result of the latest successful
-   * save, or - when that save failed - the stable value before it. Every new
-   * change is built on that value, so two quick changes on different lanes or
-   * on the preference both survive, and a failed save in between never sends
-   * the next one back to the render-time Entry (`docs/UI_FLOW.md` 10, lost
-   * update). The continuation itself never rejects; only the individual
-   * attempt does, and that rejection is what the error feedback reports. The
-   * service's Domain validation stays the authority for what a selection may
-   * contain.
-   */
-  const checkpointSaveChainRef = useRef(
-    new Map<BuildListEntryId, Promise<IntermediateStateSelection>>(),
-  )
   const masterForDisplay = dependencies?.master ?? defaultMaster
   const recommendedMaxPlanSteps = useMemo(
     () => recommendedBuildListMaxPlanSteps(entries),
@@ -632,8 +636,8 @@ export function BuildListPage({ dependencies = defaultDependencies ?? undefined 
     [filter, groups],
   )
   // Which Target groups are open (`docs/UI_FLOW.md` 10, Issue #124): runtime UI
-  // state keyed by Target ID, never by position, so a filter change, a re-read
-  // or a saved selection keeps every group as the user left it. Every group
+  // state keyed by Target ID, never by position, so a filter change or a
+  // re-read keeps every group as the user left it. Every group
   // starts closed. It is never persisted and the Planner never reads it.
   const [expandedTargetIds, setExpandedTargetIds] = useState<ReadonlySet<TargetWeaponId>>(
     () => new Set(),
@@ -680,23 +684,90 @@ export function BuildListPage({ dependencies = defaultDependencies ?? undefined 
   // Display-only counts over the loaded data. None of them decides whether the
   // Planner may run: that stays with the Planner's own input validation.
   const staleCount = entries.filter(({ isStale }) => isStale).length
-  const checkpointEntryCount = entries.filter(
-    (entry) => selectedIntermediateStateCount(entry) > 0,
-  ).length
 
-  // The 16.8 replan Preview / adoption while a Plan is running. Its state
-  // machine and its Planner Worker are its own; the ordinary Draft creation
-  // below never shares them, and no Draft is saved beside a running Plan.
-  const executionReplan = useProductionPlanReplanPreview({
-    replan: dependencies?.replan ?? unavailableReplanDependencies,
-    createWorkerClient: () => {
+  // 「現在地点からの再計画」 while a Plan is running (`docs/UI_FLOW.md` 16.5,
+  // Issue #276 PR-6A). Its session, its Worker and its auxiliary's ordinary
+  // Planner Worker are its own; the ordinary Draft creation below never shares
+  // them, and no Draft is saved beside a running Plan.
+  const executionReplan = useRunningPlanReplan({
+    dependencies: dependencies?.runningPlanReplan ?? null,
+    ordinaryReplan: dependencies?.replan ?? unavailableReplanDependencies,
+    createPlannerWorkerClient: () => {
       if (!dependencies) throw new Error('マスターデータを読み込めません。')
       return dependencies.createWorkerClient()
     },
-    // The new Plan is `active` now: its Execution Navigator (UI_FLOW 16.4).
-    onAdopted: (result) => void navigate(`/plans/${result.newPlan.id}/run`),
-    onRunningPlanChanged: () => setLoadSequence((sequence) => sequence + 1),
+    // The new Plan is `active` now: its Execution Navigator (UI_FLOW 16.5).
+    onAdopted: (newPlanId) => void navigate(`/plans/${newPlanId}/run`),
+    onPersistedStateChanged: () => setLoadSequence((sequence) => sequence + 1),
   })
+  const { runningPlanChanged: executionReplanRunningPlanChanged } = executionReplan
+  // The replan is bound to the running Plan it was opened for: when a re-read finds another (or no) running Plan, the replan
+  // closes and says so, and never continues for the new Plan by itself.
+  const runningPlanId = runningPlan.status === 'running' ? runningPlan.plan.id : null
+  useEffect(() => {
+    executionReplanRunningPlanChanged(runningPlanId)
+  }, [runningPlanId, executionReplanRunningPlanChanged])
+
+  // 18.3: the running Plan's additional candidates, re-read with the persisted
+  // state the page shows (a re-read or a change of the Entries). Only a count
+  // for the Plan shown here is displayed; a failed read shows none.
+  const [replanCandidateCount, setReplanCandidateCount] = useState<{ planId: ProductionPlanId; count: number } | null>(null)
+  useEffect(() => {
+    if (!replanGuidance || runningPlanId === null) return
+    let active = true
+    void replanGuidance.inspectAdditionalCandidates(runningPlanId).then(
+      (inspection) => {
+        if (!active) return
+        setReplanCandidateCount(inspection.kind === 'counted'
+          ? { planId: inspection.planId, count: inspection.targetWeaponIds.length }
+          : null)
+      },
+      () => {
+        if (active) setReplanCandidateCount(null)
+      },
+    )
+    return () => {
+      active = false
+    }
+  }, [replanGuidance, runningPlanId, entries])
+  const replanCandidateNote = replanCandidateCount !== null && replanCandidateCount.planId === runningPlanId
+    ? runningPlanReplanAdditionalCandidateCountText(replanCandidateCount.count)
+    : null
+
+  // 18.3: the Entries the `active` Plan keeps using whose staleness only its
+  // planned progress caused - they say the Plan continues instead of asking
+  // for a new search. The staleness itself is untouched.
+  const inUseStaleEntryIds = useMemo<ReadonlySet<BuildListEntryId>>(
+    () => new Set(runningPlan.status === 'running'
+      ? deriveRunningPlanInUseStaleBuildListEntryIds({ plan: runningPlan.plan, targetWeapons: targets, buildListEntries: entries })
+      : []),
+    [entries, runningPlan, targets],
+  )
+
+  // Whether the running Plan can go on (Issue #334, `docs/UI_FLOW.md` 12.11):
+  // the one Domain judgement over the loaded Targets, display only - the
+  // Execution runtime refuses an unsafe Plan on its own.
+  const runningPlanContinuation = useMemo(
+    () => runningPlan.status === 'running' && masterForDisplay
+      ? evaluateProductionPlanContinuation(runningPlan.plan, targets, createBuildListCalculationContext(masterForDisplay))
+      : null,
+    [masterForDisplay, runningPlan, targets],
+  )
+  const runningPlanUnsafe = runningPlanContinuation?.kind === 'completion_assignment_conflict' ? runningPlanContinuation : null
+
+  // Opening the replan from a proposal, a warning on another screen or this
+  // page's own warning (Issue #276 PR-6B): bound to the Plan the request
+  // names (another running Plan is refused by the replan's identity check),
+  // with the runtime-only initial selection; nothing is calculated by itself.
+  // The heading takes the focus, because the user asked for this section.
+  const replanHeadingRef = useRef<HTMLHeadingElement>(null)
+  const { openPanel: openExecutionReplan } = executionReplan
+  const openReplanWith = useCallback((request: RunningPlanReplanOpenRequest) => {
+    openExecutionReplan(request.planId, request.selection)
+    window.setTimeout(() => replanHeadingRef.current?.focus(), 0)
+  }, [openExecutionReplan])
+  const replanNavigation = useRunningPlanReplanNavigationRequest()
+  const { request: pendingReplanRequest, take: takeReplanRequest, dismiss: dismissReplanRequest } = replanNavigation
 
   useEffect(() => {
     let active = true
@@ -727,96 +798,9 @@ export function BuildListPage({ dependencies = defaultDependencies ?? undefined 
     }
   }, [dependencies, loadSequence])
 
-  /**
-   * Applies one selector change to an Entry.
-   *
-   * The selector reports a whole selection built from the rendered one, so
-   * only the fields that differ from that rendered selection are carried onto
-   * the last persisted selection: two quick changes on different lanes, or on
-   * a lane and the preference, both survive.
-   */
-  const changeSelection = async (
-    entry: BuildListEntry,
-    rendered: IntermediateStateSelection,
-    next: IntermediateStateSelection,
-  ) => {
-    if (!dependencies || planGuard.deciding || planCreation.busy) return
-    const deps = dependencies
-    const chain = checkpointSaveChainRef.current
-    // The last selection known to be persisted. Only the very first change of
-    // an Entry in this session starts from the loaded Entry; afterwards the
-    // chain's own continuation is the authority, never a render-time Entry.
-    const previousStable =
-      chain.get(entry.id) ?? Promise.resolve<IntermediateStateSelection>(entrySelection(entry))
-    const attempt = previousStable.then(async (latest): Promise<{
-      selection: IntermediateStateSelection
-      saved: 'applied' | 'cancelled'
-      planAbandoned: boolean
-    }> => {
-      const merged: IntermediateStateSelection = {
-        skillOpportunityId:
-          next.skillOpportunityId !== rendered.skillOpportunityId
-            ? next.skillOpportunityId
-            : latest.skillOpportunityId,
-        bonusOpportunityId:
-          next.bonusOpportunityId !== rendered.bonusOpportunityId
-            ? next.bonusOpportunityId
-            : latest.bonusOpportunityId,
-        improvementPreference:
-          next.improvementPreference !== rendered.improvementPreference
-            ? next.improvementPreference
-            : latest.improvementPreference,
-      }
-      // The inspection and the save close over the same merged selection; the
-      // runtime alone decides whether the warning is shown. A cancelled
-      // warning leaves the Entry, the chain and the database as they were.
-      const outcome = await planGuard.run({
-        inspect: () => deps.inspectIntermediateStateSelectionUpdate(entry.id, merged),
-        apply: (approval) => deps.updateIntermediateStateSelection(entry.id, merged, approval),
-        note: BUILD_LIST_SELECTION_PLAN_BREAKING_NOTE,
-      })
-      if (outcome.status === 'cancelled') return { selection: latest, saved: 'cancelled', planAbandoned: false }
-      if (outcome.status === 'refused') throw new Error(outcome.message)
-      const updated = outcome.result
-      // Only a persisted result updates the displayed Entry; a failed
-      // selection is never shown as saved.
-      setEntries((current) =>
-        current.map((existing) => (existing.id === updated.id ? updated : existing)),
-      )
-      return { selection: entrySelection(updated), saved: 'applied', planAbandoned: outcome.planAbandoned }
-    })
-    // The continuation handed to the next change: the new stable selection on
-    // success, the previous stable one on failure. It never rejects, so a
-    // failed save neither poisons the chain nor loses an earlier success.
-    const continuation: Promise<IntermediateStateSelection> =
-      attempt.then(({ selection }) => selection).catch(() => previousStable)
-    chain.set(entry.id, continuation)
-    try {
-      const { saved, planAbandoned } = await attempt
-      if (saved === 'cancelled') {
-        setCheckpointFeedback({ severity: 'info', message: SELECTION_CANCELLED_MESSAGE })
-        return
-      }
-      setCheckpointFeedback({
-        severity: 'info',
-        message: planAbandoned ? SELECTION_UPDATED_PLAN_ABANDONED_MESSAGE : SELECTION_UPDATED_MESSAGE,
-      })
-      // A Build List change on this screen drops the shown plan creation
-      // results (PLANNER_SPEC 17.9): they were calculated from the old Entry.
-      planCreation.buildListChanged()
-      // The Plan the approval ended is no longer running: the running Plan
-      // state, its replan entry and the Entries are re-read.
-      if (planAbandoned) setLoadSequence((sequence) => sequence + 1)
-    } catch (caught: unknown) {
-      setCheckpointFeedback({
-        severity: 'error',
-        message: caught instanceof Error ? caught.message : '途中採用する状態を更新できませんでした。',
-      })
-    }
-  }
-
-  const remove = async (id: BuildListEntryId) => {
-    if (!dependencies || planGuard.deciding || planCreation.busy) return
+  const remove = async (entry: BuildListEntry) => {
+    if (!dependencies || planGuard.deciding || planCreation.busy || executionReplan.busy) return
+    const { id } = entry
     setRemoveError(null)
     setRemoveNotice(null)
     try {
@@ -824,15 +808,22 @@ export function BuildListPage({ dependencies = defaultDependencies ?? undefined 
         inspect: () => dependencies.inspectEntryDelete(id),
         apply: (approval) => dependencies.deleteEntry(id, approval),
         note: BUILD_LIST_DELETE_PLAN_BREAKING_NOTE,
+        replanExclusionTargetWeaponId: entry.targetWeaponId,
       })
-      if (outcome.status === 'cancelled') return
+      if (outcome.status === 'cancelled') {
+        // Nothing was deleted; 「保存せずに再計画を開く」 opens the replan with the Target left out.
+        if (outcome.replanExclusion !== undefined) {
+          openReplanWith(runningPlanReplanExclusionRequest(outcome.replanExclusion.planId, outcome.replanExclusion.targetWeaponId))
+        }
+        return
+      }
       if (outcome.status === 'refused') {
         setRemoveError(outcome.message)
         return
       }
-      checkpointSaveChainRef.current.delete(id)
       setEntries((current) => current.filter((entry) => entry.id !== id))
       planCreation.buildListChanged()
+      executionReplan.buildListChanged()
       if (outcome.planAbandoned) {
         setRemoveNotice(ENTRY_DELETED_PLAN_ABANDONED_MESSAGE)
         setLoadSequence((sequence) => sequence + 1)
@@ -843,6 +834,13 @@ export function BuildListPage({ dependencies = defaultDependencies ?? undefined 
   }
 
   const loaded = !loading && loadError === null
+  // A request this visit arrived with opens the replan once the page knows the
+  // running Plan; without one it opens nothing (and the page says so below).
+  useEffect(() => {
+    if (pendingReplanRequest === null || !loaded || runningPlan.status !== 'running' || !masterForDisplay) return
+    const request = takeReplanRequest()
+    if (request !== null) openReplanWith(request)
+  }, [loaded, masterForDisplay, openReplanWith, pendingReplanRequest, runningPlan.status, takeReplanRequest])
   // 「生産計画の作成」 is offered while no Plan runs and the Draft is known
   // (`docs/UI_FLOW.md` 10.3); its pre-start judgement follows every re-read or
   // change of the Build List. The judgement is display only: each press reads
@@ -854,10 +852,17 @@ export function BuildListPage({ dependencies = defaultDependencies ?? undefined 
   }, [creationOffered, entries, refreshPreStart])
   // The ordinary Planner bound the user reviews (U7). It reaches the ordinary
   // Planner runs and the replan Preview as `PlannerInput.options`; the Build
-  // List optimization never reads it.
+  // List optimization never reads it. The one Accordion is placed by the
+  // creation section or the replan, each rendering it only while an operation
+  // that reads it is offered or shown (Issue #359).
   const maxPlanStepsInvalid = plannerOptions === null
   const plannerDetailSettings = (
-    <DisclosureAccordion title={productionPlannerDetailSettingsTitle} headingLevel="h3">
+    <DisclosureAccordion
+      title={productionPlannerDetailSettingsTitle}
+      headingLevel="h3"
+      expanded={plannerSettingsExpanded}
+      onExpandedChange={setPlannerSettingsExpanded}
+    >
       <Stack spacing={1.5}>
         <Stack spacing={0.5}>
           {productionPlannerDetailSettingsDescriptionLines.map((line) => (
@@ -899,7 +904,7 @@ export function BuildListPage({ dependencies = defaultDependencies ?? undefined 
   return (
     <PageShell
       title="ビルドリスト"
-      description="生産計画（Planner）で検討する候補を確認し、チェックポイントの選択と探索上限を調整します。"
+      description="生産計画（Planner）で検討する候補を確認し、生産計画を作成します。"
     >
       <Stack spacing={{ xs: 2, md: 3 }}>
         {loading && <LinearProgress aria-label="ビルドリストを読み込み中" />}
@@ -921,7 +926,7 @@ export function BuildListPage({ dependencies = defaultDependencies ?? undefined 
                 display: 'grid',
                 gridTemplateColumns: {
                   xs: 'repeat(2, minmax(0, 1fr))',
-                  md: 'repeat(4, minmax(0, 1fr))',
+                  sm: 'repeat(3, minmax(0, 1fr))',
                 },
                 gap: 1.5,
               }}
@@ -931,9 +936,15 @@ export function BuildListPage({ dependencies = defaultDependencies ?? undefined 
               <SummaryTile
                 label="再検索が必要な候補"
                 value={staleCount}
-                note={staleCount > 0 ? '生産計画に含まれません' : '件'}
+                // The count keeps its meaning (every stale Entry). Entries the
+                // `active` Plan keeps using are named, so 「含まれません」 never
+                // reads as true of them (18.3).
+                note={
+                  inUseStaleEntryIds.size > 0
+                    ? `うち${inUseStaleEntryIds.size}件は実行中の生産計画で使用中`
+                    : staleCount > 0 ? '生産計画に含まれません' : '件'
+                }
               />
-              <SummaryTile label="途中採用状態を選択中" value={checkpointEntryCount} note="候補" />
             </Box>
           </PageSection>
         )}
@@ -963,6 +974,12 @@ export function BuildListPage({ dependencies = defaultDependencies ?? undefined 
         {loaded && runningPlan.status === 'error' && (
           <Alert severity="error">
             実行中の生産計画を確認できないため、生産計画の作成と再計画の試算はできません。
+          </Alert>
+        )}
+
+        {loaded && runningPlan.status === 'none' && pendingReplanRequest !== null && (
+          <Alert severity="info" onClose={dismissReplanRequest}>
+            {RUNNING_PLAN_REPLAN_REQUEST_NO_RUNNING_PLAN_MESSAGE}
           </Alert>
         )}
 
@@ -1012,14 +1029,14 @@ export function BuildListPage({ dependencies = defaultDependencies ?? undefined 
         )}
 
         {loaded && runningPlan.status === 'running' && (
-          // 16.8: while a Plan runs, the Build List offers the replan Preview
-          // instead of a second, independent Draft (UI_FLOW 10 / 16.4).
-          <PageSection title="現在地点からの再計画" accent>
+          // 16.5 / 18: while a Plan runs, the Build List offers the replan from
+          // the current point instead of a second, independent Draft.
+          <PageSection title="現在地点からの再計画" accent headingRef={replanHeadingRef}>
             <Alert severity="info">
               <Stack spacing={1.5} sx={{ alignItems: 'flex-start' }}>
                 <Typography variant="body2" sx={{ overflowWrap: 'anywhere' }}>
-                  実行中の生産計画（{runningPlan.plan.id}、{productionPlanStatusLabels[runningPlan.plan.status]}）があります。
-                  再計画を試算して採用すると、現在の生産計画を終了し、新しい生産計画を実行中にします。再検索が必要な候補は再計画に含まれません。
+                  実行中の生産計画（{productionPlanStatusLabels[runningPlan.plan.status]}）があります。
+                  作る目標武器を見直す場合は、現在地点から再計画を試算できます。採用すると、現在の生産計画を終了し、新しい生産計画を実行中にします。
                 </Typography>
                 <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} useFlexGap sx={{ flexWrap: 'wrap', alignSelf: 'stretch' }}>
                   <Button
@@ -1031,7 +1048,7 @@ export function BuildListPage({ dependencies = defaultDependencies ?? undefined 
                   >
                     実行中の生産計画を見る
                   </Button>
-                  {runningPlan.plan.status === 'active' && (
+                  {runningPlan.plan.status === 'active' && runningPlanUnsafe === null && (
                     <Button
                       component={RouterLink}
                       to={`/plans/${runningPlan.plan.id}/run`}
@@ -1045,23 +1062,29 @@ export function BuildListPage({ dependencies = defaultDependencies ?? undefined 
                 </Stack>
               </Stack>
             </Alert>
-            {plannerOptions === null && (
-              <Alert severity="warning">
-                {productionPlannerOptionsInvalidMessage}
-              </Alert>
+            {runningPlanUnsafe !== null && (
+              <CompletionAssignmentConflictAlert
+                title="実行中の生産計画は続行できません"
+                issues={runningPlanUnsafe.issues}
+                names={completionAssignmentNamesOf(targets, ownedWeapons)}
+                debugMode={debugMode}
+                recovery={<Typography variant="body2">{COMPLETION_ASSIGNMENT_REPLAN_NOTE}</Typography>}
+              />
             )}
-            {plannerDetailSettings}
             {masterForDisplay && (
-              <ProductionPlanReplanPreviewPanel
+              <RunningPlanReplanPanel
                 controller={executionReplan}
-                runningPlan={runningPlan.plan}
-                targetWeapons={targets}
                 master={masterForDisplay}
                 debugMode={debugMode}
-                startDisabled={plannerOptions === null}
-                onStart={() => {
-                  if (plannerOptions !== null) executionReplan.start(runningPlan.plan.id, plannerOptions)
-                }}
+                plannerOptions={plannerOptions}
+                runningPlan={runningPlan.plan}
+                passiveNote={replanCandidateNote}
+                // U7: the ordinary Planner's setting. Only the replan's explicit
+                // auxiliary (「登録済みの候補で再計画を試算」) reads it - and says
+                // beside itself when the value is invalid - so the panel shows it
+                // only with that auxiliary (Issue #359); the re-optimization
+                // never reads it.
+                ordinaryPlannerSettings={plannerDetailSettings}
               />
             )}
           </PageSection>
@@ -1076,6 +1099,7 @@ export function BuildListPage({ dependencies = defaultDependencies ?? undefined 
               plannerOptions={plannerOptions}
               currentDraft={draftPlan.status === 'draft' ? draftPlan.plan : null}
               detailSettings={plannerDetailSettings}
+              completionAssignmentNames={completionAssignmentNamesOf(targets, ownedWeapons)}
             />
           </PageSection>
         )}
@@ -1085,9 +1109,6 @@ export function BuildListPage({ dependencies = defaultDependencies ?? undefined 
             <Typography id={entriesHeadingId} component="h2" variant="h2">
               候補一覧
             </Typography>
-            {checkpointFeedback && (
-              <Alert severity={checkpointFeedback.severity}>{checkpointFeedback.message}</Alert>
-            )}
             {planCreation.busy && (
               <Typography variant="body2" color="text.secondary">
                 {PLAN_CREATION_BUILD_LIST_LOCKED_NOTE}
@@ -1152,6 +1173,7 @@ export function BuildListPage({ dependencies = defaultDependencies ?? undefined 
                 key={group.targetWeaponId}
                 group={group}
                 legacyDuplicate={legacyDuplicateTargetIds.has(group.targetWeaponId)}
+                inUseStaleEntryIds={inUseStaleEntryIds}
                 weaponLabel={weaponLabelOf(group.target)}
                 expanded={expandedTargetIds.has(group.targetWeaponId)}
                 onExpandedChange={(expanded) => setGroupExpanded(group.targetWeaponId, expanded)}
@@ -1162,34 +1184,42 @@ export function BuildListPage({ dependencies = defaultDependencies ?? undefined 
                     key={entry.id}
                     sx={{
                       border: 1,
-                      borderColor: entry.isStale ? 'warning.main' : 'divider',
+                      borderColor: entry.isStale && !inUseStaleEntryIds.has(entry.id) ? 'warning.main' : 'divider',
                       borderRadius: 1,
                       p: { xs: 1.5, md: 2 },
                       minWidth: 0,
                     }}
                   >
                     <Stack spacing={1.5}>
-                      <Stack
-                        direction={{ xs: 'column', sm: 'row' }}
-                        spacing={1}
-                        useFlexGap
-                        sx={{ justifyContent: 'space-between', alignItems: { sm: 'center' }, flexWrap: 'wrap' }}
-                      >
-                        <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: 'wrap' }}>
-                          {selectedIntermediateStateCount(entry) > 0 ? (
-                            <StatusChip
-                              label={`途中採用状態を選択中 ${selectedIntermediateStateCount(entry)}`}
-                              tone="info"
-                            />
-                          ) : (
-                            <StatusChip label="途中採用状態は未選択" tone="neutral" />
-                          )}
-                        </Stack>
-                        <Typography variant="caption" color="text.secondary" className="tabular-nums">
-                          追加日時: {entry.createdAt}
-                        </Typography>
-                      </Stack>
-                      {entry.isStale && (
+                      <Typography variant="caption" color="text.secondary" className="tabular-nums">
+                        追加日時: {entry.createdAt}
+                      </Typography>
+                      {entry.isStale && inUseStaleEntryIds.has(entry.id) && (
+                        // The `active` Plan keeps using this Entry and only its
+                        // planned progress made it stale: the Plan continues, so
+                        // no new search is asked for (18.3). The reasons stay.
+                        <Alert severity="info">
+                          <AlertTitle>{RUNNING_PLAN_IN_USE_STALE_TITLE}</AlertTitle>
+                          <Stack spacing={0.5}>
+                            {RUNNING_PLAN_IN_USE_STALE_LINES.map((line) => (
+                              <Typography variant="body2" key={line} sx={{ overflowWrap: 'anywhere' }}>
+                                {line}
+                              </Typography>
+                            ))}
+                            <Typography variant="body2" sx={{ fontWeight: 500 }}>
+                              {RUNNING_PLAN_IN_USE_STALE_REASONS_LABEL}
+                            </Typography>
+                            <Box component="ul" sx={{ m: 0, pl: 2.5 }}>
+                              {entry.staleReasons.map((reason) => (
+                                <Typography component="li" variant="body2" key={reason}>
+                                  {staleReasonLabels[reason]}
+                                </Typography>
+                              ))}
+                            </Box>
+                          </Stack>
+                        </Alert>
+                      )}
+                      {entry.isStale && !inUseStaleEntryIds.has(entry.id) && (
                         <Alert severity="warning">
                           <AlertTitle>再検索が必要</AlertTitle>
                           <Box component="ul" sx={{ m: 0, pl: 2.5 }}>
@@ -1214,12 +1244,6 @@ export function BuildListPage({ dependencies = defaultDependencies ?? undefined 
                         ownedWeapons={ownedWeapons}
                         debugMode={debugMode}
                         headingLevel="h4"
-                        intermediateStateSelectionContext="build_list"
-                        intermediateStateSelection={entrySelection(entry)}
-                        intermediateStateSelectionDisabled={planGuard.deciding || planCreation.busy}
-                        onIntermediateStateSelectionChange={(next) =>
-                          void changeSelection(entry, entrySelection(entry), next)
-                        }
                       />
                       {debugMode && (
                         <Alert severity="info">
@@ -1233,7 +1257,7 @@ export function BuildListPage({ dependencies = defaultDependencies ?? undefined 
                         color="error"
                         variant="text"
                         disabled={planGuard.deciding || planCreation.busy}
-                        onClick={() => void remove(entry.id)}
+                        onClick={() => void remove(entry)}
                         sx={{ minHeight: 44, alignSelf: { xs: 'stretch', sm: 'flex-start' } }}
                       >
                         ビルドリストから削除

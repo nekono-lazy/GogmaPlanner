@@ -18,13 +18,17 @@ import {
   validateOwnedWeapon,
   validateProductionPlan,
 } from '../models/publicTypes'
-import { validateTargetPreferredOwnedWeapons } from '../target/preferredOwnedWeapon'
+import { validateTargetOwnedWeaponCollections } from '../target/preferredOwnedWeapon'
 import { ExecutionRuntimeError, executionFailure } from './executionRuntimeError'
 import {
   prepareExecutionSavePointRestore,
   splitExecutionHistoryAtSavePoint,
 } from './executionSavePoint'
-import type { ExecutionPersistedState } from './planExecutionState'
+import {
+  productionPlanExecutionContractBlock,
+  type ExecutionPersistedState,
+  type ProductionPlanExecutionContractBlock,
+} from './planExecutionState'
 import { inconsistent } from './stepExecution'
 
 /** The Plan statuses a user abandonment, a replan adoption or a breaking change can end. */
@@ -78,11 +82,83 @@ export function deriveRunningPlanSavePointChoiceRequirement(
 }
 
 /**
+ * Whether 「最後のゲーム内セーブ地点へ戻す」 can run at all for a Plan and its
+ * save point (Issue #335, `docs/PLANNER_SPEC.md` 16.10). The restore
+ * (`prepareExecutionSavePointRestore()`) requires both the current Plan and the
+ * save point's snapshot Plan to be executable under the current
+ * CalculationContext; a Plan a calculation version boundary made incompatible
+ * can never be restored, so a display must not offer it.
+ *
+ * Read-only and display only. It is judged by
+ * `productionPlanExecutionContractBlock()` - the CalculationContext
+ * compatibility and Execution contract premises the restore itself applies to
+ * both Plans - and never by comparing versions here. Whether the 16.10 choice is
+ * asked is a separate question (`deriveRunningPlanSavePointChoiceRequirement()`)
+ * this never answers. `restorable: true` is no write authority: the restore
+ * re-derives every premise, its other fail-closed checks included, in its own
+ * transaction and may still refuse.
+ */
+export type ExecutionSavePointRestorePlanAvailability =
+  | { restorable: true }
+  | {
+      restorable: false
+      /** The first premise the current Plan, then the snapshot Plan, fails. */
+      reason: ProductionPlanExecutionContractBlock
+    }
+
+export function inspectExecutionSavePointRestorePlans(
+  plan: ProductionPlan,
+  savePoint: Pick<ExecutionSavePoint, 'productionPlan'>,
+  currentCalculationContext: CalculationContext,
+): ExecutionSavePointRestorePlanAvailability {
+  const reason = productionPlanExecutionContractBlock(plan, currentCalculationContext)
+    ?? productionPlanExecutionContractBlock(savePoint.productionPlan, currentCalculationContext)
+  return reason === null ? { restorable: true } : { restorable: false, reason }
+}
+
+/**
+ * What a Plan-ending action's confirmation (abandonment, replan adoption, an
+ * approved breaking change) shows of the 16.10 choice, plus the save point the
+ * decision must name. A required choice stays required whether or not the
+ * restore can run - the Domain still asks for an explicit `keep_current` - and
+ * `savePointRestore` only says whether 「最後のゲーム内セーブ地点へ戻す」 may be
+ * offered as an executable choice (Issue #335). Advisory only.
+ */
+export type RunningPlanSavePointChoiceOptions =
+  | { savePointChoiceRequired: false }
+  | {
+      savePointChoiceRequired: true
+      savePointRecordedAt: ISODateTimeString
+      savePointLastExecutionHistoryId: ExecutionHistoryId | null
+      /** The Plan's current Step when the save point was recorded. */
+      savePointCurrentStepId: PlanStepId | null
+      savePointRestore: ExecutionSavePointRestorePlanAvailability
+    }
+
+/** The one projection of a derived 16.10 choice the Plan-ending inspections share. */
+export function runningPlanSavePointChoiceOptions(
+  plan: ProductionPlan,
+  choice: RunningPlanSavePointChoiceRequirement,
+  currentCalculationContext: CalculationContext,
+): RunningPlanSavePointChoiceOptions {
+  if (!choice.required) return { savePointChoiceRequired: false }
+  return {
+    savePointChoiceRequired: true,
+    savePointRecordedAt: choice.savePoint.recordedAt,
+    savePointLastExecutionHistoryId: choice.savePoint.lastExecutionHistoryId,
+    savePointCurrentStepId: choice.savePoint.productionPlan.currentStepId,
+    savePointRestore: inspectExecutionSavePointRestorePlans(plan, choice.savePoint, currentCalculationContext),
+  }
+}
+
+/**
  * Whether the Navigator offers 「最後のゲーム内セーブ地点へ戻す」 on its own
  * (`docs/UI_FLOW.md` 12.8): only a running Plan with a save point that at least
  * one of its records is ordered after. Read-only and display only, derived by
  * `deriveRunningPlanSavePointChoiceRequirement()` - the boundary authority the
- * restore and the 16.10 choice use - and never by array position or timestamps.
+ * restore and the 16.10 choice use - and never by array position or timestamps,
+ * and then by `inspectExecutionSavePointRestorePlans()`, so a Plan the current
+ * CalculationContext cannot execute is `blocked` rather than `available`.
  * `prepareExecutionSavePointRestore()` stays the write authority.
  */
 export type ExecutionSavePointRestoreAvailability =
@@ -94,23 +170,31 @@ export type ExecutionSavePointRestoreAvailability =
   | { kind: 'available'; savePoint: ExecutionSavePoint }
   /** Its boundary is missing or foreign: the restore would refuse it (`save_point_snapshot_invalid`). */
   | { kind: 'invalid'; savePoint: ExecutionSavePoint }
+  /** Records follow the save point, but the restore refuses the Plan or its snapshot Plan (Issue #335). */
+  | { kind: 'blocked'; savePoint: ExecutionSavePoint; reason: ProductionPlanExecutionContractBlock }
 
 export function inspectExecutionSavePointRestore(
-  plan: Pick<ProductionPlan, 'id' | 'status'>,
+  plan: ProductionPlan,
   savePoint: ExecutionSavePoint | null,
   planExecutionHistory: readonly ExecutionHistory[],
+  currentCalculationContext: CalculationContext,
 ): ExecutionSavePointRestoreAvailability {
   if (savePoint === null) return { kind: 'no_save_point' }
   if (plan.status !== 'active' && plan.status !== 'stale') return { kind: 'not_running', savePoint }
+  let choice: RunningPlanSavePointChoiceRequirement
   try {
-    const choice = deriveRunningPlanSavePointChoiceRequirement(plan, savePoint, planExecutionHistory)
-    return choice.required ? { kind: 'available', savePoint } : { kind: 'at_current_position', savePoint }
+    choice = deriveRunningPlanSavePointChoiceRequirement(plan, savePoint, planExecutionHistory)
   } catch (caught: unknown) {
     if (caught instanceof ExecutionRuntimeError && caught.code === 'save_point_snapshot_invalid') {
       return { kind: 'invalid', savePoint }
     }
     throw caught
   }
+  if (!choice.required) return { kind: 'at_current_position', savePoint }
+  const restore = inspectExecutionSavePointRestorePlans(plan, savePoint, currentCalculationContext)
+  return restore.restorable
+    ? { kind: 'available', savePoint }
+    : { kind: 'blocked', savePoint, reason: restore.reason }
 }
 
 /**
@@ -124,16 +208,7 @@ export type ProductionPlanAbandonmentOptions = {
   planStatus: RunningProductionPlanStatus
   planCurrentStepId: PlanStepId | null
   planUpdatedAt: ISODateTimeString
-} & (
-  | { savePointChoiceRequired: false }
-  | {
-      savePointChoiceRequired: true
-      savePointRecordedAt: ISODateTimeString
-      savePointLastExecutionHistoryId: ExecutionHistoryId | null
-      /** The Plan's current Step when the save point was recorded. */
-      savePointCurrentStepId: PlanStepId | null
-    }
-)
+} & RunningPlanSavePointChoiceOptions
 
 /**
  * The user's answer to the 16.10 choice. `null` is the plain abandonment when
@@ -185,7 +260,7 @@ export interface ObservedProductionPlanState {
 
 type AbandonmentReadState = Pick<
   ExecutionPersistedState,
-  'ownedWeapons' | 'targetWeapons' | 'buildListEntries' | 'planExecutionHistory' | 'executionSavePoint'
+  'ownedWeapons' | 'targetWeapons' | 'buildListEntries' | 'planExecutionHistory' | 'undoSnapshotsAfterSavePoint' | 'executionSavePoint'
 >
 
 function requireRunningPlan(plan: ProductionPlan): RunningProductionPlanStatus {
@@ -200,27 +275,22 @@ function requireRunningPlan(plan: ProductionPlan): RunningProductionPlanStatus {
 
 /**
  * Reads what abandoning the Plan would ask (`docs/PLANNER_SPEC.md` 16.10). It
- * changes nothing.
+ * changes nothing. 「現在地点を維持」 abandons a Plan of any CalculationContext,
+ * while the restore is offered only where `savePointRestore` says it can run.
  */
 export function inspectProductionPlanAbandonment(
   plan: ProductionPlan,
   state: Pick<AbandonmentReadState, 'planExecutionHistory' | 'executionSavePoint'>,
+  currentCalculationContext: CalculationContext,
 ): ProductionPlanAbandonmentOptions {
   const planStatus = requireRunningPlan(plan)
-  const base = {
+  const choice = deriveRunningPlanSavePointChoiceRequirement(plan, state.executionSavePoint, state.planExecutionHistory)
+  return {
     planId: plan.id,
     planStatus,
     planCurrentStepId: plan.currentStepId,
     planUpdatedAt: plan.updatedAt,
-  }
-  const choice = deriveRunningPlanSavePointChoiceRequirement(plan, state.executionSavePoint, state.planExecutionHistory)
-  if (!choice.required) return { ...base, savePointChoiceRequired: false }
-  return {
-    ...base,
-    savePointChoiceRequired: true,
-    savePointRecordedAt: choice.savePoint.recordedAt,
-    savePointLastExecutionHistoryId: choice.savePoint.lastExecutionHistoryId,
-    savePointCurrentStepId: choice.savePoint.productionPlan.currentStepId,
+    ...runningPlanSavePointChoiceOptions(plan, choice, currentCalculationContext),
   }
 }
 
@@ -431,9 +501,9 @@ export function assertAbandonedStateValid(
       executionFailure('entity_validation_failed', `OwnedWeapon '${weapon.id}' fails Domain validation after the abandonment.`, validation.issues)
     }
   }
-  const preferences = validateTargetPreferredOwnedWeapons([...nextTargets], [...nextWeapons])
+  const preferences = validateTargetOwnedWeaponCollections([...nextTargets], [...nextWeapons])
   if (!preferences.isValid) {
-    executionFailure('collection_validation_failed', 'The Target preferred owned weapon collection is invalid after the abandonment.', preferences.issues)
+    executionFailure('collection_validation_failed', 'The Target preferred owned weapon or completion assignment collection is invalid after the abandonment.', preferences.issues)
   }
   const stillInProgress = nextWeapons.find(({ executionInProgress }) => executionInProgress?.productionPlanId === plan.id)
   if (stillInProgress !== undefined) {

@@ -3,6 +3,7 @@ import type {
   CalculationContext,
   ExecutionHistory,
   ExecutionSavePoint,
+  ExecutionUndoSnapshot,
   ExpectedPlanState,
   NormalArtianCounter,
   ObservedRestorationBonusBinding,
@@ -26,7 +27,8 @@ import {
   createDependentBuildListEntriesHash,
   createDependentTargetDefinitionsHash,
 } from '../planner/productionPlanGeneration'
-import { executionFailure } from './executionRuntimeError'
+import { inspectProductionPlanCompletionAssignmentSafety } from '../planner/productionPlanCompletionAssignmentSafety'
+import { ExecutionRuntimeError, executionFailure } from './executionRuntimeError'
 
 /**
  * The persisted state one Execution transaction reads before it decides
@@ -40,8 +42,15 @@ export interface ExecutionPersistedState {
   ownedWeapons: readonly OwnedWeapon[]
   targetWeapons: readonly TargetWeapon[]
   buildListEntries: readonly BuildListEntry[]
-  /** Every ExecutionHistory entry of the Plan being executed. */
+  /** The metadata of every ExecutionHistory entry of the Plan being executed. */
   planExecutionHistory: readonly ExecutionHistory[]
+  /**
+   * The Undo bodies of the Plan's records after its game save point, read only
+   * when the operation restores that save point (`docs/DATA_MODEL.md` 14.6).
+   * Empty for every other operation: a Step confirmation, a save point record
+   * or a 「現在地点を維持」 reads no Undo body.
+   */
+  undoSnapshotsAfterSavePoint: readonly ExecutionUndoSnapshot[]
   /** The Plan's game save point, if one was recorded. */
   executionSavePoint: ExecutionSavePoint | null
 }
@@ -60,6 +69,25 @@ function sameExpectedPlanState(left: ExpectedPlanState, right: ExpectedPlanState
   )
 }
 
+/** Which premise of `assertExecutableProductionPlan()` before its Domain validation a Plan fails. */
+export type ProductionPlanExecutionContractBlock = 'calculation_context_changed' | 'plan_not_executable'
+
+/**
+ * The premises of `assertExecutableProductionPlan()` that need no Domain
+ * validation, in its order: the CalculationContext compatibility, then the
+ * Execution Plan contract. `null` when both hold. The assertion and the
+ * read-only display judgements (Issue #335) share this one function, so a
+ * display never offers what the runtime refuses for these reasons.
+ */
+export function productionPlanExecutionContractBlock(
+  plan: ProductionPlan,
+  currentCalculationContext: CalculationContext,
+): ProductionPlanExecutionContractBlock | null {
+  if (!isProductionPlanCalculationCompatible(plan, currentCalculationContext)) return 'calculation_context_changed'
+  if (!isExecutionContractProductionPlan(plan)) return 'plan_not_executable'
+  return null
+}
+
 /**
  * The Plan is an executable Plan of the current calculation schema under the current
  * CalculationContext (`isProductionPlanCalculationCompatible()`, which also keeps
@@ -70,13 +98,14 @@ export function assertExecutableProductionPlan(
   plan: ProductionPlan,
   currentCalculationContext: CalculationContext,
 ): void {
-  if (!isProductionPlanCalculationCompatible(plan, currentCalculationContext)) {
+  const block = productionPlanExecutionContractBlock(plan, currentCalculationContext)
+  if (block === 'calculation_context_changed') {
     executionFailure(
       'calculation_context_changed',
       `ProductionPlan '${plan.id}' was calculated under an incompatible CalculationContext.`,
     )
   }
-  if (!isExecutionContractProductionPlan(plan)) {
+  if (block === 'plan_not_executable') {
     executionFailure(
       'plan_not_executable',
       `ProductionPlan '${plan.id}' predates the Execution Plan contract and is never executable.`,
@@ -90,6 +119,33 @@ export function assertExecutableProductionPlan(
       validation.issues,
     )
   }
+}
+
+/**
+ * The completion assignment premise of every operation that advances a Plan
+ * (Issue #334, `docs/PLANNER_SPEC.md` 21.4.1): the Plan start (a replan
+ * adoption's new Plan included), every Step confirmation (`confirmed_expected`,
+ * `actual_result_different`, `operation_uncertain`) and the Current Position
+ * Recovery. Judged from the state the transaction read through the one Domain
+ * authority `inspectProductionPlanCompletionAssignmentSafety()`, after
+ * `assertExecutableProductionPlan()` so an incompatible Plan reports
+ * `calculation_context_changed` first. An unsafe Plan is refused as a whole with
+ * `completion_assignment_conflict` before its conflicting completion Step is
+ * reached. It is never applied to Undo, the game save point record / restore,
+ * an abandonment or an approved breaking change: none of them advances the Plan.
+ */
+export function assertProductionPlanCompletionAssignmentSafe(
+  plan: ProductionPlan,
+  targetWeapons: readonly TargetWeapon[],
+): void {
+  const safety = inspectProductionPlanCompletionAssignmentSafety(plan, targetWeapons)
+  if (safety.safe) return
+  throw new ExecutionRuntimeError(
+    'completion_assignment_conflict',
+    `ProductionPlan '${plan.id}' would make one owned weapon the completion of two Targets (${safety.issues.map(({ reason }) => reason).join(', ')}).`,
+    [],
+    safety.issues,
+  )
 }
 
 /** The current incomplete Step of an executable Plan. */

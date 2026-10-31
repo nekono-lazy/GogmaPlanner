@@ -33,9 +33,15 @@ import {
  * Beam Search Production Planner) had no provisional outcome and recorded
  * `resource_conflict` for explicit decisions only. A future version joins only
  * when it keeps the meaning of the rejection records, by adding it here.
+ * Version 19 (Issue #100, the completion condition redesign) keeps it: the
+ * Planner's rejection and conflict records mean exactly what they meant under
+ * 18 (`docs/DATA_MODEL.md` 3.5). Version 20 (Issue #334 PR-3, one completed
+ * weapon per Target) keeps it too: the release that produced
+ * `already_satisfied` no longer happens, and every other reason and cause means
+ * what it meant under 19 (`docs/PLANNER_SPEC.md` 21.9).
  */
 export const PLAN_COMPLETION_RATIO_CALCULATION_APP_SCHEMA_VERSIONS: ReadonlySet<number> = new Set([
-  14, 15, 16, 17, 18,
+  14, 15, 16, 17, 18, 19, 20,
 ])
 
 /** Why the ratio cannot be told from the records (`docs/PLANNER_SPEC.md` 9.6.9.1 conditions 2 - 5). */
@@ -139,8 +145,29 @@ const ESTABLISHED_CONFLICT_CAUSES: ReadonlySet<string> = new Set([
  * Step lacking `executionEffects` is of the legacy form, and its completions
  * are never reconstructed from `shouldSecure` or the Step kinds.
  */
-export function hasProductionPlanTargetCompletionAuthority(plan: ProductionPlan): boolean {
+export function hasProductionPlanTargetCompletionAuthority(plan: Pick<ProductionPlan, 'steps'>): boolean {
   return plan.steps.every((step) => step.executionEffects !== undefined)
+}
+
+/**
+ * `C`: the distinct Targets of `steps[].executionEffects.targetCompletions`, in
+ * Step order (`docs/PLANNER_SPEC.md` 9.6.9.1), or `null` when the Plan lacks
+ * that authority (`hasProductionPlanTargetCompletionAuthority()`), so a legacy
+ * Plan is never read as one that plans no Target. The one derivation of the
+ * Plan's planned Targets: the completion summary and the running Plan replan
+ * (18.2) both read it.
+ */
+export function collectProductionPlanTargetCompletionTargetWeaponIds(
+  plan: Pick<ProductionPlan, 'steps'>,
+): TargetWeaponId[] | null {
+  if (!hasProductionPlanTargetCompletionAuthority(plan)) return null
+  const completed = new Set<TargetWeaponId>()
+  for (const step of plan.steps) {
+    for (const { targetWeaponId } of step.executionEffects?.targetCompletions ?? []) {
+      completed.add(targetWeaponId)
+    }
+  }
+  return [...completed]
 }
 
 function hasKnownLiterals(record: RejectedBuildListEntry): boolean {
@@ -176,16 +203,6 @@ function firstFailingCondition(plan: ProductionPlan): ProductionPlanCompletionRa
     return 'conflict_cause_not_established'
   }
   return null
-}
-
-function completedTargetWeaponIdsOf(plan: ProductionPlan): TargetWeaponId[] {
-  const completed = new Set<TargetWeaponId>()
-  for (const step of plan.steps) {
-    for (const { targetWeaponId } of step.executionEffects?.targetCompletions ?? []) {
-      completed.add(targetWeaponId)
-    }
-  }
-  return [...completed]
 }
 
 /** Read only when conditions 1 - 4 hold: every `resource_conflict` record names its Target and cause. */
@@ -227,10 +244,10 @@ function causeBreakdownOf(
  */
 export function summarizeProductionPlanCompletion(plan: ProductionPlan): ProductionPlanCompletionSummary {
   const isProvisional = plan.conflicts.some(({ selectedBuildListEntryId }) => selectedBuildListEntryId === null)
-  if (!hasProductionPlanTargetCompletionAuthority(plan)) {
+  const completedTargetWeaponIds = collectProductionPlanTargetCompletionTargetWeaponIds(plan)
+  if (completedTargetWeaponIds === null) {
     return { status: 'completion_unknown', isProvisional }
   }
-  const completedTargetWeaponIds = completedTargetWeaponIdsOf(plan)
   const completedCount = completedTargetWeaponIds.length
   const failing = firstFailingCondition(plan)
   if (failing === null) {

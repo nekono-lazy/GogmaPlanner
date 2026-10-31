@@ -107,6 +107,13 @@ export function validateOwnedWeaponMasterReferences(
   return issues
 }
 
+/**
+ * The save-time Master references of a Target (`docs/DATA_MODEL.md` 8.2): the
+ * weapon type, element and completion Skills must be enabled, and every slot's
+ * `(bonusTypeId, minimumRankId)` of every Variant must be a Production draw
+ * candidate of the Target's weapon type / element / `gogma_artian` scope
+ * (`docs/MASTER_DATA.md` 15.1). Import keeps checking existence only.
+ */
 export function validateTargetWeaponMasterReferences(
   target: TargetWeapon,
   master: MasterDataRoot,
@@ -116,24 +123,17 @@ export function validateTargetWeaponMasterReferences(
     {
       weaponTypeId: target.weaponTypeId,
       elementId: target.elementId,
-      seriesSkillId: target.idealSkillCondition.seriesSkillId,
-      groupSkillId: target.idealSkillCondition.groupSkillId,
+      seriesSkillId: target.completionSkillCondition.seriesSkillId,
+      groupSkillId: target.completionSkillCondition.groupSkillId,
     },
     master,
     issues,
   )
-  if (target.practicalSkillCondition.seriesSkillId !== null && !master.seriesSkills.some(({ id, isEnabled }) => id === target.practicalSkillCondition.seriesSkillId && isEnabled)) issues.push('practicalSkillCondition.seriesSkillId: 利用できません。')
-  if (target.practicalSkillCondition.groupSkillId !== null && !master.groupSkills.some(({ id, isEnabled }) => id === target.practicalSkillCondition.groupSkillId && isEnabled)) issues.push('practicalSkillCondition.groupSkillId: 利用できません。')
-  validateBonuses(master, target.weaponTypeId, target.elementId, 'gogma_artian', [
-    ...target.idealBonuses.map((bonus, index) => ({ bonus, path: `idealBonuses[${index}]` })),
-    ...target.practicalBonusConditions.map((condition, index) => ({
-      bonus: { bonusTypeId: condition.bonusTypeId, bonusRankId: condition.minimumRankId },
-      path: `practicalBonusConditions[${index}]`,
-    })),
-    ...target.alternativeBonusRules.flatMap((group, groupIndex) => group.options.map((option, optionIndex) => ({
-      bonus: { bonusTypeId: option.alternativeBonusTypeId, bonusRankId: option.minimumRankId },
-      path: `alternativeBonusRules[${groupIndex}].options[${optionIndex}]`,
+  validateBonuses(master, target.weaponTypeId, target.elementId, 'gogma_artian',
+    target.completionBonusVariants.flatMap((variant, variantIndex) => variant.slots.map((slot, slotIndex) => ({
+      bonus: { bonusTypeId: slot.bonusTypeId, bonusRankId: slot.minimumRankId },
+      path: `completionBonusVariants[${variantIndex}].slots[${slotIndex}]`,
     }))),
-  ], issues)
+    issues)
   return issues
 }

@@ -3,11 +3,9 @@ import {
   buildListEntriesForTarget,
   classifyBuildListCandidateAddition,
   createBuildListEntry,
-  defaultIntermediateStateSelection,
   evaluateBuildListEntryStaleness,
   isSameBuildListCandidate,
   validateBuildListCardinality,
-  withIntermediateStateSelection,
 } from '../../domain/buildList'
 import {
   unchangedMutableState,
@@ -15,13 +13,16 @@ import {
   type PlanBreakingChangeInspection,
   type PlanGuardedMutation,
 } from '../../domain/execution'
+import {
+  targetWeaponPlanningIneligibilityCause,
+  type TargetWeaponPlanningIneligibilityCause,
+} from '../../domain/models/domainRules'
 import { validateBuildListEntry } from '../../domain/models/publicTypes'
 import type {
   BuildCandidate,
   BuildListEntry,
   BuildListEntryId,
   CalculationContext,
-  IntermediateStateSelection,
   ISODateTimeString,
   NormalArtianCounter,
   OwnedWeapon,
@@ -64,9 +65,8 @@ export interface BuildListServiceRepositories {
   getTargets(): Promise<TargetWeapon[]>
   /**
    * The breaking-change guard of the Build List operations that can break the
-   * `active` Plan: changing a selected Entry's intermediate state selection or
-   * improvement preference, deleting a selected Entry, and replacing the Entry
-   * of a Target.
+   * `active` Plan: deleting a selected Entry and replacing the Entry of a
+   * Target.
    */
   persistence: PlanGuardedPersistence
   /** The `createdAt` of a replacing Entry. Defaults to the system clock. */
@@ -91,8 +91,8 @@ export const defaultBuildListRepositories: BuildListServiceRepositories = {
  *
  * - `added`: the Target had no Entry, and the new Entry was added
  * - `duplicate`: the Target's one Entry is of the same semantic Candidate and
- *   is returned untouched - its selection and improvement preference are never
- *   overwritten by a re-add
+ *   is returned untouched - a re-add never rewrites it, a legacy Entry's
+ *   persisted fields included
  * - `replacement_required`: the Target holds one Entry of another Candidate.
  *   Nothing was written; that Entry may only be replaced through
  *   `replaceCandidate()` after the user confirmed it
@@ -113,13 +113,12 @@ export type AddBuildListCandidateResult =
  * addition, so the new Entry's Target definition hash describes the Candidate.
  * `expectedExistingEntryId` is the Entry the user saw and confirmed replacing:
  * the replacement is refused unless it is still that Target's only Entry.
- * `intermediateStateSelection` is the Search screen's own selection; nothing of
- * the replaced Entry is carried over.
+ * The new Entry is built from the Candidate alone; nothing of the replaced
+ * Entry is carried over.
  */
 export interface BuildListCandidateReplacementRequest {
   candidate: BuildCandidate
   target: TargetWeapon
-  intermediateStateSelection: IntermediateStateSelection
   expectedExistingEntryId: BuildListEntryId
 }
 
@@ -137,7 +136,7 @@ const cardinalityErrorMessages: Record<BuildListCardinalityErrorCode, string> = 
   legacy_duplicate_entries:
     'この目標武器には作成リストに複数の候補が登録されています。作成リストで使用する候補を1件にしてから、もう一度操作してください。',
   candidate_already_added:
-    'この候補は作成リストに追加済みです。途中採用する状態と改善優先は作成リストで変更してください。',
+    'この候補は作成リストに追加済みです。',
 }
 
 export class BuildListCardinalityError extends Error {
@@ -148,6 +147,81 @@ export class BuildListCardinalityError extends Error {
     this.name = 'BuildListCardinalityError'
     this.code = code
   }
+}
+
+/**
+ * Why a stale Entry's re-search replacement was refused with nothing written
+ * (`docs/DATA_MODEL.md` 9.4.1 「再検索による置換」, Issue #347). The first three
+ * are the cardinality refusals the confirmed replacement shares; the others
+ * are the re-search's own premises re-read inside the transaction.
+ */
+export type BuildListStaleCandidateReplacementErrorCode =
+  | 'target_not_found'
+  | 'replacement_target_changed'
+  | 'legacy_duplicate_entries'
+  /**
+   * The Target can no longer be searched by the state the save runs on
+   * (`targetWeaponPlanningIneligibilityCause()`): it was completed, its search
+   * was disabled, or its completion condition awaits review since the batch
+   * started. A re-search never replaces the Entry of a Target the single
+   * search could not search.
+   */
+  | 'target_completed'
+  | 'target_disabled'
+  | 'target_review_required'
+  /** The Entry the batch set out to replace is no longer stale by the state the save runs on. */
+  | 'entry_no_longer_stale'
+  /** The found Candidate is already stale against the state the save runs on (the state moved after its search). */
+  | 'candidate_not_current'
+
+/** The refusal code of each cause `targetWeaponPlanningIneligibilityCause()` names. */
+const staleCandidateReplacementIneligibilityCodes: Record<
+  TargetWeaponPlanningIneligibilityCause,
+  BuildListStaleCandidateReplacementErrorCode
+> = {
+  completed: 'target_completed',
+  disabled: 'target_disabled',
+  review_required: 'target_review_required',
+}
+
+const staleCandidateReplacementErrorMessages: Record<BuildListStaleCandidateReplacementErrorCode, string> = {
+  target_not_found: cardinalityErrorMessages.target_not_found,
+  replacement_target_changed: cardinalityErrorMessages.replacement_target_changed,
+  legacy_duplicate_entries: cardinalityErrorMessages.legacy_duplicate_entries,
+  target_completed:
+    'この目標武器は完了済みになっていたため、候補を置き換えませんでした。元の候補はそのまま登録されています。',
+  target_disabled:
+    'この目標武器は検索対象OFFになっていたため、候補を置き換えませんでした。元の候補はそのまま登録されています。',
+  target_review_required:
+    'この目標武器は完成条件の再設定が必要になっていたため、候補を置き換えませんでした。元の候補はそのまま登録されています。目標武器画面で内容を確認して保存してください。',
+  entry_no_longer_stale:
+    'この作成リストの候補は再検索が不要になっていたため、置き換えませんでした。元の候補はそのまま登録されています。',
+  candidate_not_current:
+    '検索の後にRNG状態・所持武器・目標武器が変わったため、検索結果をそのまま登録できませんでした。元の候補はそのまま登録されています。もう一度検索してください。',
+}
+
+export class BuildListStaleCandidateReplacementError extends Error {
+  readonly code: BuildListStaleCandidateReplacementErrorCode
+
+  constructor(code: BuildListStaleCandidateReplacementErrorCode) {
+    super(staleCandidateReplacementErrorMessages[code])
+    this.name = 'BuildListStaleCandidateReplacementError'
+    this.code = code
+  }
+}
+
+/**
+ * One replacement 「再検索が必要な候補を一括再検索・置換」 makes for a Target
+ * (`docs/DATA_MODEL.md` 9.4.1 「再検索による置換」, Issue #347): the Candidate
+ * its re-search found, the Target that search ran with, and the stale Entry
+ * the batch set out to replace. Like the confirmed replacement, the Entry ID
+ * is the premise the save re-checks; nothing of the replaced Entry is carried
+ * over.
+ */
+export interface BuildListStaleCandidateReplacementRequest {
+  candidate: BuildCandidate
+  target: TargetWeapon
+  expectedExistingEntryId: BuildListEntryId
 }
 
 function assertValidEntry(entry: BuildListEntry): void {
@@ -168,10 +242,11 @@ function assertValidEntry(entry: BuildListEntry): void {
  * Every premise is re-read from the state the mutation runs on, never trusted
  * from the screen: the Target must still exist and hold exactly the Entry the
  * user confirmed replacing (another tab may have changed it), and the Candidate
- * must not be that Entry's own - a re-add never overwrites a selection. The new
- * Entry comes from the Candidate and the request's own selection alone, with a
- * fresh ID; the replaced Entry's selection and improvement preference are not
- * carried over, and no record referring to it is touched. The replaced Target
+ * must not be that Entry's own - a re-add never rewrites the Entry. The new
+ * Entry comes from the Candidate alone, with a fresh ID and no
+ * `intermediateStateSelection`; nothing of the replaced Entry (a legacy
+ * selection or improvement preference included) is carried over, and no record
+ * referring to it is touched. The replaced Target
  * must satisfy the Build List cardinality contract afterwards. Any refusal
  * throws before anything is written.
  */
@@ -180,7 +255,7 @@ export function buildListEntryReplacementMutation(
   createdAt: ISODateTimeString,
 ): PlanGuardedMutation<BuildListEntry> {
   return (base) => {
-    const { candidate, target, intermediateStateSelection, expectedExistingEntryId } = request
+    const { candidate, target, expectedExistingEntryId } = request
     if (!base.targetWeapons.some(({ id }) => id === target.id)) {
       throw new BuildListCardinalityError('target_not_found')
     }
@@ -193,7 +268,7 @@ export function buildListEntryReplacementMutation(
     if (isSameBuildListCandidate(existing, candidate)) {
       throw new BuildListCardinalityError('candidate_already_added')
     }
-    const entry = createBuildListEntry(candidate, target, { intermediateStateSelection, createdAt })
+    const entry = createBuildListEntry(candidate, target, { createdAt })
     assertValidEntry(entry)
     if (base.buildListEntries.some(({ id }) => id === entry.id)) {
       throw new Error(`BuildListEntry '${entry.id}' already exists and is never overwritten.`)
@@ -216,28 +291,90 @@ export function buildListEntryReplacementMutation(
 }
 
 /**
- * One intermediate state selection change as a guarded mutation. The Domain
- * validation is the authority for at most one state per lane and for every id
- * existing on its own lane of the Candidate Snapshot, so an invalid selection
- * fails closed here rather than reaching the Planner.
+ * One stale Entry's re-search replacement as a guarded mutation
+ * (`docs/DATA_MODEL.md` 9.4.1 「再検索による置換」, Issue #347). It differs from
+ * `buildListEntryReplacementMutation()` in exactly two premises, both re-read
+ * from the state the mutation runs on:
+ *
+ * - the Target must still be one the single search could search
+ *   (`targetWeaponPlanningIneligibilityCause()` names none): a Target completed,
+ *   disabled or sent back to review since the batch started keeps its Entry
+ *   (`target_completed` / `target_disabled` / `target_review_required`).
+ *   `isEnabled`, the lifecycle and the review are outside the Target
+ *   definition hash, so the staleness checks below would not catch them
+ * - the Target's one Entry must still be stale by
+ *   `evaluateBuildListEntryStaleness()` recomputed from that state (an Entry
+ *   that is up to date again - the RNG state was restored, say - is kept as it
+ *   is: `entry_no_longer_stale`)
+ * - the new Entry built from the Candidate must be up to date against that
+ *   same state (a search result the state moved past is never written:
+ *   `candidate_not_current`)
+ *
+ * and a Candidate of the same semantic meaning as the stale Entry's is
+ * allowed: the point of the re-search is a fresh Entry whose Target definition
+ * hash, search state hash, referenced weapons hash and CalculationContext are
+ * the current ones, so `candidate_already_added` is never raised here. The
+ * replaced Entry's removal and the new Entry's addition are still one change
+ * for the breaking-change guard and one transaction; the new Entry gets a
+ * fresh ID, and nothing of the replaced Entry is carried over. Every other
+ * premise (the Target exists, holds exactly the expected Entry, the
+ * cardinality afterwards) is the confirmed replacement's.
  */
-export function intermediateStateSelectionMutation(
-  id: BuildListEntryId,
-  intermediateStateSelection: IntermediateStateSelection,
+export function buildListStaleCandidateReplacementMutation(
+  request: BuildListStaleCandidateReplacementRequest,
+  createdAt: ISODateTimeString,
+  currentCalculationContext: CalculationContext,
 ): PlanGuardedMutation<BuildListEntry> {
   return (base) => {
-    const existing = base.buildListEntries.find((entry) => entry.id === id)
-    if (!existing) {
-      throw new Error(`BuildListEntry '${id}' does not exist.`)
+    const { candidate, target, expectedExistingEntryId } = request
+    const currentTarget = base.targetWeapons.find(({ id }) => id === target.id) ?? null
+    if (currentTarget === null) throw new BuildListStaleCandidateReplacementError('target_not_found')
+    // The current Target, never the one the search ran with: it may have been
+    // completed, disabled or sent back to review in another tab meanwhile.
+    const ineligibility = targetWeaponPlanningIneligibilityCause(currentTarget)
+    if (ineligibility !== null) {
+      throw new BuildListStaleCandidateReplacementError(staleCandidateReplacementIneligibilityCodes[ineligibility])
     }
-    const updated = withIntermediateStateSelection(existing, intermediateStateSelection)
-    assertValidEntry(updated)
+    const current = buildListEntriesForTarget(base.buildListEntries, target.id)
+    if (current.length >= 2) throw new BuildListStaleCandidateReplacementError('legacy_duplicate_entries')
+    const [existing] = current
+    if (existing === undefined || existing.id !== expectedExistingEntryId) {
+      throw new BuildListStaleCandidateReplacementError('replacement_target_changed')
+    }
+    if (base.rngState === null) {
+      throw new Error('No RngState is stored, so no Build List staleness can be judged.')
+    }
+    const stalenessContext = {
+      target: currentTarget,
+      rngState: base.rngState,
+      normalCounters: base.normalCounters,
+      ownedWeapons: base.ownedWeapons,
+      calculationContext: currentCalculationContext,
+    }
+    if (!evaluateBuildListEntryStaleness(existing, stalenessContext).isStale) {
+      throw new BuildListStaleCandidateReplacementError('entry_no_longer_stale')
+    }
+    const entry = createBuildListEntry(candidate, target, { createdAt })
+    assertValidEntry(entry)
+    if (evaluateBuildListEntryStaleness(entry, stalenessContext).isStale) {
+      throw new BuildListStaleCandidateReplacementError('candidate_not_current')
+    }
+    if (base.buildListEntries.some(({ id }) => id === entry.id)) {
+      throw new Error(`BuildListEntry '${entry.id}' already exists and is never overwritten.`)
+    }
+    const buildListEntries = [
+      ...base.buildListEntries.filter(({ id }) => id !== existing.id),
+      entry,
+    ]
+    const cardinality = validateBuildListCardinality(
+      buildListEntriesForTarget(buildListEntries, target.id),
+    )
+    if (!cardinality.isValid) {
+      throw new Error(cardinality.issues.map(({ message }) => message).join('\n'))
+    }
     return {
-      result: updated,
-      state: {
-        ...unchangedMutableState(base),
-        buildListEntries: base.buildListEntries.map((entry) => (entry.id === id ? updated : entry)),
-      },
+      result: entry,
+      state: { ...unchangedMutableState(base), buildListEntries },
     }
   }
 }
@@ -268,19 +405,15 @@ export class BuildListService {
    * The Build List holds at most one Entry per Target, so another Candidate of
    * a Target that already has an Entry is never added beside it: it needs the
    * user's confirmed `replaceCandidate()`. An existing equivalent Entry is
-   * returned untouched: its intermediate state selection and improvement
-   * preference are the user's Build List input, and the Search screen's current
-   * selection must never silently overwrite them (`docs/UI_FLOW.md` 9). The
+   * returned untouched (`docs/UI_FLOW.md` 9): a re-add never rewrites it. The
+   * new Entry carries no `intermediateStateSelection` (Issue #100). The
    * decision and the addition run in one transaction.
    */
   async addCandidate(
     candidate: BuildCandidate,
     target: TargetWeapon,
-    intermediateStateSelection: IntermediateStateSelection = defaultIntermediateStateSelection(),
   ): Promise<AddBuildListCandidateResult> {
-    const entry = createBuildListEntry(candidate, target, {
-      intermediateStateSelection,
-    })
+    const entry = createBuildListEntry(candidate, target)
     assertValidEntry(entry)
     return this.repositories.decideAndAddEntry<AddBuildListCandidateResult>((entries) => {
       const state = classifyBuildListCandidateAddition(entries, candidate)
@@ -326,33 +459,23 @@ export class BuildListService {
   }
 
   /**
-   * Replaces one Entry's intermediate state selection and improvement
-   * preference.
-   *
-   * The Domain validation is the authority for at most one state per lane
-   * and for every id existing on its own lane of the Candidate Snapshot, so
-   * an invalid selection fails closed here rather than reaching the Planner.
-   * A lane start (position 0) is a legal selection: for an existing Gogma,
-   * both lane starts - or one start beside a lane that is already Ideal - is
-   * the weapon the user holds now, and the Planner treats that compromise
-   * checkpoint as reached at its start; a conversion Route's lane start is
-   * reached once the conversion ran (`docs/PLANNER_SPEC.md` 7.5.2).
+   * Replaces a Target's one stale Entry with a new Entry of the Candidate its
+   * re-search found (`docs/DATA_MODEL.md` 9.4.1 「再検索による置換」, Issue #347),
+   * for 「再検索が必要な候補を一括再検索・置換」 only. It takes no approval: the
+   * batch never approves a breaking change, so when the replaced Entry is one
+   * the `active` Plan depends on the guard refuses with
+   * `PlanBreakingChangeApprovalRequiredError` and nothing is written - the
+   * user replaces that Entry through the single search's confirmed replacement
+   * instead. A refusal of the re-search's own premises is a typed
+   * `BuildListStaleCandidateReplacementError`; either way the stale Entry stays
+   * exactly as persisted.
    */
-  async updateIntermediateStateSelection(
-    id: BuildListEntryId,
-    intermediateStateSelection: IntermediateStateSelection,
-    approval: PlanBreakingChangeApproval | null = null,
+  async replaceStaleCandidate(
+    request: BuildListStaleCandidateReplacementRequest,
+    currentCalculationContext: CalculationContext,
   ): Promise<BuildListEntry> {
-    const mutation = intermediateStateSelectionMutation(id, intermediateStateSelection)
-    return (await this.repositories.persistence.apply(mutation, approval)).result
-  }
-
-  /** Whether the selection change needs the breaking-change approval (`docs/UI_FLOW.md` 16.3). Writes nothing. */
-  inspectIntermediateStateSelectionUpdate(
-    id: BuildListEntryId,
-    intermediateStateSelection: IntermediateStateSelection,
-  ): Promise<PlanBreakingChangeInspection> {
-    return this.repositories.persistence.inspect(intermediateStateSelectionMutation(id, intermediateStateSelection))
+    const mutation = buildListStaleCandidateReplacementMutation(request, this.now(), currentCalculationContext)
+    return (await this.repositories.persistence.apply(mutation, null)).result
   }
 
   async refreshStaleness(

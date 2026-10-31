@@ -1,4 +1,8 @@
-import { keepFamilyLayoutKey, keepFamilyMultisetKey } from '../rng/gogmaBonusFamily'
+import {
+  completionVariantKeepFamilyMultisetKeys,
+  keepFamilyLayoutKey,
+  keepFamilyMultisetKey,
+} from '../rng/gogmaBonusFamily'
 import type { TargetSearchScheduler } from './targetSearchScheduler'
 import type { RouteOperation, SkillAmendmentResult } from '../models/publicTypes'
 import { V1_NORMAL_ARTIAN_RARITY } from '../models/publicTypes'
@@ -418,7 +422,9 @@ function searchPredictedNormalRoutes(
     }
   }
   const initialSearch = (context.frontierPolicy ?? 'initial_candidate_search') === 'initial_candidate_search'
-  const idealFamilyMultiset = keepFamilyMultisetKey(target.idealBonuses, input.master)
+  // Issue #100: the set of every completion Variant's family multiset; a later
+  // offset stays only when its own family multiset belongs to it.
+  const completionFamilyMultisets = completionVariantKeepFamilyMultisetKeys(target.completionBonusVariants, input.master)
   result.searchedRoutes.push('normal_artian_to_gogma')
   // No legal conversion position inside the Skill window: no base can exist.
   if (conversions.positions.length === 0) return
@@ -455,9 +461,9 @@ function searchPredictedNormalRoutes(
           })
           context.normalPredictions?.set(candidateCounter, bonuses)
           // Keep preserves family counts. Later Reset routes are already
-          // represented by offset zero; an incompatible Keep-only base cannot
-          // reach the unordered Ideal bonus multiset, at any Skill position.
-          if (initialSearch && offset > 0 && keepFamilyMultisetKey(bonuses, input.master) !== idealFamilyMultiset) {
+          // represented by offset zero; a Keep-only base whose family multiset
+          // matches no completion Variant reaches none, at any Skill position.
+          if (initialSearch && offset > 0 && !completionFamilyMultisets.has(keepFamilyMultisetKey(bonuses, input.master))) {
             scheduleOffset(offset + 1)
             return
           }

@@ -196,6 +196,24 @@ export function createAppTheme(mode: ThemeMode): Theme {
               : {},
         },
       },
+      MuiTypography: {
+        // Issue #321: MUI 9 removed the system props from Typography, so its
+        // `color` prop now resolves only palette colour names (`primary`,
+        // `error`, ...) and `textPrimary` / `textSecondary` / `textDisabled`.
+        // The screens write the token path `color="text.secondary"` for their
+        // supporting text, which no longer matches anything: MUI emits no
+        // colour and the text silently inherits the primary text colour. This
+        // one variant resolves exactly that value to `text.secondary` again, as
+        // MUI's own `textSecondary` variant does. Any other `color`, a
+        // Typography without one, and an explicit `sx` colour (applied after
+        // the theme variants) render exactly as before.
+        variants: [
+          {
+            props: { color: 'text.secondary' },
+            style: ({ theme }) => ({ color: theme.palette.text.secondary }),
+          },
+        ],
+      },
       MuiButton: {
         defaultProps: { disableElevation: true },
       },

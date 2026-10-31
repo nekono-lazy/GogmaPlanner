@@ -29,6 +29,7 @@ import type {
   OwnedWeapon,
   TargetWeapon,
 } from './entities'
+import type { ProductionPlanUndoState } from './productionPlanUndoState'
 
 export interface ProductionPlan {
   id: ProductionPlanId
@@ -411,6 +412,14 @@ export const rejectedBuildListEntryResourceConflictCauses = [
   'stuck_drop_with_other_routes',
 ] as const satisfies readonly RejectedBuildListEntryResourceConflictCause[]
 
+/**
+ * One ExecutionHistory record's metadata (`docs/DATA_MODEL.md` 12.2), the
+ * `executionHistory` table. Its Undo body is a separate
+ * `ExecutionUndoSnapshot` with the same ID in the `executionUndoSnapshots`
+ * table, so every process that needs only the metadata reads no Undo body
+ * (`docs/DATA_MODEL.md` 14.6). The shape a record had before Dexie version 11
+ * / Export schema 14 is `LegacyExecutionHistory`.
+ */
 export interface ExecutionHistory {
   id: ExecutionHistoryId
   planId: ProductionPlanId
@@ -419,7 +428,8 @@ export interface ExecutionHistory {
   actualResult: ActualResult | null
   wasExpected: boolean
   recalculationReason: RecalculationReason | null
-  undoSnapshot: ExecutionUndoSnapshot
+  /** The OwnedWeapons this Step added (moved from the former Undo snapshot; same meaning). */
+  addedOwnedWeaponIds: OwnedWeaponId[]
   createdAt: ISODateTimeString
 }
 
@@ -432,11 +442,19 @@ export interface ActualResult {
   note: string | null
 }
 
+/**
+ * The Undo body of one ExecutionHistory record (`docs/DATA_MODEL.md` 12.2,
+ * `docs/PLANNER_SPEC.md` 19.3), the `executionUndoSnapshots` table, one per
+ * record. It holds no ProductionPlan body: the Plan before the record is
+ * rebuilt from the current Plan and `productionPlanStateBefore`, and verified
+ * by its two hashes, when the record is undone (19.5).
+ */
 export interface ExecutionUndoSnapshot {
+  /** The primary key: the ID of the ExecutionHistory this body belongs to. */
+  executionHistoryId: ExecutionHistoryId
   rngStateBefore: RngState
   normalCountersBefore: NormalArtianCounter[]
   affectedOwnedWeaponsBefore: OwnedWeapon[]
-  addedOwnedWeaponIds: OwnedWeaponId[]
   removedOwnedWeaponsBefore: OwnedWeapon[]
   /**
    * Every TargetWeapon the Step changed, as it was before the Step: the linked
@@ -445,10 +463,14 @@ export interface ExecutionUndoSnapshot {
    * (`docs/DATA_MODEL.md` 12).
    */
   affectedTargetWeaponsBefore: TargetWeapon[]
-  /** Undo restores this snapshot verbatim; it must not infer new stale reasons. */
-  productionPlanBefore: ProductionPlan
-  /** The Plan's game save point before the Step, so a deletion by the Step can be undone. */
-  executionSavePointBefore: ExecutionSavePoint | null
+  /** The Plan just before the record, as its execution fields, changed Steps and hashes. */
+  productionPlanStateBefore: ProductionPlanUndoState
+  /**
+   * The game save point the record's own terminal transition (`completed` /
+   * `abandoned`) deleted, so its Undo restores it; `null` for every other
+   * record, even when a save point existed before it.
+   */
+  deletedExecutionSavePoint: ExecutionSavePoint | null
 }
 
 /**

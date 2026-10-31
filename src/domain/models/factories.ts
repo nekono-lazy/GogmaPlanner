@@ -37,6 +37,7 @@ export type CreateTargetWeaponInput = Omit<
   | 'lifecycleStatus'
   | 'completedAt'
   | 'completedByProductionPlanId'
+  | 'completedWithOwnedWeaponId'
   | 'createdAt'
   | 'updatedAt'
 > & {
@@ -110,6 +111,7 @@ export function createTargetWeapon(
     lifecycleStatus: 'active',
     completedAt: null,
     completedByProductionPlanId: null,
+    completedWithOwnedWeaponId: null,
     createdAt: now,
     updatedAt: now,
   }

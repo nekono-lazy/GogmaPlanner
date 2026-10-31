@@ -84,6 +84,12 @@ export type ExcludedOwnedWeaponReason =
   | 'protected_gogma_not_ideal'
   | 'protected_normal'
   | 'normal_rarity_not_8'
+  /**
+   * The weapon is the completion of a Target (`TargetWeapon.completedWithOwnedWeaponId`,
+   * Issue #334, `docs/PLANNER_SPEC.md` 21.4 / 21.7): never a source of another
+   * Target's Route, whatever its protection.
+   */
+  | 'completion_assigned'
 
 export interface InclusiveRange {
   from: number
@@ -195,7 +201,7 @@ export type ReachTableResult =
    * stream origin exists. `target_without_source`: a planning Target has no owned source and no confirmed
    * rarity-8 Normal Counter (the blind variant is never an option). `blind_route_required`: a planning
    * Target has no owned source and its Normal prediction is unsupported, so only a blind Route could
-   * reach it. `checkpoint_selection`: a valid Entry of a planning Target holds a selected intermediate
+   * reach it. `checkpoint_selection`: a current Entry of a planning Target holds a selected intermediate
    * state, which this design never pins (design 15.1). None of them means the Ideal is unreachable. The
    * names are the concept names of `docs/PLANNER_SPEC.md` 17.4.
    */

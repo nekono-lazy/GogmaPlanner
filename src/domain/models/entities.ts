@@ -5,6 +5,7 @@ import type {
   BuildCandidateId,
   BuildListEntryId,
   CalculationContext,
+  CompletionConditionReviewReason,
   IntermediateStateGroupId,
   IntermediateStateOpportunityId,
   ElementId,
@@ -117,36 +118,65 @@ export interface TargetWeapon {
    * and for a Target the user completed with an owned weapon.
    */
   completedByProductionPlanId: ProductionPlanId | null
-  idealBonuses: RestorationBonusSet
-  practicalBonusConditions: PracticalBonusCondition[]
-  alternativeBonusRules: AlternativeBonusRule[]
-  /** Legacy compromise conditions were cleared; cleared after explicit save. */
-  compromiseNeedsReview?: boolean
-  idealSkillCondition: SkillCondition
-  practicalSkillCondition: SkillCondition
+  /**
+   * The completion assignment (`docs/DATA_MODEL.md` 8.7, `docs/PLANNER_SPEC.md`
+   * 21.3): the owned weapon this `completed` Target was completed with. Always
+   * `null` for an `active` Target, and `null` ("not recorded") for a Target
+   * completed before the assignment was recorded - never inferred from a Plan
+   * or an owned Ideal. It points one way, Target -> weapon; one weapon is the
+   * completion of at most one Target, and an assigned weapon is never the
+   * completion, the Route base or the preferred origin of another Target
+   * (21.4). Only Execution completion and the direct completion write it; only
+   * reopening, Undo and a save point restore clear it. Not a performance
+   * definition and part of no hash.
+   */
+  completedWithOwnedWeaponId: OwnedWeaponId | null
+  /**
+   * The completion bonus Variants (`docs/DATA_MODEL.md` 8.2): one or more
+   * equal five-slot configurations, any one of which completes the Bonus side.
+   * Their order carries no meaning.
+   */
+  completionBonusVariants: CompletionBonusVariant[]
+  /** The completion Skill condition; `matchMode` is always `all` (8.4). */
+  completionSkillCondition: SkillCondition
+  /**
+   * Why the completion condition needs the user's review (8.6). Non-empty keeps
+   * the Target out of every calculation until the user explicitly saves it.
+   * Not a performance definition: never part of `createTargetDefinitionHash()`.
+   */
+  completionConditionReview: CompletionConditionReviewReason[]
   memo: string | null
   createdAt: ISODateTimeString
   updatedAt: ISODateTimeString
 }
 
-export interface PracticalBonusCondition {
-  id: string
+/**
+ * One required slot of a completion Variant: this bonus type at this rank or
+ * any higher rank by Master `BonusRankMaster.order` (`docs/DATA_MODEL.md` 8.2).
+ */
+export interface CompletionBonusSlot {
   bonusTypeId: BonusTypeId
   minimumRankId: BonusRankId
-  requiredExCount: number
 }
 
-export interface AlternativeBonusRule {
+export type CompletionBonusSlots = [
+  CompletionBonusSlot,
+  CompletionBonusSlot,
+  CompletionBonusSlot,
+  CompletionBonusSlot,
+  CompletionBonusSlot,
+]
+
+/**
+ * One completion configuration of a Target (`docs/DATA_MODEL.md` 8.2).
+ *
+ * The five slots are an unordered multiset with duplicate counts preserved;
+ * `id` is a UI editing key only and never enters a hash, an identity or a
+ * judgement.
+ */
+export interface CompletionBonusVariant {
   id: string
-  sourceBonusTypeId: BonusTypeId
-  maxReplacementCount: number
-  options: AlternativeBonusOption[]
-}
-
-export interface AlternativeBonusOption {
-  alternativeBonusTypeId: BonusTypeId
-  minimumRankId: BonusRankId
-  requiredExCount: number
+  slots: CompletionBonusSlots
 }
 
 export interface SkillCondition {
@@ -331,12 +361,11 @@ export type IntermediateStateGroup =
   | IntermediateBonusStateGroup
 
 /**
- * Which lane the Planner should improve first once the compromise checkpoint
- * has been reached (`docs/PLANNER_SPEC.md` 7.6).
- *
- * A soft Planner preference, never a hard constraint: `planner` leaves the
- * order to the Planner, and either `_first` value only decides among Plans the
- * existing evaluation rates equally.
+ * Legacy (calculation schema 11..18, `docs/PLANNER_SPEC.md` 7.6, historical):
+ * which lane the Planner improved first once the compromise checkpoint had
+ * been reached. Issue #100 abolished the preference (20.7); the literals stay
+ * so a persisted legacy Entry's selection still validates and hashes, and the
+ * Planner no longer orders anything by it.
  */
 export type ImprovementPreference = 'planner' | 'skill_first' | 'bonus_first'
 
@@ -347,13 +376,13 @@ export const improvementPreferences: readonly ImprovementPreference[] = [
 ]
 
 /**
- * The user's intermediate-state intent for one BuildListEntry
- * (`docs/DATA_MODEL.md` 9.4).
- *
- * At most one selected opportunity per lane. A selected opportunity is a hard
- * Planner constraint: the Entry's weapon must really hold that lane state, and
- * the compromise checkpoint is the moment both lanes hold their pinned state -
- * the selected one, or the Ideal lane end where nothing is selected.
+ * Legacy (calculation schema 11..18, `docs/DATA_MODEL.md` 9.4, historical):
+ * the user's intermediate-state intent for one BuildListEntry - at most one
+ * selected opportunity per lane, which pinned the Planner's compromise
+ * checkpoint. Issue #100 abolished it (`docs/PLANNER_SPEC.md` 20.7): no
+ * current Entry carries one, a persisted one is kept exactly as stored (never
+ * rewritten or cleared), and a valid Entry still selecting a state fails the
+ * Planner input closed instead of being read as "nothing selected".
  */
 export interface IntermediateStateSelection {
   skillOpportunityId: IntermediateStateOpportunityId | null
@@ -376,19 +405,21 @@ export interface BuildCandidate {
   requiredMaterials: MaterialRequirement[]
   idealDifference: IdealDifference
   /**
-   * The accepted intermediate states of this Candidate's own Skill lane and
-   * Bonus lane (`docs/SEARCH_SPEC.md` 5.8).
+   * Legacy (calculation schema 11..18, `docs/SEARCH_SPEC.md` 5.8, historical):
+   * the accepted intermediate states of this Candidate's own Skill lane and
+   * Bonus lane. Issue #100 abolished the intermediate states
+   * (`docs/PLANNER_SPEC.md` 20.7): Candidate Search extracts none, so a
+   * schema 19 or later Candidate carries no field, and a persisted one is kept
+   * exactly as stored and validated structurally only where present
+   * (`docs/DATA_MODEL.md` 9.1).
    *
-   * Derived from the finished Route, its observational traces and the Target
-   * definition, so it changes no Candidate semantic identity: it never enters
-   * the Candidate ID `semanticHash`, `candidateStableKey`, the deduplication
-   * key, the `BuildCandidateMeaning` fingerprint, `searchStateHash`, or
-   * `referencedOwnedWeaponsHash`, and intermediate state availability never
-   * influences canonical Ideal selection.
-   *
-   * Optional so a Candidate persisted before this field existed still loads
-   * and renders. Every Candidate generated under the current
-   * `CalculationContext` carries it, and validation requires it there.
+   * It never entered any Candidate semantic identity: not the Candidate ID
+   * `semanticHash`, `candidateStableKey`, the deduplication key, the
+   * `BuildCandidateMeaning` fingerprint, `searchStateHash` or
+   * `referencedOwnedWeaponsHash`. A legacy Entry's `intermediateStateSelection`
+   * resolves its ids against this field, which is why both are kept together.
+   * A calculation schema 10 Candidate stored its strict-prefix checkpoints in
+   * the untyped `checkpointGroups` instead (`docs/DATA_MODEL.md` 9.4).
    */
   intermediateStateGroups?: IntermediateStateGroup[]
   searchStateHash: string
@@ -549,19 +580,22 @@ export interface BuildListEntry {
   targetWeaponId: TargetWeaponId
   candidateSnapshot: BuildCandidate
   /**
-   * The intermediate states the user chose to hold on the way to the Ideal,
-   * plus the improvement preference (`docs/PLANNER_SPEC.md` 7.5 / 7.6).
+   * Legacy (calculation schema 11..18, `docs/PLANNER_SPEC.md` 7.5 / 7.6,
+   * historical): the intermediate states the user chose to hold on the way to
+   * the Ideal, plus the improvement preference. Issue #100 abolished both
+   * (20.7): `createBuildListEntry()` writes no field, so a schema 19 or later
+   * Entry carries none, and a persisted one is kept exactly as stored - never
+   * rewritten to `null` or cleared (20.8).
    *
    * Each selected id must exist in `candidateSnapshot.intermediateStateGroups`
-   * on its own lane. A selection is the user's Planner input, not part of the
-   * Candidate's own meaning, so it never participates in
-   * `createBuildCandidateMeaningFingerprint()` and changing it alone never
-   * makes this entry stale - but it does change what the Planner must achieve,
-   * so it participates in the Plan's build-list semantic hash.
-   *
-   * Optional so a BuildListEntry persisted before this field existed still
-   * loads and renders; absent means nothing is selected and the preference is
-   * `planner`.
+   * on its own lane (validated structurally where present, 7.5.9). The
+   * selection never entered the Candidate's own meaning
+   * (`createBuildCandidateMeaningFingerprint()`) and never stales the Entry,
+   * but it still enters the Plan's build-list hash normalization exactly as
+   * schema 11..18 defined it, so no persisted Plan hash moves. Absent means
+   * nothing is selected and the preference is `planner`. A calculation schema
+   * 10 Entry stored its selection in the untyped `selectedCheckpointOpportunityIds`
+   * instead (`docs/DATA_MODEL.md` 9.4).
    */
   intermediateStateSelection?: IntermediateStateSelection
   targetDefinitionHash: string

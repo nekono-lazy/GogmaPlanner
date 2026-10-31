@@ -13,9 +13,10 @@ import type {
   SeriesSkillId,
   SkillAmendmentResult,
   TargetWeapon,
+  TargetWeaponId,
 } from '../models/publicTypes'
 import type { RngEngine, RngPredictionUnsupportedReason } from '../rng/rngEngine'
-import { evaluateSkillCondition, satisfiesIdealBonuses } from '../target'
+import { evaluateSkillCondition, satisfiesCompletionBonuses } from '../target'
 import { hasConfirmedGogmaInputs } from './searchRngInputs'
 import {
   nextOperationPositions,
@@ -184,6 +185,17 @@ export interface RouteSearchContext {
    * source anyway.
    */
   excludedSourceOwnedWeaponIds?: ReadonlySet<OwnedWeaponId>
+  /**
+   * The completion assignments of the input Targets (Issue #334,
+   * `collectCompletionAssignedOwnedWeaponIds()`, `docs/SEARCH_SPEC.md` 5.5.1):
+   * a weapon another Target was completed with is never a Route base of this
+   * Target, its zero-operation current Route included, protected or not. Only
+   * the ordinary Candidate Search sets it, derived from its own input; absent
+   * (every other consumer) or empty, every source is enumerated exactly as
+   * before. Like the source exclusion it enters no Candidate identity, hash or
+   * ordering.
+   */
+  completionAssignedOwnedWeaponIds?: ReadonlyMap<OwnedWeaponId, TargetWeaponId>
   /** Normal predictions shared across counter records. */
   normalPredictions?: Map<number, RestorationBonusSet>
   target: TargetWeapon
@@ -362,6 +374,28 @@ export function isAvailableRouteSource(
 }
 
 /**
+ * Splits the sources the existing rules admit into the ones this Target may use
+ * and the ones that are the completion of another Target (Issue #334,
+ * `docs/SEARCH_SPEC.md` 5.5.1). Order is preserved on both sides. Without
+ * assignments every source is kept, so a context of any other consumer is
+ * unaffected.
+ */
+export function partitionCompletionAssignedRouteSources<T extends { id: OwnedWeaponId }>(
+  context: RouteSearchContext,
+  sources: readonly T[],
+): { kept: T[]; assigned: T[] } {
+  const assignments = context.completionAssignedOwnedWeaponIds
+  if (assignments === undefined || assignments.size === 0) return { kept: [...sources], assigned: [] }
+  const kept: T[] = []
+  const assigned: T[] = []
+  for (const source of sources) {
+    const assignedTo = assignments.get(source.id)
+    ;(assignedTo !== undefined && assignedTo !== context.target.id ? assigned : kept).push(source)
+  }
+  return { kept, assigned }
+}
+
+/**
  * Splits the sources the existing rules admit into the ones the ordinary
  * Candidate Search request keeps and the ones its source exclusion removes
  * (`docs/SEARCH_SPEC.md` 3.3). Order is preserved on both sides. Without an
@@ -381,9 +415,10 @@ export function partitionExcludedRouteSources<T extends { id: OwnedWeaponId }>(
 }
 
 /**
- * A Skill stream whose current Skills already satisfy the Ideal Skill condition
- * is finished: Ideal implies Practical, so no later Skill position can produce a
- * higher category. Only the Skill stream stops; the Bonus stream is unaffected.
+ * A Skill stream whose current Skills already satisfy the completion Skill
+ * condition is finished: completion is a truth value, so no later Skill
+ * position can produce a better state (SEARCH_SPEC 5.6.1). Only the Skill stream
+ * stops; the Bonus stream is unaffected.
  */
 export function skillsSatisfyIdeal(
   context: RouteSearchContext,
@@ -391,7 +426,7 @@ export function skillsSatisfyIdeal(
   groupSkillId: GroupSkillId | null,
 ): boolean {
   return evaluateSkillCondition(
-    context.target.idealSkillCondition,
+    context.target.completionSkillCondition,
     seriesSkillId,
     groupSkillId,
   )
@@ -399,8 +434,8 @@ export function skillsSatisfyIdeal(
 
 /**
  * The Bonus-stream counterpart of `skillsSatisfyIdeal` (SEARCH_SPEC 5.6.1).
- * A Route base whose current Gogma-scope five slots match `idealBonuses`
- * searches no Bonus amendment at all, so it consumes no `maxGogmaAdvance` position and
+ * A Route base whose current Gogma-scope five slots satisfy any completion
+ * Variant searches no Bonus amendment at all, so it consumes no `maxGogmaAdvance` position and
  * calls `predictGogmaBonus` zero times. The Skill stream keeps running.
  */
 export function bonusesSatisfyIdeal(
@@ -408,7 +443,7 @@ export function bonusesSatisfyIdeal(
   bonuses: RestorationBonusSet,
   restorationBonusScope: RestorationBonusScope,
 ): boolean {
-  return satisfiesIdealBonuses(context.target, bonuses, restorationBonusScope, context.input.master)
+  return satisfiesCompletionBonuses(context.target, bonuses, restorationBonusScope, context.input.master)
 }
 
 /**

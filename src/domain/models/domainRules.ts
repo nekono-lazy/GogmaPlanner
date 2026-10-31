@@ -142,6 +142,15 @@ export function isCalculationContextCompatible(
  * incompatible. ProductionPlans have their own narrow exception
  * (`isProductionPlanCalculationCompatible()`), never this map.
  *
+ * App schema 19 (Issue #100) added no exception at all. App schema 20 changes
+ * only the Planner's completion of a planning Target - one Target, one
+ * physically distinct completed weapon (Issue #334 PR-3, `docs/PLANNER_SPEC.md`
+ * 21.5 / 21.9). Candidate Search, BuildCandidate and BuildListEntry snapshot
+ * semantics and staleness are untouched, so a version 19 BuildCandidate or
+ * BuildListEntry stays usable under version 20 through the explicit `20 -> [19]`
+ * entry. Version 1..18 stay incompatible, and no ProductionPlan exception exists
+ * for 20: every version 1..19 Plan fails closed.
+ *
  * Each exception is directional and deliberately narrow: version 1 stays
  * incompatible, it is never a general forward compatibility for future
  * versions, every other CalculationContext field must still be equal, and the
@@ -158,6 +167,7 @@ const COMPATIBLE_BUILD_RESULT_APP_SCHEMA_VERSIONS: ReadonlyMap<number, readonly 
     [16, [12, 13, 14, 15]],
     [17, [12, 13, 14, 15, 16]],
     [18, [12, 13, 14, 15, 16, 17]],
+    [20, [19]],
   ])
 
 export function isBuildResultCalculationContextCompatible(
@@ -224,15 +234,54 @@ export function isProductionPlanCalculationCompatible(
 
 /**
  * Whether Candidate Search and the Planner treat this Target as a planning
- * target: it is enabled and still `active`. A `completed` Target keeps its
- * record but is excluded from both inputs (`docs/DATA_MODEL.md` 8.1). This is
- * an input exclusion, never a staleness judgment: the BuildListEntries of a
- * completed Target are not stale.
+ * target: it is enabled, still `active`, and its completion condition needs no
+ * review (`docs/DATA_MODEL.md` 8.6, `docs/PLANNER_SPEC.md` 20.2). A `completed`
+ * Target keeps its record but is excluded from both inputs
+ * (`docs/DATA_MODEL.md` 8.1); a Target whose migrated completion condition
+ * awaits the user's explicit save is excluded the same way. This is the single
+ * authority Candidate Search, the Planner input, the Build List optimization,
+ * the running Plan replan, the other-Target source exclusion and the owned
+ * Ideal completion read. It is an input exclusion, never a staleness judgment:
+ * the BuildListEntries of such a Target are not stale.
  */
 export function isTargetWeaponPlanningEligible(
-  target: Pick<TargetWeapon, 'isEnabled' | 'lifecycleStatus'>,
+  target: Pick<TargetWeapon, 'isEnabled' | 'lifecycleStatus' | 'completionConditionReview'>,
 ): boolean {
-  return target.isEnabled && target.lifecycleStatus === 'active'
+  return (
+    target.isEnabled &&
+    target.lifecycleStatus === 'active' &&
+    target.completionConditionReview.length === 0
+  )
+}
+
+/**
+ * Why a Target is not a planning target (`isTargetWeaponPlanningEligible()`
+ * is false): it is `completed`, its search is disabled, or its completion
+ * condition still awaits the user's review. One cause is named in that
+ * precedence, so a disabled Target awaiting review reads as `disabled`.
+ */
+export type TargetWeaponPlanningIneligibilityCause = 'completed' | 'disabled' | 'review_required'
+
+/**
+ * The one authority naming why `isTargetWeaponPlanningEligible()` refuses a
+ * Target, or `null` when it is a planning target. The batch re-search
+ * (`docs/UI_FLOW.md` 9.3) reads it both for its selection and inside its
+ * replacement transaction, so no screen or Service re-derives the cause.
+ */
+export function targetWeaponPlanningIneligibilityCause(
+  target: Pick<TargetWeapon, 'isEnabled' | 'lifecycleStatus' | 'completionConditionReview'>,
+): TargetWeaponPlanningIneligibilityCause | null {
+  if (target.lifecycleStatus !== 'active') return 'completed'
+  if (!target.isEnabled) return 'disabled'
+  if (target.completionConditionReview.length > 0) return 'review_required'
+  return null
+}
+
+/** Whether a Target's completion condition still awaits the user's explicit save (`docs/DATA_MODEL.md` 8.6). */
+export function targetCompletionConditionNeedsReview(
+  target: Pick<TargetWeapon, 'completionConditionReview'>,
+): boolean {
+  return target.completionConditionReview.length > 0
 }
 
 export function canResetBonuses(weapon: OwnedWeapon): boolean {

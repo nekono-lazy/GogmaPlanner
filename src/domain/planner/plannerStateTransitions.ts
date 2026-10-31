@@ -29,22 +29,16 @@ import {
   routeUnitOwnedWeaponId,
   type PlannerRouteUnit,
 } from './plannerRouteProgress'
-import { entryIsRelevantForState } from './plannerEntryRelevance'
-import {
-  entryImprovementPreference,
-  hasIntermediateStateSelection,
-  type PlannerCheckpointRequirements,
-} from './plannerCheckpoints'
+import { entryIsRelevantForState, isPlannerTargetComplete } from './plannerEntryRelevance'
 import {
   advancePlannerLaneProgress,
-  hasReachedIntermediatePin,
   initialPlannerLaneProgress,
   isPlannerLaneRouteComplete,
   nextPlannerLaneUnits,
   type PlannerEntryLanes,
-  type PlannerLaneProgress,
 } from './plannerRouteLanes'
 import { advancePlannerPreferredSourceMetric } from './plannerPreferredSource'
+import { isCompletionAssignedElsewhere, satisfiesCompletionTarget } from '../target'
 import type {
   PlannerDependencies,
   PlannerInput,
@@ -55,7 +49,6 @@ import type {
   PlannerSearchState,
   SimulatedInventory,
 } from './plannerTypes'
-import { deriveTargetSatisfaction } from './targetSatisfaction'
 
 /**
  * The Planner action application authority: the preconditions of a route
@@ -91,11 +84,8 @@ export interface PlannerRouteActionContext {
   readonly conflictsById: ReadonlyMap<string, PlanConflict>
   readonly conflictIdsByUnitKey: ReadonlyMap<string, readonly string[]>
   readonly selectedPhysicalActionKeysByConflictId: ReadonlyMap<string, readonly string[]>
-  readonly targets: readonly TargetWeapon[]
-  readonly master: PlannerInput['master']
   readonly engine: RngEngine
   readonly preferredSourceEntryIds: ReadonlySet<BuildListEntryId>
-  readonly requirements: PlannerCheckpointRequirements
   /**
    * Which other Entries a shareable physical action may progress besides its
    * primary unit. Omitted, every relevant Entry may share it, which is the
@@ -105,13 +95,21 @@ export interface PlannerRouteActionContext {
   readonly canShareWithEntry?: (entryId: BuildListEntryId) => boolean
 }
 
-/** Everything an internal reserve reads besides the state it is applied to. */
+/**
+ * Everything an internal reserve reads besides the state it is applied to.
+ *
+ * `master` judges a zero-operation confirmation's own weapon against its
+ * Target's completion condition; `completionAssignments` (the input Targets'
+ * `collectCompletionAssignedOwnedWeaponIds()`, Issue #334, 21.4) refuses a
+ * reserve of a weapon another Target was completed with. A route action reads
+ * neither: since Issue #334 PR-3 no action derives Target satisfaction from the
+ * inventory (`docs/PLANNER_SPEC.md` 21.5).
+ */
 export interface PlannerReserveActionContext {
   readonly dependencies: PlannerDependencies
-  readonly targets: readonly TargetWeapon[]
   readonly master: PlannerInput['master']
+  readonly completionAssignments: ReadonlyMap<OwnedWeaponId, TargetWeaponId>
   readonly preferredSourceEntryIds: ReadonlySet<BuildListEntryId>
-  readonly requirements: PlannerCheckpointRequirements
 }
 
 export interface PlannerRouteActionOptions {
@@ -231,42 +229,26 @@ function sourceMutatedByOperation(
   return null
 }
 
-function refreshTargetSatisfaction(
+/**
+ * Records that `targetWeaponId` was completed in this run by its own Entry's
+ * reserve (Issue #334 PR-3, `docs/PLANNER_SPEC.md` 21.5). It is the one
+ * transition of `targetSatisfaction`: no route action and no other Entry's
+ * reserve moves it, because nothing derives Target satisfaction from what the
+ * inventory performs any more.
+ */
+function completeTargetInRun(
   state: PlannerSearchState,
-  targets: readonly TargetWeapon[],
-  master: PlannerInput['master'],
+  targetWeaponId: TargetWeaponId,
 ): PlannerSearchAction['satisfactionChanges'] {
-  const before = structuredClone(state.targetSatisfaction)
-  const derived = deriveTargetSatisfaction(
-    targets,
-    state.simulatedInventory.ownedWeapons.filter(
-      ({ id }) => state.inFlightExistingSourceByOwnedWeaponId[id] === undefined,
-    ),
-    master,
-  )
-  const next = Object.fromEntries(
-    derived.map(({ targetWeaponId, hasPractical, hasIdeal }) => [
-      targetWeaponId,
-      { hasPractical, hasIdeal },
-    ]),
-  ) as PlannerSearchState['targetSatisfaction']
-  state.targetSatisfaction = next
-  return [...new Set([...Object.keys(before), ...Object.keys(next)])]
-    .sort(compareStableStrings)
-    .flatMap((targetWeaponId) => {
-      const previous = before[targetWeaponId as TargetWeaponId] ?? {
-        hasPractical: false,
-        hasIdeal: false,
-      }
-      const current = next[targetWeaponId as TargetWeaponId] ?? {
-        hasPractical: false,
-        hasIdeal: false,
-      }
-      return previous.hasPractical === current.hasPractical &&
-        previous.hasIdeal === current.hasIdeal
-        ? []
-        : [{ targetWeaponId: targetWeaponId as TargetWeaponId, before: previous, after: current }]
-    })
+  const before = state.targetSatisfaction[targetWeaponId] ?? { completedInRun: false }
+  const after = { completedInRun: true }
+  state.targetSatisfaction[targetWeaponId] = after
+  return [{ targetWeaponId, before, after }]
+}
+
+/** The OwnedWeapon IDs the Entries secured so far, each the completion of one Target. */
+function securedOwnedWeaponIds(state: PlannerSearchState): ReadonlySet<OwnedWeaponId> {
+  return new Set(Object.values(state.securedOwnedWeaponIdByEntryId))
 }
 
 /** The Gogma or Skill Counter a route unit leaves behind. */
@@ -578,39 +560,6 @@ export function plannerRouteUnitSourceRejection(
   return inventoryPreconditionRejection(state, entry, unit)
 }
 
-/**
- * Whether executing `unit` counts against its Entry's improvement preference
- * (`docs/PLANNER_SPEC.md` 7.6): once the Entry's checkpoint is reached - or
- * from the start when it selected none - a stream-lane operation executed
- * while the lane the user wanted first still has units left.
- *
- * `previousProgress` is the Entry's lane progress before the unit runs.
- */
-export function isPlannerImprovementPreferenceViolation(
-  state: PlannerSearchState,
-  entry: BuildListEntry,
-  lanes: PlannerEntryLanes,
-  previousProgress: PlannerLaneProgress,
-  unit: PlannerRouteUnit,
-): boolean {
-  const preference = entryImprovementPreference(entry)
-  const improving =
-    lanes.pin === null || state.reachedCheckpointByEntryId[entry.id] === true
-  if (
-    preference === 'planner' ||
-    !improving ||
-    unit.position.unitIndex !== unit.position.unitCount - 1 ||
-    unit.lane === 'base'
-  ) {
-    return false
-  }
-  const preferredLane = preference === 'skill_first' ? 'skill' : 'bonus'
-  return (
-    unit.lane !== preferredLane &&
-    previousProgress[preferredLane] < lanes[preferredLane].length
-  )
-}
-
 /** One shared Counter stream position, the resource a unit occupies. */
 function counterPositionKey(unit: PlannerRouteUnit): string | null {
   if (unit.counterStream === null || unit.counterBefore === null) return null
@@ -632,12 +581,11 @@ export function executablePlannerRequiredUnitsByCounterPosition(
   entries: readonly BuildListEntry[],
   lanePlans: ReadonlyMap<BuildListEntryId, PlannerEntryLanes>,
   isUnitBlocked: (unit: PlannerRouteUnit) => boolean,
-  requirements: PlannerCheckpointRequirements,
 ): Map<string, PlannerRouteUnit[]> {
   const required = new Map<string, PlannerRouteUnit[]>()
   entries.forEach((entry) => {
     if (state.selectedBuildListEntryIds.includes(entry.id)) return
-    if (!entryIsRelevantForState(state, entry, requirements)) return
+    if (!entryIsRelevantForState(state, entry)) return
     const lanes = lanePlans.get(entry.id)
     if (!lanes) return
     const progress = state.routeProgressByEntryId[entry.id] ?? initialPlannerLaneProgress()
@@ -689,7 +637,6 @@ export function mergedPlannerProgressedEntries(
     conflictsById,
     conflictIdsByUnitKey,
     selectedPhysicalActionKeysByConflictId,
-    requirements,
   } = context
   const shared = [primary]
   if (!primary.shareable) return shared
@@ -700,11 +647,8 @@ export function mergedPlannerProgressedEntries(
     const entry = entriesById.get(entryId)
     if (!entry) return
     if (!entryUsesCurrentSourceVersion(state, entry)) return
-    if (!entryIsRelevantForState(state, entry, requirements)) return
+    if (!entryIsRelevantForState(state, entry)) return
     const progress = state.routeProgressByEntryId[entryId] ?? initialPlannerLaneProgress()
-    // The pin gating applies to a shared progression too: an Entry whose lane
-    // may not advance yet is simply not progressed, and its Route is then
-    // superseded by the source mutation like any other unshared action.
     const next = nextPlannerLaneUnits(lanes, progress).find((unit) =>
       arePlannerRouteUnitsShareable(primary, unit),
     )
@@ -717,10 +661,7 @@ export function mergedPlannerProgressedEntries(
         selectedPhysicalActionKeysByConflictId,
         (entryId) => {
           const selected = entriesById.get(entryId)
-          return (
-            selected !== undefined &&
-            entryIsRelevantForState(state, selected, requirements)
-          )
+          return selected !== undefined && entryIsRelevantForState(state, selected)
         },
       )
     ) {
@@ -747,8 +688,7 @@ export function applyPlannerRouteAction(
   context: PlannerRouteActionContext,
   options: PlannerRouteActionOptions,
 ): PlannerAppliedActionResult {
-  const { entriesById, lanePlans, targets, master, engine, preferredSourceEntryIds } =
-    context
+  const { entriesById, lanePlans, engine, preferredSourceEntryIds } = context
   const primaryEntry = entriesById.get(primary.entryId)
   if (!primaryEntry) {
     return rejected(
@@ -793,7 +733,6 @@ export function applyPlannerRouteAction(
   if (mutatedSourceId !== null) {
     state.sourceMutationVersionByOwnedWeaponId[mutatedSourceId] =
       (state.sourceMutationVersionByOwnedWeaponId[mutatedSourceId] ?? 0) + 1
-    state.inFlightExistingSourceByOwnedWeaponId[mutatedSourceId] = true
   }
   const progressedRoutePositions: PlannerSearchAction['progressedRoutePositions'] =
     {}
@@ -805,29 +744,6 @@ export function applyPlannerRouteAction(
     state.routeProgressByEntryId[unit.entryId] = nextProgress
     progressedRoutePositions[unit.entryId] = unit.position
     const entry = entriesById.get(unit.entryId)
-    if (entry && lanes) {
-      // The user's improvement preference (docs/PLANNER_SPEC.md 7.6): once
-      // this Entry's checkpoint is reached - or from the start when it selected
-      // none - a stream-lane unit executed while the lane the user wanted first
-      // still has units left counts against the branch. A ranking preference
-      // only: the unit is executed all the same.
-      if (
-        isPlannerImprovementPreferenceViolation(state, entry, lanes, previousProgress, unit)
-      ) {
-        state.improvementPreferenceViolationCount += 1
-      }
-      // The compromise checkpoint is reached the moment both lanes hold their
-      // pinned state. A pinned endpoint is never skippable, so this can only
-      // arrive through a real executed action - or be held from the start by
-      // an existing Gogma's lane starts (docs/PLANNER_SPEC.md 7.5.2 / 7.5.3).
-      if (
-        lanes.pin !== null &&
-        state.reachedCheckpointByEntryId[entry.id] !== true &&
-        hasReachedIntermediatePin(lanes, nextProgress)
-      ) {
-        state.reachedCheckpointByEntryId[entry.id] = true
-      }
-    }
     if (entry && routeOutputChanges(entry, unit)) {
       const currentRuntime = state.routeRuntimeByEntryId[entry.id]
       state.routeRuntimeByEntryId[entry.id] = {
@@ -878,10 +794,10 @@ export function applyPlannerRouteAction(
     rngBefore: before,
     rngAfter: rngSnapshot(state),
     inventoryEffect: appliedInventory.effect,
-    satisfactionChanges:
-      mutatedSourceId !== null
-        ? refreshTargetSatisfaction(state, targets, master)
-        : [],
+    // A physical operation completes no Target and un-completes none: a
+    // mutated existing source neither loses nor grants any Target's completion
+    // (Issue #334 PR-3, `docs/PLANNER_SPEC.md` 21.5).
+    satisfactionChanges: [],
   }
   state.trace.push(action)
   // One physical action, so the switch is judged once. Sharing this action with
@@ -950,47 +866,32 @@ export function applyPlannerReserveAction(
   context: PlannerReserveActionContext,
   options: PlannerReserveActionOptions,
 ): PlannerAppliedActionResult {
-  const { dependencies, targets, master, preferredSourceEntryIds, requirements } =
-    context
+  const { dependencies, master, completionAssignments, preferredSourceEntryIds } = context
   const zeroOperationConfirm = options.zeroOperationConfirm === true
-  // A zero-operation Candidate confirms a weapon that already satisfies its
-  // Target, so the Target is Ideal by definition; it is the one reserve that
-  // does not require an unsatisfied Target (`docs/PLANNER_SPEC.md` 16.3).
+  // One completion per Target and per Entry (Issue #334 PR-3,
+  // `docs/PLANNER_SPEC.md` 21.5): a Target this run already completed - by this
+  // very Entry, or by another Entry of the same Target in a malformed input - is
+  // never completed again. An owned weapon that merely performs the condition
+  // never stands in the way: only a recorded completion does.
   if (
-    !zeroOperationConfirm &&
-    !entryIsRelevantForState(sourceState, entry, requirements)
+    sourceState.selectedBuildListEntryIds.includes(entry.id) ||
+    isPlannerTargetComplete(sourceState, entry.targetWeaponId) ||
+    !entryIsRelevantForState(sourceState, entry)
   ) {
     return rejected(
       rejection(
         entry.id,
         'reserve_weapon',
-        'candidate_already_satisfied',
-        'The Target already holds an Ideal weapon.',
+        'inventory_precondition_failed',
+        `TargetWeapon '${entry.targetWeaponId}' was already completed in this run, or is not a planning Target of it.`,
       ),
     )
   }
-  // The user's selected intermediate states are a hard constraint: a branch
-  // that did not actually reach the compromise checkpoint they pin may not
-  // finish this Entry, and the Planner never resolves that by dropping or
-  // moving the selection (`docs/PLANNER_SPEC.md` 7.5.3).
-  if (
-    hasIntermediateStateSelection(entry) &&
-    sourceState.reachedCheckpointByEntryId[entry.id] !== true
-  ) {
-    return rejected(
-      rejection(
-        entry.id,
-        'reserve_weapon',
-        'selected_checkpoint_not_reached',
-        'The compromise checkpoint selected for this BuildListEntry was not reached.',
-      ),
-    )
-  }
+  const alreadySecured = securedOwnedWeaponIds(sourceState)
   const route = entry.candidateSnapshot.route
   const effect = emptyInventoryEffect()
   let ownedWeaponId: OwnedWeaponId
   let inventory: SimulatedInventory
-  let completesExistingSource: boolean
 
   if (
     route.kind === 'normal_artian_to_gogma' ||
@@ -1007,6 +908,19 @@ export function applyPlannerReserveAction(
       )
     }
     ownedWeaponId = dependencies.idFactory.ownedWeaponId()
+    // A reserved ID is excluded exactly like an existing weapon (21.5): the ID
+    // factory never repeats one, and the inventory refuses a repeat too, but
+    // the completion exclusivity is judged here as its own authority.
+    if (alreadySecured.has(ownedWeaponId)) {
+      return rejected(
+        rejection(
+          entry.id,
+          'reserve_weapon',
+          'inventory_precondition_failed',
+          `OwnedWeapon '${ownedWeaponId}' was already secured as the completion of another BuildListEntry in this run.`,
+        ),
+      )
+    }
     const reserved = reserveWeaponId(sourceState.simulatedInventory, ownedWeaponId)
     if (!reserved.isValid || reserved.inventory === null) {
       return rejected(
@@ -1033,7 +947,6 @@ export function applyPlannerReserveAction(
     }
     inventory = registered.inventory
     effect.addedOwnedWeaponIds.push(ownedWeaponId)
-    completesExistingSource = false
   } else {
     const sourceId = route.sourceOwnedWeaponId
     const source =
@@ -1050,6 +963,32 @@ export function applyPlannerReserveAction(
         ),
       )
     }
+    // One OwnedWeapon completes at most one Target (Issue #334 PR-3,
+    // `docs/PLANNER_SPEC.md` 21.4 / 21.5): a weapon another Entry secured in
+    // this run, or a weapon another Target was completed with before it, is
+    // never this Entry's completion. Route commitment makes two Entries on one
+    // weapon collide before either runs, so this is the Domain's own defence,
+    // shared by the Beam Search oracle.
+    if (alreadySecured.has(sourceId)) {
+      return rejected(
+        rejection(
+          entry.id,
+          'reserve_weapon',
+          'inventory_precondition_failed',
+          `OwnedWeapon '${sourceId}' was already secured as the completion of another BuildListEntry in this run.`,
+        ),
+      )
+    }
+    if (isCompletionAssignedElsewhere(completionAssignments, sourceId, entry.targetWeaponId)) {
+      return rejected(
+        rejection(
+          entry.id,
+          'reserve_weapon',
+          'inventory_precondition_failed',
+          `OwnedWeapon '${sourceId}' is the completion of another TargetWeapon.`,
+        ),
+      )
+    }
     const readyVersion = zeroOperationConfirm
       ? 0
       : sourceState.candidateReadySourceVersionByEntryId[entry.id]
@@ -1062,6 +1001,30 @@ export function applyPlannerReserveAction(
           'reserve_weapon',
           'inventory_precondition_failed',
           'The existing Gogma Candidate was superseded by a later source mutation.',
+        ),
+      )
+    }
+    // A zero-operation Candidate confirms the weapon as it is, so its own
+    // weapon must satisfy its Target's completion condition now (21.5): the
+    // confirmation is the Entry's own completion, never an inference from what
+    // some other owned weapon performs.
+    if (
+      zeroOperationConfirm &&
+      !satisfiesCompletionTarget(
+        target,
+        source.restorationBonuses,
+        source.restorationBonusScope,
+        source.seriesSkillId,
+        source.groupSkillId,
+        master,
+      )
+    ) {
+      return rejected(
+        rejection(
+          entry.id,
+          'reserve_weapon',
+          'inventory_precondition_failed',
+          `OwnedWeapon '${sourceId}' does not satisfy the completion condition of TargetWeapon '${target.id}'.`,
         ),
       )
     }
@@ -1091,18 +1054,17 @@ export function applyPlannerReserveAction(
     }
     inventory = result.inventory
     effect.updatedOwnedWeaponIds.push(ownedWeaponId)
-    completesExistingSource = true
   }
   const before = rngSnapshot(sourceState)
 
   // Nothing above wrote any state; nothing below can reject the action.
   const state = writableState(sourceState, options.mode)
   state.simulatedInventory = inventory
-  if (completesExistingSource) {
-    delete state.inFlightExistingSourceByOwnedWeaponId[ownedWeaponId]
-  }
   state.securedOwnedWeaponIdByEntryId[entry.id] = ownedWeaponId
-  const satisfactionChanges = refreshTargetSatisfaction(state, targets, master)
+  // The Entry's own reserve is the one event that completes its Target in the
+  // run; a weapon that also performs another Target's condition completes
+  // nothing else (21.5).
+  const satisfactionChanges = completeTargetInRun(state, entry.targetWeaponId)
   state.selectedBuildListEntryIds = [
     ...state.selectedBuildListEntryIds,
     entry.id,

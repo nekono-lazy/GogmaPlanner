@@ -12,6 +12,9 @@ import { validateBuildListEntry, validateProductionPlan } from '../../domain/mod
  *
  * Passing it is not adoptability: the adoption re-validates the artifact against the current persisted state in its own
  * transaction (`docs/PLANNER_SPEC.md` 17.11, Issue #260 PR-6).
+ *
+ * The final Planner result, summary, generated Entry, input token, diagnostics and `not_found` / `search_bound_reached` checks are
+ * exported for the running Plan replan result check (Issue #276 PR-4), whose results share those shapes (`docs/PLANNER_SPEC.md` 18.6).
  */
 
 type UnknownRecord = Record<string, unknown>
@@ -33,7 +36,7 @@ function duplicates(values: readonly string[]): string[] {
 }
 
 /** Runs a Domain validator over untrusted data: a malformed value that makes it throw is an issue, not a crash. */
-function domainIssues(path: string, validate: () => { isValid: boolean; issues: readonly { path: string; message: string }[] }): string[] {
+export function domainIssues(path: string, validate: () => { isValid: boolean; issues: readonly { path: string; message: string }[] }): string[] {
   try {
     const result = validate()
     return result.isValid ? [] : result.issues.map(issue => `${path}${issue.path ? `.${issue.path}` : ''}: ${issue.message}`)
@@ -46,7 +49,7 @@ const UNSUPPORTED_REASON_KINDS = ['invalid_planner_input', 'no_planning_target',
 const BOUND_KINDS = ['structural_search_node_budget', 'structural_candidate_limit', 'planner_verification_budget', 'shape_search_scale_gate', 'shape_search_budget']
 const NOT_FOUND_REASONS = ['no_structural_candidate', 'candidates_rejected']
 
-function diagnosticsIssues(value: unknown, path: string): string[] {
+export function diagnosticsIssues(value: unknown, path: string): string[] {
   if (!isRecord(value)) return [`${path} must be an object.`]
   const issues: string[] = []
   if (!Array.isArray(value.candidates)) issues.push(`${path}.candidates must be an array.`)
@@ -55,13 +58,13 @@ function diagnosticsIssues(value: unknown, path: string): string[] {
   return issues
 }
 
-function expectedPlanStateIssues(value: unknown, path: string): string[] {
+export function expectedPlanStateIssues(value: unknown, path: string): string[] {
   if (!isRecord(value)) return [`${path} must be an object.`]
   return ['rngStateHash', 'normalCountersHash', 'ownedWeaponsHash', 'targetExecutionStateHash']
     .filter(key => !isNonEmptyString(value[key])).map(key => `${path}.${key} must be a non-empty string.`)
 }
 
-function calculationContextIssues(value: unknown, path: string): string[] {
+export function calculationContextIssues(value: unknown, path: string): string[] {
   if (!isRecord(value)) return [`${path} must be an object.`]
   const issues: string[] = []
   if (!isNonEmptyString(value.gameVersion)) issues.push(`${path}.gameVersion must be a non-empty string.`)
@@ -71,17 +74,19 @@ function calculationContextIssues(value: unknown, path: string): string[] {
   return issues
 }
 
-function optimizedArtifactIssues(artifact: unknown): string[] {
-  if (!isRecord(artifact)) return ['result.artifact must be an object.']
-  const issues: string[] = []
-  const summary = artifact.summary
-  const plannerResult = artifact.plannerResult
-  const planningTargets = artifact.planningTargetWeaponIds
-  const unchanged = artifact.unchangedTargetWeaponIds
-  const generated = artifact.generatedBuildListEntries
-  const replacements = artifact.replacements
+/** The final Planner result of an optimized artifact, with the Plan and the termination it holds when they are objects. */
+export interface OptimizedPlannerResultReading {
+  issues: string[]
+  plan: UnknownRecord | null
+  termination: UnknownRecord | null
+}
 
-  // The final Planner result: a completed draft Plan of a new chain.
+/**
+ * `result.artifact.plannerResult`: a completed draft Plan of a new chain (no repair lineage), Domain-valid, recording neither a
+ * Conflict nor a rejected Entry (`docs/PLANNER_SPEC.md` 17.7 item 2), with its warnings as an array (their content is the caller's).
+ */
+export function optimizedPlannerResultIssues(plannerResult: unknown): OptimizedPlannerResultReading {
+  const issues: string[] = []
   let plan: UnknownRecord | null = null
   let termination: UnknownRecord | null = null
   if (!isRecord(plannerResult)) {
@@ -97,7 +102,8 @@ function optimizedArtifactIssues(artifact: unknown): string[] {
     if (!Array.isArray(plannerResult.warnings)) issues.push('result.artifact.plannerResult.warnings must be an array.')
   }
   if (plan !== null) {
-    issues.push(...domainIssues('result.artifact.plannerResult.plan', () => validateProductionPlan(plan as unknown as ProductionPlan)))
+    const persisted = plan
+    issues.push(...domainIssues('result.artifact.plannerResult.plan', () => validateProductionPlan(persisted as unknown as ProductionPlan)))
     if (plan.status !== 'draft') issues.push('result.artifact.plannerResult.plan.status must be draft.')
     if (plan.conflictRepairLineage !== null) issues.push('result.artifact.plannerResult.plan.conflictRepairLineage must be null.')
     // Neither a Conflict nor a rejected Entry is recorded on the Plan itself either (17.7 item 2).
@@ -107,40 +113,73 @@ function optimizedArtifactIssues(artifact: unknown): string[] {
     else if (plan.rejectedBuildListEntries.length !== 0) issues.push('result.artifact.plannerResult.plan.rejectedBuildListEntries must be empty.')
   }
   if (termination !== null && termination.status !== 'completed') issues.push('result.artifact.plannerResult.termination.status must be completed.')
+  return { issues, plan, termination }
+}
+
+/**
+ * `result.artifact.summary` (the final Plan's figures, `docs/PLANNER_SPEC.md` 17.8), consistent with the Plan and the termination it
+ * was read from. Nothing is recomputed: the reported values are compared with each other.
+ */
+export function optimizedPlanSummaryIssues(summary: unknown, plan: UnknownRecord | null, termination: UnknownRecord | null): string[] {
+  if (!isRecord(summary)) return ['result.artifact.summary must be an object.']
+  const issues: string[] = []
+  for (const key of ['physicalOperationCount', 'planStepCount', 'nonPhysicalStepCount', 'structuralObjective', 'completedTargetCount', 'totalTargetCount']) {
+    if (!isNonNegativeInteger(summary[key])) issues.push(`result.artifact.summary.${key} must be a non-negative integer.`)
+  }
+  if (!isPositiveInteger(summary.maxPlanSteps)) issues.push('result.artifact.summary.maxPlanSteps must be a positive integer.')
+  if (isNonNegativeInteger(summary.physicalOperationCount) && isNonNegativeInteger(summary.nonPhysicalStepCount)
+    && summary.physicalOperationCount + summary.nonPhysicalStepCount !== summary.planStepCount) {
+    issues.push('result.artifact.summary: physicalOperationCount + nonPhysicalStepCount must equal planStepCount.')
+  }
+  // The physical identity the calculation verified (17.7 item 6), compared as reported: nothing is re-derived from the Steps.
+  if (isNonNegativeInteger(summary.structuralObjective) && isNonNegativeInteger(summary.physicalOperationCount)
+    && summary.structuralObjective !== summary.physicalOperationCount) {
+    issues.push('result.artifact.summary.structuralObjective must equal physicalOperationCount.')
+  }
+  if (summary.completedTargetCount !== summary.totalTargetCount) issues.push('result.artifact.summary: every planning Target must be completed.')
+  if (plan !== null && Array.isArray(plan.steps) && plan.steps.length !== summary.planStepCount) {
+    issues.push('result.artifact.summary.planStepCount must equal the Plan Step count.')
+  }
+  if (termination !== null) {
+    if (termination.completedTargetCount !== summary.completedTargetCount || termination.totalTargetCount !== summary.totalTargetCount) {
+      issues.push('result.artifact.summary Target counts must equal the termination\'s.')
+    }
+    const limits = termination.limits
+    if (!isRecord(limits) || limits.maxPlanSteps !== summary.maxPlanSteps) {
+      issues.push('result.artifact.summary.maxPlanSteps must be the bound the final verification ran with.')
+    }
+  }
+  return issues
+}
+
+/** `result.artifact.generatedBuildListEntries`: an array of Domain-valid BuildListEntries. */
+export function generatedBuildListEntryIssues(generated: unknown): string[] {
+  if (!Array.isArray(generated)) return ['result.artifact.generatedBuildListEntries must be an array.']
+  const issues: string[] = []
+  generated.forEach((entry, index) => {
+    if (!isRecord(entry)) issues.push(`result.artifact.generatedBuildListEntries[${index}] must be an object.`)
+    else issues.push(...domainIssues(`result.artifact.generatedBuildListEntries[${index}]`, () => validateBuildListEntry(entry as unknown as BuildListEntry)))
+  })
+  return issues
+}
+
+function optimizedArtifactIssues(artifact: unknown): string[] {
+  if (!isRecord(artifact)) return ['result.artifact must be an object.']
+  const summary = artifact.summary
+  const planningTargets = artifact.planningTargetWeaponIds
+  const unchanged = artifact.unchangedTargetWeaponIds
+  const generated = artifact.generatedBuildListEntries
+  const replacements = artifact.replacements
+
+  // The final Planner result: a completed draft Plan of a new chain.
+  const { issues, plan, termination } = optimizedPlannerResultIssues(artifact.plannerResult)
 
   // The summary the Preview reads, consistent with the Plan and the termination it was read from.
-  if (!isRecord(summary)) {
-    issues.push('result.artifact.summary must be an object.')
-  } else {
-    for (const key of ['physicalOperationCount', 'planStepCount', 'nonPhysicalStepCount', 'structuralObjective', 'completedTargetCount', 'totalTargetCount']) {
-      if (!isNonNegativeInteger(summary[key])) issues.push(`result.artifact.summary.${key} must be a non-negative integer.`)
-    }
-    if (!isPositiveInteger(summary.maxPlanSteps)) issues.push('result.artifact.summary.maxPlanSteps must be a positive integer.')
+  issues.push(...optimizedPlanSummaryIssues(summary, plan, termination))
+  if (isRecord(summary)) {
     const outOfScope = summary.outOfScopeTargetCounts
-    if (!isRecord(outOfScope) || !['noEntry', 'excludedEntryOnly', 'disabled', 'completed'].every(key => isNonNegativeInteger(outOfScope[key]))) {
-      issues.push('result.artifact.summary.outOfScopeTargetCounts needs noEntry, excludedEntryOnly, disabled and completed counts.')
-    }
-    if (isNonNegativeInteger(summary.physicalOperationCount) && isNonNegativeInteger(summary.nonPhysicalStepCount)
-      && summary.physicalOperationCount + summary.nonPhysicalStepCount !== summary.planStepCount) {
-      issues.push('result.artifact.summary: physicalOperationCount + nonPhysicalStepCount must equal planStepCount.')
-    }
-    // The physical identity the calculation verified (17.7 item 6), compared as reported: nothing is re-derived from the Steps.
-    if (isNonNegativeInteger(summary.structuralObjective) && isNonNegativeInteger(summary.physicalOperationCount)
-      && summary.structuralObjective !== summary.physicalOperationCount) {
-      issues.push('result.artifact.summary.structuralObjective must equal physicalOperationCount.')
-    }
-    if (summary.completedTargetCount !== summary.totalTargetCount) issues.push('result.artifact.summary: every planning Target must be completed.')
-    if (plan !== null && Array.isArray(plan.steps) && plan.steps.length !== summary.planStepCount) {
-      issues.push('result.artifact.summary.planStepCount must equal the Plan Step count.')
-    }
-    if (termination !== null) {
-      if (termination.completedTargetCount !== summary.completedTargetCount || termination.totalTargetCount !== summary.totalTargetCount) {
-        issues.push('result.artifact.summary Target counts must equal the termination\'s.')
-      }
-      const limits = termination.limits
-      if (!isRecord(limits) || limits.maxPlanSteps !== summary.maxPlanSteps) {
-        issues.push('result.artifact.summary.maxPlanSteps must be the bound the final verification ran with.')
-      }
+    if (!isRecord(outOfScope) || !['noEntry', 'excludedEntryOnly', 'disabled', 'completionConditionReview', 'completed'].every(key => isNonNegativeInteger(outOfScope[key]))) {
+      issues.push('result.artifact.summary.outOfScopeTargetCounts needs noEntry, excludedEntryOnly, disabled, completionConditionReview and completed counts.')
     }
     if (isStringArray(planningTargets) && planningTargets.length !== summary.totalTargetCount) {
       issues.push('result.artifact.planningTargetWeaponIds must hold totalTargetCount Targets.')
@@ -150,14 +189,8 @@ function optimizedArtifactIssues(artifact: unknown): string[] {
   // The planning Targets, partitioned into the unchanged ones and the replaced ones.
   if (!isStringArray(planningTargets) || planningTargets.length === 0) issues.push('result.artifact.planningTargetWeaponIds must be a non-empty string array.')
   if (!isStringArray(unchanged)) issues.push('result.artifact.unchangedTargetWeaponIds must be a string array.')
-  if (!Array.isArray(generated)) issues.push('result.artifact.generatedBuildListEntries must be an array.')
+  issues.push(...generatedBuildListEntryIssues(generated))
   if (!Array.isArray(replacements)) issues.push('result.artifact.replacements must be an array.')
-  if (Array.isArray(generated)) {
-    generated.forEach((entry, index) => {
-      if (!isRecord(entry)) issues.push(`result.artifact.generatedBuildListEntries[${index}] must be an object.`)
-      else issues.push(...domainIssues(`result.artifact.generatedBuildListEntries[${index}]`, () => validateBuildListEntry(entry as unknown as BuildListEntry)))
-    })
-  }
   if (Array.isArray(replacements)) {
     const shaped = replacements.every(value => isRecord(value) && isNonEmptyString(value.targetWeaponId)
       && isNonEmptyString(value.replacedBuildListEntryId) && isNonEmptyString(value.generatedBuildListEntryId))
@@ -207,6 +240,20 @@ function optimizedArtifactIssues(artifact: unknown): string[] {
   return issues
 }
 
+/** A `not_found` result body (`docs/PLANNER_SPEC.md` 17.8): its reason and diagnostics. */
+export function notFoundResultIssues(value: UnknownRecord): string[] {
+  const issues = NOT_FOUND_REASONS.includes(value.reason as string) ? [] : ['result.reason must be no_structural_candidate or candidates_rejected.']
+  return [...issues, ...diagnosticsIssues(value.diagnostics, 'result.diagnostics')]
+}
+
+/** A `search_bound_reached` result body (`docs/PLANNER_SPEC.md` 17.8): at least one reached search bound, and diagnostics. */
+export function searchBoundReachedResultIssues(value: UnknownRecord): string[] {
+  const bounds = value.bounds
+  const issues = Array.isArray(bounds) && bounds.length > 0 && bounds.every(bound => isRecord(bound) && BOUND_KINDS.includes(bound.kind as string))
+    ? [] : ['result.bounds must name at least one reached search bound.']
+  return [...issues, ...diagnosticsIssues(value.diagnostics, 'result.diagnostics')]
+}
+
 /**
  * The issues of one `blo_result` body (empty when it may be shown as the run's result). `running_plan_exists` is never the
  * calculation's: the Application decides it before a run starts, so a Worker result carrying it is malformed.
@@ -216,16 +263,10 @@ export function buildListOptimizationResultIssues(value: unknown): string[] {
   switch (value.status) {
     case 'optimized':
       return optimizedArtifactIssues(value.artifact)
-    case 'not_found': {
-      const issues = NOT_FOUND_REASONS.includes(value.reason as string) ? [] : ['result.reason must be no_structural_candidate or candidates_rejected.']
-      return [...issues, ...diagnosticsIssues(value.diagnostics, 'result.diagnostics')]
-    }
-    case 'search_bound_reached': {
-      const bounds = value.bounds
-      const issues = Array.isArray(bounds) && bounds.length > 0 && bounds.every(bound => isRecord(bound) && BOUND_KINDS.includes(bound.kind as string))
-        ? [] : ['result.bounds must name at least one reached search bound.']
-      return [...issues, ...diagnosticsIssues(value.diagnostics, 'result.diagnostics')]
-    }
+    case 'not_found':
+      return notFoundResultIssues(value)
+    case 'search_bound_reached':
+      return searchBoundReachedResultIssues(value)
     case 'unsupported': {
       const reasons = value.reasons
       return Array.isArray(reasons) && reasons.length > 0 && reasons.every(reason => isRecord(reason) && UNSUPPORTED_REASON_KINDS.includes(reason.kind as string))

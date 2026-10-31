@@ -9,9 +9,8 @@ import type {
   RouteOperation,
   TargetWeaponId,
 } from '../../models/publicTypes'
-import { hasIntermediateStateSelection } from '../plannerCheckpoints'
 import {
-  conflictInvolvesSelectedCheckpoint,
+  plannerEntryCompletionWeaponId,
   plannerRouteUnitKey,
 } from '../plannerConflictDetection'
 import type { PlannerInitialContext } from '../plannerInitialContext'
@@ -80,26 +79,12 @@ export interface PlannerConflictParticipantContext {
   sourceOwnedWeaponId: OwnedWeaponId | null
   exclusiveConsumedOwnedWeaponId: OwnedWeaponId | null
   physicalActionKey: string
-  /**
-   * Whether this participant's BuildListEntry carries a selected compromise
-   * checkpoint. No Route replacement search (the Planner Alternative) ever
-   * replaces such an Entry's Route:
-   * any alternate Route would drop the checkpoint the user selected
-   * (`docs/PLANNER_SPEC.md` 9.5.2).
-   */
-  hasSelectedCheckpoints: boolean
 }
 
 export interface PlannerConflictContext {
   /** The `PlanConflict.id` detected right now; diagnostic only for re-mapping. */
   conflictId: string
   kind: ConflictKind
-  /**
-   * Whether a selected compromise checkpoint takes part in this conflict. Such
-   * a conflict is never fixed by a winner-picking resolution
-   * (`docs/PLANNER_SPEC.md` 9.5).
-   */
-  involvesSelectedCheckpoint: boolean
   resourceIdentity: PlannerConflictResourceIdentity
   counterStream: PlannerCounterStream
   normalCounterId: string | null
@@ -192,23 +177,51 @@ function unitResourceIdentity(
         counterBefore: unit.counterBefore as number,
       }
     case 'same_owned_weapon_consumed':
-      invariant(
-        unit.exclusiveConsumedOwnedWeaponId !== null,
-        `conflict '${conflict.id}' has a participant that exclusively consumes no OwnedWeapon.`,
-      )
-      return {
-        kind: 'same_owned_weapon_consumed',
-        counterStream: null,
-        consumedOwnedWeaponId:
-          unit.exclusiveConsumedOwnedWeaponId as OwnedWeaponId,
-      }
+      throw new Error(`Planner conflict context invariant violated: conflict '${conflict.id}' is not a Counter conflict.`)
+  }
+}
+
+/**
+ * The one weapon of a `same_owned_weapon_consumed` conflict (Issue #334 PR-3,
+ * `docs/PLANNER_SPEC.md` 21.5): the weapon a participating unit exclusively
+ * consumes, or - for a participant with no such unit, a zero-operation
+ * Candidate or a Reset Skills Route - the weapon the participant's Route
+ * completes its Target with (`plannerEntryCompletionWeaponId()`). Every
+ * participant must name the same weapon.
+ */
+function consumedWeaponIdentity(
+  conflict: PlanConflict,
+  units: readonly PlannerRouteUnit[],
+  participants: readonly BuildListEntry[],
+): PlannerConflictResourceIdentity {
+  const weaponIds = new Set<OwnedWeaponId>([
+    ...units.flatMap((unit) => unit.exclusiveConsumedOwnedWeaponId === null ? [] : [unit.exclusiveConsumedOwnedWeaponId]),
+    ...participants.flatMap((entry) => {
+      const weaponId = plannerEntryCompletionWeaponId(entry)
+      return weaponId === null ? [] : [weaponId]
+    }),
+  ])
+  invariant(
+    weaponIds.size === 1,
+    weaponIds.size === 0
+      ? `conflict '${conflict.id}' names no consumed or completed OwnedWeapon.`
+      : `conflict '${conflict.id}' mixes several physical resources.`,
+  )
+  return {
+    kind: 'same_owned_weapon_consumed',
+    counterStream: null,
+    consumedOwnedWeaponId: [...weaponIds][0] as OwnedWeaponId,
   }
 }
 
 function resourceIdentity(
   conflict: PlanConflict,
   units: readonly PlannerRouteUnit[],
+  participants: readonly BuildListEntry[],
 ): PlannerConflictResourceIdentity {
+  if (conflict.kind === 'same_owned_weapon_consumed') {
+    return consumedWeaponIdentity(conflict, units, participants)
+  }
   invariant(
     units.length > 0,
     `conflict '${conflict.id}' has no participating Route unit.`,
@@ -235,7 +248,6 @@ function participantContext(
     sourceOwnedWeaponId: participantSourceOwnedWeaponId(entry, unit),
     exclusiveConsumedOwnedWeaponId: unit.exclusiveConsumedOwnedWeaponId,
     physicalActionKey: unit.physicalActionKey,
-    hasSelectedCheckpoints: hasIntermediateStateSelection(entry),
   }
 }
 
@@ -305,7 +317,14 @@ export function createPlannerConflictContexts(
           left.position.unitIndex - right.position.unitIndex ||
           compareStableStrings(left.physicalActionKey, right.physicalActionKey),
       )
-      const identity = resourceIdentity(conflict, units)
+      const participantEntries = conflict.buildListEntryIds.map((entryId) => {
+        const entry = context.entriesById.get(entryId)
+        invariant(entry !== undefined, `conflict '${conflict.id}' names unknown BuildListEntry '${entryId}'.`)
+        return entry as BuildListEntry
+      })
+      const identity = resourceIdentity(conflict, units, participantEntries)
+      // At unit granularity: a participant with no Route unit (a zero-operation
+      // Candidate of a weapon conflict) appears in the conflict, not here.
       const participants = units.map((unit) => {
         const entry = context.entriesById.get(unit.entryId)
         invariant(
@@ -318,7 +337,6 @@ export function createPlannerConflictContexts(
       return {
         conflictId: conflict.id,
         kind: conflict.kind,
-        involvesSelectedCheckpoint: conflictInvolvesSelectedCheckpoint(conflict),
         resourceIdentity: identity,
         counterStream: identity.counterStream,
         normalCounterId:
@@ -373,11 +391,6 @@ export type PlannerFixedConstraintFailureReason =
   | 'selected_entry_not_participant'
   /** No unique participant context carries the selected Entry's semantics. */
   | 'participant_context_ambiguous'
-  /**
-   * The conflict involves a selected compromise checkpoint, which no
-   * winner-picking resolution may settle (`docs/PLANNER_SPEC.md` 9.5).
-   */
-  | 'checkpoint_conflict'
 
 export interface PlannerFixedConstraintFailure {
   conflictKey: string
@@ -502,18 +515,6 @@ export function preparePlannerFixedConflictConstraints(
         resolution.selectedBuildListEntryId,
         'selected_entry_not_participant',
         `BuildListEntry '${resolution.selectedBuildListEntryId}' is not a participant in conflict '${resolution.conflictKey}'.`,
-      ))
-      return
-    }
-    if (conflictInvolvesSelectedCheckpoint(conflict)) {
-      // Fixing either side would make the other give up the Counter position
-      // its selected checkpoint needs. The Build List, not a resolution, is
-      // where this conflict is settled.
-      failures.push(constraintFailure(
-        resolution.conflictKey,
-        resolution.selectedBuildListEntryId,
-        'checkpoint_conflict',
-        `Conflict '${resolution.conflictKey}' involves a selected compromise checkpoint and cannot be fixed by preferring BuildListEntry '${resolution.selectedBuildListEntryId}'.`,
       ))
       return
     }

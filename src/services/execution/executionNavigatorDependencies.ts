@@ -36,8 +36,6 @@ import {
   type RecoverOperationCountRequest,
   type RestoreExecutionSavePointRequest,
   type RestoreExecutionSavePointResult,
-  type FinishProductionPlanAsCompromiseRequest,
-  type FinishProductionPlanAsCompromiseResult,
   type ProductionPlanExecutionService,
   type RecordActualResultDifferentRequest,
   type RecordOperationUncertainRequest,
@@ -100,9 +98,6 @@ export interface ExecutionNavigatorPageDependencies {
   /** The exact persisted Plan of the route and its display data; `null` when the Plan does not exist. */
   loadSnapshot(planId: ProductionPlanId): Promise<ExecutionNavigatorSnapshot | null>
   confirmExpectedPlanStep(request: ConfirmExpectedPlanStepRequest): Promise<ConfirmExpectedPlanStepResult>
-  finishProductionPlanAsCompromise(
-    request: FinishProductionPlanAsCompromiseRequest,
-  ): Promise<FinishProductionPlanAsCompromiseResult>
   recordActualResultDifferent(request: RecordActualResultDifferentRequest): Promise<ExecutionStepRecordResult>
   recordOperationUncertain(request: RecordOperationUncertainRequest): Promise<ExecutionStepRecordResult>
   recoverOperationCount(request: RecoverOperationCountRequest): Promise<ExecutionStepRecordResult>
@@ -115,23 +110,37 @@ export interface ExecutionNavigatorPageDependencies {
   abandonProductionPlan(request: AbandonProductionPlanRequest): Promise<AbandonProductionPlanResult>
 }
 
+/**
+ * The Navigator's read (`docs/DATA_MODEL.md` 14.6): the Plan's ExecutionHistory
+ * metadata and the Undo body of its latest record - for the Undo display - and
+ * no other Undo body, so the read does not grow with the confirmed Steps. A
+ * record of the Plan the Dexie version 11 upgrade could not convert rejects the
+ * read (`execution_history_unconvertible`); it is never shown as "no history".
+ * The save point restore availability is judged under the CalculationContext
+ * the restore itself runs with (Issue #335).
+ */
 export async function loadExecutionNavigatorSnapshot(
   database: AppDatabase,
   planId: ProductionPlanId,
+  currentCalculationContext: CalculationContext,
 ): Promise<ExecutionNavigatorSnapshot | null> {
   const plan = await database.productionPlans.get(planId)
   if (!plan) return null
+  const history = new ExecutionHistoryRepository(database)
   const [ownedWeapons, targetWeapons, buildListEntries, planExecutionHistory, executionSavePoint, rngState, normalCounters] = await Promise.all([
     database.ownedWeapons.toArray(),
     database.targetWeapons.toArray(),
     database.buildListEntries.toArray(),
     // Ordered by `compareExecutionHistoryOrder()`: the last one is the latest.
-    new ExecutionHistoryRepository(database).getExecutionHistoryByPlan(planId),
+    history.getExecutionHistoryByPlan(planId),
     database.executionSavePoints.get(executionSavePointIdForPlan(planId)),
     database.rngState.get('current'),
     database.normalArtianCounters.toArray(),
   ])
   const latestExecutionHistory = planExecutionHistory.at(-1) ?? null
+  const latestUndoSnapshot = latestExecutionHistory === null
+    ? null
+    : (await history.getExecutionUndoSnapshot(latestExecutionHistory.id)) ?? null
   const savePoint = executionSavePoint ?? null
   return {
     plan,
@@ -142,8 +151,8 @@ export async function loadExecutionNavigatorSnapshot(
     latestExecutionHistory,
     executionSavePoint: savePoint,
     operationCountRecovery: deriveOperationCountRecovery(plan, { ownedWeapons, planExecutionHistory }),
-    undo: inspectExecutionUndo(plan, latestExecutionHistory, savePoint),
-    savePointRestore: inspectExecutionSavePointRestore(plan, savePoint, planExecutionHistory),
+    undo: inspectExecutionUndo(plan, latestExecutionHistory, latestUndoSnapshot, savePoint),
+    savePointRestore: inspectExecutionSavePointRestore(plan, savePoint, planExecutionHistory, currentCalculationContext),
     reidentificationReminder: deriveExecutionReidentificationReminder({
       plan,
       planExecutionHistory,
@@ -158,12 +167,12 @@ export function createExecutionNavigatorDependencies(
   database: AppDatabase = appDatabase,
   service: ProductionPlanExecutionService = createProductionPlanExecutionService(master, database),
 ): ExecutionNavigatorPageDependencies {
+  const currentCalculationContext = createBuildListCalculationContext(master)
   return {
     master,
-    currentCalculationContext: createBuildListCalculationContext(master),
-    loadSnapshot: (planId) => loadExecutionNavigatorSnapshot(database, planId),
+    currentCalculationContext,
+    loadSnapshot: (planId) => loadExecutionNavigatorSnapshot(database, planId, currentCalculationContext),
     confirmExpectedPlanStep: (request) => service.confirmExpectedPlanStep(request),
-    finishProductionPlanAsCompromise: (request) => service.finishProductionPlanAsCompromise(request),
     recordActualResultDifferent: (request) => service.recordActualResultDifferent(request),
     recordOperationUncertain: (request) => service.recordOperationUncertain(request),
     recoverOperationCount: (request) => service.recoverOperationCount(request),

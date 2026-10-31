@@ -6,7 +6,6 @@ import type {
 import { isProductionPlanCalculationCompatible } from '../models/publicTypes'
 import {
   applyPlannerConflictResolutions,
-  effectiveCheckpointParticipants,
   type PlannerResolvableConflict,
 } from './plannerConflictDetection'
 import type { PlannerConflictResolution } from './plannerTypes'
@@ -43,8 +42,6 @@ export type PlannerConflictDecisionNotCarriedReason =
   | 'entry_not_participant'
   /** Its Entry is not a valid Entry of the current input. */
   | 'entry_not_valid'
-  /** Its conflict has an effective checkpoint participant in the carried set. */
-  | 'checkpoint_conflict'
 
 /** Why an earlier decision cannot hold together with the new one (rule 4). */
 export type PlannerConflictDecisionSupersededReason =
@@ -52,8 +49,6 @@ export type PlannerConflictDecisionSupersededReason =
   | 'selected_entry_not_preferred'
   /** It did not select the Entry the new decision prefers. */
   | 'preferred_entry_was_excluded'
-  /** Dropping another decision gave its conflict an effective checkpoint participant again. */
-  | 'checkpoint_participant_restored'
 
 export interface PlannerConflictDecisionNotCarried {
   readonly resolution: PlannerConflictResolution
@@ -75,8 +70,6 @@ export type PlannerConflictDecisionRefusal =
   | { reason: 'entry_not_participant' }
   /** The preferred Entry is not a valid Entry of the current input. */
   | { reason: 'entry_not_valid' }
-  /** The decided conflict keeps an effective checkpoint participant (9.5.1). */
-  | { reason: 'checkpoint_conflict' }
   /** An Entry is preferred by one decision and excluded by another (rule 5). */
   | { reason: 'inconsistent_decision_set'; buildListEntryId: BuildListEntryId }
   /** Two preferred Entries meet in an undecided current initial Conflict (rule 6). */
@@ -165,18 +158,21 @@ function nonSelectedParticipants(
  *
  * 1. The new decision must name a current initial Conflict, a participant and
  *    a valid Entry, of an editable displayed Plan.
- * 2. An earlier decision is carried over only when the same holds for it; one
- *    whose conflict keeps an effective checkpoint participant even among the
- *    carried decisions alone is not carried over either. Nothing is re-mapped.
+ * 2. An earlier decision is carried over only when the same holds for it.
+ *    Nothing is re-mapped.
  * 3. The earlier decision of the same conflict is replaced by the new one.
  * 4. An earlier decision that preferred an Entry the new decision does not
  *    select, or that did not select the Entry the new decision prefers, is
- *    superseded. Every decision then applies through the Planner's own
- *    fixpoint; a carried decision that applied among the carried decisions but
- *    no longer applies (its checkpoint participant is not excluded any more) is
- *    superseded too. The new decision must apply, or the press is refused.
+ *    superseded. Every remaining decision then applies through the Planner's
+ *    own `applyPlannerConflictResolutions()`.
  * 5. No Entry may be both preferred and excluded.
  * 6. No two preferred Entries may meet in an undecided current initial Conflict.
+ *
+ * Calculation schema 11..18 also refused, did not carry over or superseded a
+ * decision whose conflict kept an effective selected compromise checkpoint
+ * (9.5.1 / 9.6.2). Issue #100 removed the selection (20.7 / 20.10): no current
+ * initial Conflict carries a checkpoint participant, so a decision that passes
+ * rules 1 - 4 always applies.
  */
 export function derivePlannerConflictDecisionSet(
   input: PlannerConflictDecisionSetInput,
@@ -185,25 +181,17 @@ export function derivePlannerConflictDecisionSet(
   const validEntryIds = new Set(input.preparation.validBuildListEntryIds)
   const earlier = plannerPersistedConflictDecisions(input.displayedPlan)
 
-  // Rule 2 (basic part) and the carried-only fixpoint.
+  // Rule 2.
   const notCarriedOver: PlannerConflictDecisionNotCarried[] = []
   const basicCarried = earlier.filter((resolution) => {
     const reason = basicRefusal(resolution, conflictsById, validEntryIds)
     if (reason !== null) notCarriedOver.push({ resolution, reason })
     return reason === null
   })
-  const carriedOnly = applyPlannerConflictResolutions(input.preparation.currentConflicts, basicCarried)
-  const appliesCarriedOnly = (resolution: PlannerConflictResolution) =>
-    carriedOnly.appliedSelections.get(resolution.conflictKey) === resolution.selectedBuildListEntryId
   const refuse = (refusal: PlannerConflictDecisionRefusal): PlannerConflictDecisionSetResult => ({
     status: 'refused',
     refusal,
-    notCarriedOver: [
-      ...notCarriedOver,
-      ...basicCarried
-        .filter((resolution) => !appliesCarriedOnly(resolution))
-        .map((resolution) => ({ resolution, reason: 'checkpoint_conflict' as const })),
-    ],
+    notCarriedOver: [...notCarriedOver],
   })
 
   // Rule 1 (Plan and the new decision's own validity).
@@ -240,19 +228,12 @@ export function derivePlannerConflictDecisionSet(
     return true
   })
 
-  // The Planner's own fixpoint over the set to pass, then the checkpoint
-  // re-judgement of rule 4 and the new decision's checkpoint part of rule 1.
+  // The Planner's own application of the set to pass. Every candidate and the
+  // new decision name a distinct current Conflict and one of its participants
+  // (rules 1 - 3), so each one applies.
   const passed = decision === null ? candidates : [...candidates, decision]
   const application = applyPlannerConflictResolutions(input.preparation.currentConflicts, passed)
-  const applies = (resolution: PlannerConflictResolution) =>
-    application.appliedSelections.get(resolution.conflictKey) === resolution.selectedBuildListEntryId
-  if (decision !== null && !applies(decision)) return refuse({ reason: 'checkpoint_conflict' })
-  const carriedOver: PlannerConflictResolution[] = []
-  candidates.forEach((resolution) => {
-    if (applies(resolution)) carriedOver.push(resolution)
-    else if (appliesCarriedOnly(resolution)) superseded.push({ resolution, reason: 'checkpoint_participant_restored' })
-    else notCarriedOver.push({ resolution, reason: 'checkpoint_conflict' })
-  })
+  const carriedOver = [...candidates]
   const resolutions = (decision === null ? carriedOver : [...carriedOver, decision])
     .map((resolution) => ({ ...resolution }))
     .sort((left, right) => compareStableStrings(left.conflictKey, right.conflictKey))
@@ -314,17 +295,4 @@ export function plannerConflictDecisionExclusions(
       })
     })
   return exclusions
-}
-
-/**
- * The checkpoint participants of a current initial Conflict that still run
- * once the given decision set applies (`docs/PLANNER_SPEC.md` 9.6.2), read
- * from this module's result: the screen's "this conflict needs a Build List
- * checkpoint change" judgement.
- */
-export function plannerConflictEffectiveCheckpointParticipants(
-  conflict: PlannerResolvableConflict,
-  excludedBuildListEntryIds: readonly BuildListEntryId[],
-) {
-  return effectiveCheckpointParticipants(conflict, new Set(excludedBuildListEntryIds))
 }

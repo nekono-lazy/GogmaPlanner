@@ -1,3 +1,4 @@
+import { runRunningPlanReplanOptimization } from '../domain/execution/runningPlanReplanOptimization'
 import { createProductionPlannerDependencies, type PlannerDependencies } from '../domain/planner'
 import {
   runBuildListOptimization,
@@ -8,6 +9,7 @@ import {
   BuildListOptimizationSearchBoundsUnavailableError,
   type BuildListOptimizationWorkerCalculation,
   type BuildListOptimizationWorkerRuntime,
+  type RunningPlanReplanWorkerCalculation,
 } from './buildListOptimization.worker'
 
 /**
@@ -20,6 +22,9 @@ import {
  * `docs/BUILD_LIST_OPTIMIZATION_BROWSER_MEASUREMENT.md` 8), and the Owner chose it on 2026-10-15 over `w0-research` (the same bounds
  * with one structural candidate and one verification) to keep room for verifying the next structural candidate when the Planner
  * rejects the first. What a second or third candidate costs was not measured (the representative case accepts the first).
+ *
+ * The running Plan replan re-optimization of Issue #276 runs with these same bounds (`docs/PLANNER_SPEC.md` 18.6: shared until 18.12
+ * R5 decides whether it needs its own after the PR-7 measurement); it has no default or value of its own.
  *
  * Never the Candidate Search defaults or a saved setting; no request, Client, Application or UI ever carries a bound.
  */
@@ -65,13 +70,33 @@ export function createBuildListOptimizationCalculation(
   }
 }
 
-/** The Worker runtime over the given search bounds, with the Production dependencies and the Worker's monotonic clock. */
+/**
+ * The Production running Plan replan re-optimization with the given search bounds (Issue #276 PR-4): `runRunningPlanReplanOptimization()`
+ * itself, handed a copy of the bounds, exactly like the Build List optimization's calculation above - `null` refuses before any Stage,
+ * nothing computes a step bound, and the Domain asserts every bound. The ordinary `runBuildListOptimization()` is never handed a
+ * replan target set: the replan has its own entry.
+ */
+export function createRunningPlanReplanCalculation(
+  bounds: BuildListOptimizationBounds | null,
+): RunningPlanReplanWorkerCalculation {
+  const fixed = bounds === null ? null : structuredClone(bounds)
+  return async (input, dependencies, execution) => {
+    if (fixed === null) throw new BuildListOptimizationSearchBoundsUnavailableError()
+    return runRunningPlanReplanOptimization(input, dependencies, structuredClone(fixed), execution)
+  }
+}
+
+/**
+ * The Worker runtime over the given search bounds, with the Production dependencies and the Worker's monotonic clock. Both run
+ * requests of the Worker - the Build List optimization and the running Plan replan - share the bounds.
+ */
 export function createBuildListOptimizationWorkerRuntime(
   bounds: BuildListOptimizationBounds | null,
 ): BuildListOptimizationWorkerRuntime {
   return {
     createDependencies: createProductionBuildListOptimizationWorkerDependencies,
     calculation: createBuildListOptimizationCalculation(bounds),
+    replanCalculation: createRunningPlanReplanCalculation(bounds),
     now: () => performance.now(),
   }
 }

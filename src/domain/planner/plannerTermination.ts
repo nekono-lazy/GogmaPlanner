@@ -1,5 +1,4 @@
 import type { TargetWeaponId } from '../models/publicTypes'
-import type { PlannerCheckpointRequirements } from './plannerCheckpoints'
 import { isPlannerTargetComplete } from './plannerEntryRelevance'
 import type {
   PlannerOptions,
@@ -35,15 +34,13 @@ export function plannerRunLimits(options: PlannerOptions): PlannerOptions {
 function countCompletedTargets(
   bestState: PlannerSearchState | null,
   planningTargetIds: readonly TargetWeaponId[],
-  checkpointRequirements: PlannerCheckpointRequirements,
   unconfirmedTargetIds: ReadonlySet<TargetWeaponId>,
 ): number {
   if (bestState === null) return 0
-  // The same authority the run uses: a Target with a required checkpoint
-  // Entry counts only once that Entry itself was secured.
+  // The same authority the run uses.
   return planningTargetIds.filter((targetId) =>
     !unconfirmedTargetIds.has(targetId) &&
-    isPlannerTargetComplete(bestState, targetId, checkpointRequirements),
+    isPlannerTargetComplete(bestState, targetId),
   ).length
 }
 
@@ -54,7 +51,6 @@ export interface PlannerTerminationStateInput {
    * only Targets with a valid BuildListEntry, never every active Target.
    */
   planningTargetIds: readonly TargetWeaponId[]
-  checkpointRequirements: PlannerCheckpointRequirements
   bestState: PlannerSearchState | null
   expandedStates: number
   cancelled: boolean
@@ -76,9 +72,9 @@ export interface PlannerTerminationStateInput {
  * - `cancelled`  the user stopped the run; nothing about the result is a
  *   statement on feasibility, and the ordinary Planner already returns a safe
  *   `plan: null` for it.
- * - `completed`  every planning Target is complete: Ideal, and its required
- *   checkpoint Entry secured (PLANNER_SPEC 7.5.6). A bound that was touched
- *   on the way stays in `reachedLimits` as a diagnostic and changes nothing.
+ * - `completed`  every planning Target is complete (holds its Ideal). A bound
+ *   that was touched on the way stays in `reachedLimits` as a diagnostic and
+ *   changes nothing.
  * - `incomplete` a bound truncated the run before that, so the best state is a
  *   run artifact, not an answer about the input.
  * - `exhausted`  the run ended on its own without completing every Target.
@@ -96,7 +92,6 @@ export function createPlannerTermination<TLimitKind extends string, TLimits>(
   const completedTargetCount = countCompletedTargets(
     input.bestState,
     input.planningTargetIds,
-    input.checkpointRequirements,
     input.unconfirmedTargetIds ?? new Set(),
   )
   const isComplete =

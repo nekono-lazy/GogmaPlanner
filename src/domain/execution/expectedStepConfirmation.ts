@@ -3,7 +3,6 @@ import type {
   BuildListEntry,
   CalculationContext,
   NormalArtianCounter,
-  ExecutionHistory,
   ExecutionHistoryId,
   ISODateTimeString,
   ObservedRestorationBonusBinding,
@@ -24,12 +23,11 @@ import {
 import {
   applyRngAdvance,
   applyTargetLinks,
-  assertExecutionHistoryValid,
+  createExecutionRecord,
   assertStepResultValid,
   changedEntity,
   changedNormalCounters,
   collectEntityChanges,
-  createExecutionUndoSnapshot,
   createMutableExecutionState,
   inconsistent,
   markTrackedWeaponInProgress,
@@ -181,26 +179,25 @@ function updateTrackedWeapon(
   }
 }
 
-/** Compromise labels (16.12): `practical`, with protection and progress untouched. */
-function applyCompromiseLabels(
-  context: StepExecutionContext,
-  step: ExecutableProductionPlanStep,
-  state: MutableExecutionState,
-): void {
-  step.executionEffects.compromiseLabels.forEach((label) => {
-    const weapon = requireWeapon(state, label.ownedWeaponId, step.id)
-    if (weapon.kind !== 'gogma') inconsistent(`The compromise label of '${weapon.id}' needs a Gogma weapon.`)
-    if (weapon.status !== 'practical') {
-      state.weapons.set(weapon.id, { ...weapon, status: 'practical', updatedAt: context.now })
-    }
-  })
+/**
+ * Compromise labels (calculation schema 11..18, 16.12) are no Execution effect
+ * any more: Execution never writes `status = practical` (Issue #100,
+ * `docs/PLANNER_SPEC.md` 20.4). A schema 19 Step always carries an empty
+ * `compromiseLabels`, so this is a no-op; a Step that still carries a label is
+ * a legacy Step, never applied as if it carried none.
+ */
+function refuseCompromiseLabels(step: ExecutableProductionPlanStep): void {
+  if (step.executionEffects.compromiseLabels.length > 0) {
+    inconsistent(`PlanStep '${step.id}' carries a compromise label, which current Execution no longer applies.`)
+  }
 }
 
 /**
  * Ideal completion and Target completion (16.13): the weapon holds the Candidate
- * result as a protected Ideal, and the completed Target plus every Target that
- * preferred the weapon lose that preference - nothing else about those Targets
- * changes.
+ * result as a protected Ideal, the completed Target records it as its
+ * completion assignment (Issue #334, 21.6), and the completed Target plus every
+ * Target that preferred the weapon lose that preference - nothing else about
+ * those Targets changes.
  */
 function applyTargetCompletions(
   context: StepExecutionContext,
@@ -234,6 +231,11 @@ function applyTargetCompletions(
       lifecycleStatus: 'completed',
       completedAt: now,
       completedByProductionPlanId: plan.id,
+      // The completion assignment (Issue #334, `docs/PLANNER_SPEC.md` 21.6):
+      // `targetCompletions[].ownedWeaponId` is its authority, written in this
+      // same transaction. The collection validation of the Step refuses a
+      // weapon another Target was completed with.
+      completedWithOwnedWeaponId: weapon.id,
       preferredOwnedWeaponId: null,
       updatedAt: now,
     })
@@ -275,10 +277,10 @@ export function nextPlanAfterStep(
  * Applies one Step exactly as the Plan recorded it (`docs/PLANNER_SPEC.md`
  * 16.1 / 16.3): its `rngAdvance` through the Counter authority, the tracked
  * weapon registration or same-ID update with the recorded expected result (or
- * a blind observation), the in-progress mark, target links, compromise labels
- * and target completions. It completes no Step, writes no ExecutionHistory and
- * runs no RNG prediction; the working entity state is updated in place and the
- * advanced Counters are returned.
+ * a blind observation), the in-progress mark, target links and target
+ * completions (a legacy compromise label is refused). It completes no Step,
+ * writes no ExecutionHistory and runs no RNG prediction; the working entity
+ * state is updated in place and the advanced Counters are returned.
  *
  * This is the one state transition authority `confirmed_expected` and the
  * Current Position Recovery replay (16.15) share.
@@ -302,7 +304,7 @@ export function applyExpectedStepTransition(
     markTrackedWeaponInProgress(context, step, mutable)
   }
   applyTargetLinks(context, step, mutable)
-  applyCompromiseLabels(context, step, mutable)
+  refuseCompromiseLabels(step)
   applyTargetCompletions(context, step, mutable, working.entryById)
   return counters
 }
@@ -327,11 +329,11 @@ export function clearPlanInProgress(
  *
  * Order: validate the Plan, its current Step, its premises and the
  * `expectedStateBefore`; apply `rngAdvance`; register or update the tracked
- * weapon; target links; compromise labels; target completions; complete the
- * Step (and the Plan on its last Step, clearing every in-progress weapon of the
- * Plan); verify entities, the Target preference collection and
- * `expectedStateAfter`; build the ExecutionHistory with the Undo snapshot taken
- * from the untouched state. Any failure throws before the caller writes
+ * weapon; target links; refuse a legacy compromise label; target completions;
+ * complete the Step (and the Plan on its last Step, clearing every in-progress
+ * weapon of the Plan); verify entities, the Target preference collection and
+ * `expectedStateAfter`; build the ExecutionHistory and its Undo body from the
+ * untouched state. Any failure throws before the caller writes
  * anything.
  */
 export function prepareExpectedStepConfirmation(
@@ -400,18 +402,24 @@ export function prepareExpectedStepConfirmation(
         securedOwnedWeaponId: null,
         note: null,
       }
-  const history: ExecutionHistory = {
-    id: input.executionHistoryId,
-    planId: plan.id,
-    planStepId: step.id,
-    action: 'confirmed_expected',
-    actualResult,
-    wasExpected: true,
-    recalculationReason: null,
-    undoSnapshot: createExecutionUndoSnapshot(plan, state, changes),
-    createdAt: now,
-  }
-  assertExecutionHistoryValid(history)
+  const deletesExecutionSavePoint = nextPlan.status === 'completed' && state.executionSavePoint !== null
+  const record = createExecutionRecord({
+    metadata: {
+      id: input.executionHistoryId,
+      planId: plan.id,
+      planStepId: step.id,
+      action: 'confirmed_expected',
+      actualResult,
+      wasExpected: true,
+      recalculationReason: null,
+      createdAt: now,
+    },
+    planBefore: plan,
+    planAfter: nextPlan,
+    state,
+    changes,
+    deletesExecutionSavePoint,
+  })
 
   return {
     rngState: changedEntity(state.rngState, counters.rngState) ? counters.rngState : null,
@@ -419,7 +427,8 @@ export function prepareExpectedStepConfirmation(
     ownedWeapons: changes.changedWeapons,
     targetWeapons: changes.changedTargets,
     plan: nextPlan,
-    history,
-    deletesExecutionSavePoint: nextPlan.status === 'completed' && state.executionSavePoint !== null,
+    history: record.history,
+    undoSnapshot: record.undoSnapshot,
+    deletesExecutionSavePoint,
   }
 }

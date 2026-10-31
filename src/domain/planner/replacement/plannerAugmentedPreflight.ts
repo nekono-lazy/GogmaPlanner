@@ -65,12 +65,6 @@ export type PlannerConstraintReassociationFailureReason =
   | 'participant_context_mismatch'
   /** Two rebuilt resolutions would share one current `conflictKey`. */
   | 'resolution_key_collision'
-  /**
-   * The current conflict now involves a selected compromise checkpoint, so the
-   * re-mapped resolution would drop a hard constraint (`docs/PLANNER_SPEC.md`
-   * 9.5). Nothing is guessed: the trial fails closed.
-   */
-  | 'checkpoint_conflict'
 
 export interface PlannerConstraintReassociationFailure {
   /** Diagnostic only; it is never reused as the current `conflictKey`. */
@@ -308,13 +302,6 @@ function reassociateConstraint(
     )
   }
   const current = matching[0]
-  if (current.involvesSelectedCheckpoint) {
-    return failure(
-      constraint,
-      'checkpoint_conflict',
-      `Conflict '${current.conflictId}' involves a selected compromise checkpoint, so BuildListEntry '${constraint.fixedBuildListEntryId}' cannot be fixed over it.`,
-    )
-  }
   // One Entry may legitimately participate through several Route units, so unit
   // count is never the authority. Only a mixed semantic participant context is
   // a mismatch (PLANNER_SPEC 9.2.3.1).

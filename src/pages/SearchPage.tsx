@@ -1,7 +1,8 @@
-import { isTargetWeaponPlanningEligible } from '../domain/models/domainRules'
+import { isTargetWeaponPlanningEligible, targetCompletionConditionNeedsReview } from '../domain/models/domainRules'
+import { COMPLETION_CONDITION_REVIEW_CHIP_LABEL } from '../components/target/completionConditionPresentation'
 import { CURRENT_CALCULATION_APP_SCHEMA_VERSION } from '../domain/models/publicTypes'
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
-import { Link as RouterLink } from 'react-router-dom'
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react'
+import { Link as RouterLink, useNavigate } from 'react-router-dom'
 import {
   Alert,
   AlertTitle,
@@ -21,17 +22,47 @@ import { DisclosureAccordion } from '../components/DisclosureAccordion'
 import { PageShell } from '../components/PageShell'
 import { PersistentReidentificationReminderAlert } from '../components/execution/PersistentReidentificationReminderAlert'
 import { PlanBreakingChangeDialog } from '../components/execution/PlanBreakingChangeDialog'
+import { RunningPlanReplanProposalNotice } from '../components/execution/RunningPlanReplanProposalNotice'
+import { RUNNING_PLAN_REPLAN_UNNAMED_TARGET } from '../components/execution/runningPlanReplanGuidancePresentation'
+import {
+  runningPlanReplanExclusionRequest,
+  runningPlanReplanInclusionRequest,
+  runningPlanReplanNavigationState,
+  type RunningPlanReplanOpenRequest,
+} from '../components/execution/runningPlanReplanRequest'
 import { usePersistentReidentificationReminder } from '../components/execution/usePersistentReidentificationReminder'
-import { usePlanBreakingChangeApproval } from '../components/execution/usePlanBreakingChangeApproval'
+import {
+  usePlanBreakingChangeApproval,
+  type PlanBreakingReplanExclusionRequest,
+} from '../components/execution/usePlanBreakingChangeApproval'
+import type { ReplanProposalBuildListChange } from '../domain/execution'
 import { OwnedIdealCompletionDialog } from '../components/target/OwnedIdealCompletionDialog'
 import { OwnedIdealWeaponNotice } from '../components/target/OwnedIdealWeaponNotice'
 import { useOwnedIdealCompletion, type OwnedIdealCompletionApi } from '../components/target/useOwnedIdealCompletion'
 import { StatusChip } from '../components/StatusChip'
 import { CandidateCard } from '../components/search/CandidateCard'
 import {
+  BatchCandidateResearchSummaryPanel,
   BatchCandidateSearchProgressPanel,
   BatchCandidateSearchSummaryPanel,
 } from '../components/search/BatchCandidateSearchPanels'
+import { BatchCandidateResearchDialog } from '../components/search/BatchStaleCandidateReplacementDialog'
+import { BatchCandidateResearchExclusionDisclosure } from '../components/search/BatchStaleCandidateReplacementExclusionDisclosure'
+import {
+  BATCH_RESEARCH_CANCEL_LABEL,
+  BATCH_RESEARCH_DESCRIPTION,
+  BATCH_RESEARCH_NONE_NOTE,
+  BATCH_RESEARCH_PROGRESS_TITLE,
+  batchResearchButtonLabel,
+  batchResearchCountsNote,
+  batchResearchExcludedDisclosureTitle,
+  batchResearchExcludedOnlyNote,
+} from '../components/search/batchStaleCandidateReplacementPresentation'
+import {
+  useBatchCandidateResearch,
+  type BatchCandidateResearchApi,
+  type BatchCandidateResearchRunContext,
+} from '../components/search/useBatchStaleCandidateReplacement'
 import { BuildListReplacementDialog } from '../components/search/BuildListReplacementDialog'
 import {
   BUILD_LIST_CHECK_LINK_LABEL,
@@ -53,10 +84,11 @@ import type {
   BuildListEntryId,
   CalculationContext,
   CandidateSearchDefaults,
-  IntermediateStateSelection,
   OwnedGogmaArtianWeapon,
   OwnedWeapon,
+  ProductionPlanId,
   TargetWeapon,
+  TargetWeaponId,
 } from '../domain/models/publicTypes'
 import { findOwnedIdealWeaponsForTarget } from '../domain/target'
 import type {
@@ -68,7 +100,6 @@ import type {
 } from '../domain/search'
 import { defaultCandidateSearchSettings } from '../domain/search'
 import {
-  defaultIntermediateStateSelection,
   findBuildListRegisteredTargetIds,
   isSameBuildListCandidate,
 } from '../domain/buildList'
@@ -85,6 +116,11 @@ import {
   buildListService,
   type AddBuildListCandidateResult,
 } from '../services/buildList/buildListService'
+import { createBuildListCalculationContext } from '../services/buildList/createBuildListCalculationContext'
+import {
+  createBuildListResearchSelectionReader,
+  type BatchCandidateResearchSummary,
+} from '../services/search/batchStaleCandidateReplacement'
 import {
   TargetWeaponLifecycleService,
   type TargetOwnedIdealCompletion,
@@ -93,6 +129,10 @@ import {
   loadPersistentReidentificationReminder,
   type PersistentReidentificationReminder,
 } from '../services/execution/persistentReidentificationReminderService'
+import {
+  createRunningPlanReplanGuidanceReader,
+  type RunningPlanReplanGuidanceReader,
+} from '../services/execution/runningPlanReplanGuidanceService'
 import {
   runBatchCandidateSearch,
   selectBatchCandidateSearchTargets,
@@ -141,7 +181,7 @@ function createSearchRunId(): string {
   return globalThis.crypto?.randomUUID?.() ?? `search-${Date.now()}`
 }
 
-export interface SearchPageDependencies extends OwnedIdealCompletionApi, BuildListCandidateReplacementApi {
+export interface SearchPageDependencies extends OwnedIdealCompletionApi, BuildListCandidateReplacementApi, BatchCandidateResearchApi {
   master: MasterDataRoot
   getTargets(): Promise<TargetWeapon[]>
   getOwnedWeapons(): Promise<OwnedWeapon[]>
@@ -177,13 +217,17 @@ export interface SearchPageDependencies extends OwnedIdealCompletionApi, BuildLi
    * anything. `replacement_required` opens the replacement confirmation, whose
    * confirmed save is `replaceCandidate()` after `inspectCandidateReplacement()`
    * (`BuildListCandidateReplacementApi`); `legacy_duplicate` asks the user to
-   * tidy the Build List and never picks an Entry.
+   * tidy the Build List and never picks an Entry. The new Entry carries no
+   * intermediate state selection (Issue #100).
    */
-  addCandidate(
-    candidate: BuildCandidate,
-    target: TargetWeapon,
-    intermediateStateSelection: IntermediateStateSelection,
-  ): Promise<AddBuildListCandidateResult>
+  addCandidate(candidate: BuildCandidate, target: TargetWeapon): Promise<AddBuildListCandidateResult>
+  /**
+   * The read-only running Plan replan guidance (`docs/PLANNER_SPEC.md` 18.3,
+   * Issue #276 PR-6B): the proposal after an addition, a replacement or a
+   * batch, and whether the breaking-change warning may offer to exclude the
+   * Target in a replan. It never writes and never starts a replan.
+   */
+  replanGuidance: RunningPlanReplanGuidanceReader
 }
 
 const defaultDependencies: SearchPageDependencies | null = defaultMaster && defaultLifecycleService
@@ -206,10 +250,16 @@ const defaultDependencies: SearchPageDependencies | null = defaultMaster && defa
         buildCandidateRepository.replaceBuildCandidatesForTarget(targetId, candidates),
       // The Service result is passed through unchanged: the Build List
       // cardinality and duplicate decisions stay its authority.
-      addCandidate: (candidate, target, intermediateStateSelection) =>
-        buildListService.addCandidate(candidate, target, intermediateStateSelection),
+      addCandidate: (candidate, target) => buildListService.addCandidate(candidate, target),
       inspectCandidateReplacement: (request) => buildListService.inspectCandidateReplacement(request),
       replaceCandidate: (request, approval) => buildListService.replaceCandidate(request, approval ?? null),
+      // 「再検索が必要な候補を一括再検索・置換」 (`docs/UI_FLOW.md` 9.3): the
+      // selection is the Domain's over one read, and the replacement never
+      // carries an approval - a breaking one is refused and the Entry kept.
+      readResearchSelection: () => createBuildListResearchSelectionReader(defaultMaster).read(),
+      replaceStaleCandidate: (request) =>
+        buildListService.replaceStaleCandidate(request, createBuildListCalculationContext(defaultMaster)),
+      replanGuidance: createRunningPlanReplanGuidanceReader(),
     }
   : null
 
@@ -227,6 +277,22 @@ interface AddFeedback {
   message: string
   buildListLinkLabel?: string
 }
+
+/**
+ * The replan proposal of the last Build List save on this screen (`docs/UI_FLOW.md`
+ * 9 / 16.5, `docs/PLANNER_SPEC.md` 18.3, Issue #276 PR-6B): the Domain's
+ * `propose` answer and where it belongs - the single Candidate's add area or the
+ * batch summary. Screen memory only: dismissed, replaced by the next operation,
+ * and gone when the screen is left or reloaded; nothing is persisted.
+ */
+interface SearchReplanProposal {
+  source: 'single' | 'batch'
+  planId: ProductionPlanId
+  targetWeaponIds: readonly TargetWeaponId[]
+}
+
+/** The Build List read before an operation started (null when it could not be read: that operation proposes nothing). */
+type BuildListBefore = readonly Pick<BuildListEntry, 'id'>[] | null
 
 /**
  * A finished single search as the screen shows it: the Worker result together
@@ -249,6 +315,21 @@ interface DisplayedSearchResult {
  */
 function selectableSearchTargets(targets: readonly TargetWeapon[]): TargetWeapon[] {
   return sortByRegistrationOrder(targets.filter(isTargetWeaponPlanningEligible))
+}
+
+/**
+ * Enabled, active Targets whose completion condition still needs the user's
+ * review (`docs/UI_FLOW.md` 8.4 / 9): shown in the Select as options that
+ * cannot be chosen, with the reason, so their absence from the search is
+ * explained. The judgement is the Domain's `isTargetWeaponPlanningEligible()`.
+ */
+function reviewRequiredSearchTargets(targets: readonly TargetWeapon[]): TargetWeapon[] {
+  return sortByRegistrationOrder(
+    targets.filter((target) =>
+      target.isEnabled &&
+      target.lifecycleStatus === 'active' &&
+      targetCompletionConditionNeedsReview(target)),
+  )
 }
 
 /** A Target's name with 「登録済み」 when the Build List already holds its Entry. */
@@ -275,17 +356,10 @@ export function SearchPage({ dependencies = defaultDependencies ?? undefined }: 
   const [targets, setTargets] = useState<TargetWeapon[]>([])
   const [ownedWeapons, setOwnedWeapons] = useState<OwnedWeapon[]>([])
   // Read-only mirror of the Build List, kept only to show the add state of
-  // the displayed Candidate. It never feeds an intermediate state selection
-  // back into this screen's own draft selection.
+  // the displayed Candidate.
   const [buildListEntries, setBuildListEntries] = useState<BuildListEntry[]>([])
   const [targetWeaponId, setTargetWeaponId] = useState<TargetWeapon['id'] | ''>('')
   const [routeFilter, setRouteFilter] = useState<CandidateRouteFilter>('all')
-  // Intermediate states always start unselected and the improvement order is
-  // left to the Planner: choosing nothing means "go straight to the Ideal
-  // result" (`docs/UI_FLOW.md` 9).
-  const [intermediateSelection, setIntermediateSelection] = useState<IntermediateStateSelection>(
-    defaultIntermediateStateSelection(),
-  )
   // This screen's search bounds: they start from the saved AppSettings
   // defaults once loaded (the recommendation until then, and when the read
   // fails), and an edit here applies to this screen's single and batch
@@ -329,9 +403,59 @@ export function SearchPage({ dependencies = defaultDependencies ?? undefined }: 
   const [batchCancelling, setBatchCancelling] = useState(false)
   const [batchProgress, setBatchProgress] = useState<BatchCandidateSearchProgress | null>(null)
   const [batchSummary, setBatchSummary] = useState<BatchCandidateSearchSummary | null>(null)
+  const navigate = useNavigate()
+  const replanGuidance = dependencies?.replanGuidance
   // The owned Ideal notice and 「この武器で目標を完了にする」 (`docs/UI_FLOW.md` 8.2):
-  // a preferred path beside the search, never a gate on it.
-  const planGuard = usePlanBreakingChangeApproval()
+  // a preferred path beside the search, never a gate on it. The warning may
+  // offer to exclude a Plan-dependent Target in a replan instead (Issue #276
+  // PR-6B); its judgement, approval and save are the guard's as before.
+  const planGuard = usePlanBreakingChangeApproval({
+    replanExclusion: replanGuidance === undefined
+      ? undefined
+      : (planId, targetWeaponId) => replanGuidance.canExcludeInReplan(planId, targetWeaponId),
+  })
+  // The replan proposal after a Build List save on this screen (18.3). A newer
+  // operation, search or batch drops it, and a late answer for an older one
+  // never lands (the sequence).
+  const [replanProposal, setReplanProposal] = useState<SearchReplanProposal | null>(null)
+  const proposalSequenceRef = useRef(0)
+  const clearReplanProposal = useCallback(() => {
+    proposalSequenceRef.current += 1
+    setReplanProposal(null)
+  }, [])
+  /** The Build List right before an operation starts, as persisted; null on a read failure (that operation then proposes nothing). */
+  const readBuildListBefore = useCallback(async (): Promise<BuildListBefore> => {
+    if (replanGuidance === undefined) return null
+    try {
+      return (await replanGuidance.readBuildListEntryIds()).map((id) => ({ id }))
+    } catch {
+      return null
+    }
+  }, [replanGuidance])
+  /**
+   * Asks the Domain whether the save just made proposes a replan, from the
+   * state persisted after it. A read failure proposes nothing (no guess).
+   */
+  const proposeReplan = useCallback((source: SearchReplanProposal['source'], change: ReplanProposalBuildListChange, before: BuildListBefore) => {
+    proposalSequenceRef.current += 1
+    const sequence = proposalSequenceRef.current
+    setReplanProposal(null)
+    if (replanGuidance === undefined || before === null || change.persistedBuildListEntries.length === 0) return
+    void replanGuidance.proposeAfterBuildListChange(change, before).then(
+      (proposal) => {
+        if (proposalSequenceRef.current !== sequence || proposal.kind !== 'propose') return
+        setReplanProposal({ source, planId: proposal.planId, targetWeaponIds: proposal.targetWeaponIds })
+      },
+      () => undefined,
+    )
+  }, [replanGuidance])
+  /** Leaves for the Build List's replan with a runtime-only initial selection; nothing is calculated there by itself. */
+  const openBuildListReplan = useCallback((request: RunningPlanReplanOpenRequest) => {
+    void navigate('/build-list', { state: runningPlanReplanNavigationState(request) })
+  }, [navigate])
+  const openReplanExclusion = useCallback((request: PlanBreakingReplanExclusionRequest) => {
+    openBuildListReplan(runningPlanReplanExclusionRequest(request.planId, request.targetWeaponId))
+  }, [openBuildListReplan])
   const [completionNotice, setCompletionNotice] = useState<string | null>(null)
   const onCompletionApplied = useCallback((result: TargetOwnedIdealCompletion, planAbandoned: boolean) => {
     // A search still running was started for a Target that is now completed:
@@ -344,8 +468,8 @@ export function SearchPage({ dependencies = defaultDependencies ?? undefined }: 
     }
     setProgress(null)
     setResult(null)
-    setIntermediateSelection(defaultIntermediateStateSelection())
     setAddFeedback(null)
+    clearReplanProposal()
     setSearchError(null)
     setSearchNotice(null)
     setCompletionNotice(
@@ -368,12 +492,14 @@ export function SearchPage({ dependencies = defaultDependencies ?? undefined }: 
       .catch((caught: unknown) => {
         setLoadError(caught instanceof Error ? caught.message : '検索データの読み込みに失敗しました。')
       })
-  }, [dependencies])
+  }, [clearReplanProposal, dependencies])
   const completion = useOwnedIdealCompletion({
     api: dependencies ?? null,
     planGuard,
     targets,
+    master: dependencies?.master ?? defaultMaster,
     onApplied: onCompletionApplied,
+    onReplanExclusion: openReplanExclusion,
   })
   // An addition in flight: the add button waits, so one click is one decision.
   const [adding, setAdding] = useState(false)
@@ -388,6 +514,9 @@ export function SearchPage({ dependencies = defaultDependencies ?? undefined }: 
         setLoadError(caught instanceof Error ? caught.message : '作成リストの読み込みに失敗しました。')
       })
   }, [dependencies])
+  // The Build List read when the add press that turned into a replacement
+  // started: the replacement's "before" for its proposal (18.3).
+  const replacementBeforeRef = useRef<{ targetWeaponId: TargetWeaponId; before: BuildListBefore } | null>(null)
   const onReplacementApplied = useCallback(
     (entry: BuildListEntry, replacedEntryId: BuildListEntryId, planAbandoned: boolean) => {
       // The replaced Entry leaves the mirror in the same update the new one
@@ -400,10 +529,20 @@ export function SearchPage({ dependencies = defaultDependencies ?? undefined }: 
         severity: 'info',
         message: planAbandoned ? BUILD_LIST_REPLACED_PLAN_ABANDONED_MESSAGE : BUILD_LIST_REPLACED_MESSAGE,
       })
+      const tracked = replacementBeforeRef.current
+      replacementBeforeRef.current = null
+      // A replacement of an Entry the Plan does not depend on can propose; an
+      // approved breaking replacement ended the Plan, so the Domain says none.
+      proposeReplan(
+        'single',
+        { operation: 'candidate_replacement', persistedBuildListEntries: [entry] },
+        tracked !== null && tracked.targetWeaponId === entry.targetWeaponId ? tracked.before : null,
+      )
     },
-    [],
+    [proposeReplan],
   )
   const onReplacementRefused = useCallback((message: string) => {
+    replacementBeforeRef.current = null
     setAddFeedback({ severity: 'error', message, buildListLinkLabel: BUILD_LIST_CHECK_LINK_LABEL })
     reloadBuildListEntries()
   }, [reloadBuildListEntries])
@@ -414,7 +553,89 @@ export function SearchPage({ dependencies = defaultDependencies ?? undefined }: 
     planGuard,
     onApplied: onReplacementApplied,
     onRefused: onReplacementRefused,
+    onReplanExclusion: openReplanExclusion,
   })
+  // 「再検索が必要な候補を一括再検索・置換」 (`docs/UI_FLOW.md` 9.3, Issue #347):
+  // the 9.1 search loop over the Targets whose one Entry is stale, replacing
+  // each Entry only when its re-search found a Candidate. One batch at a time,
+  // never beside a single search or the 9.1 batch.
+  const researchBeforeRef = useRef<Promise<BuildListBefore> | null>(null)
+  const researchRunContext = useCallback((): BatchCandidateResearchRunContext | null => {
+    const client = clientRef.current
+    if (!dependencies || !client) return null
+    return {
+      loop: {
+        client,
+        createSearchRunId,
+        // Each Target's input and exclusion are read from the persisted state
+        // right before its search, so an Entry an earlier Target really
+        // replaced is counted; the loop refuses an input ignoring the condition.
+        prepareInput: (options) => dependencies.prepareInput(options),
+        saveCandidates: (targetId, candidates) => dependencies.saveCandidates(targetId, candidates),
+      },
+      request: {
+        // The conditions the screen shows now apply to every Target.
+        routeFilter,
+        settings: { ...settings },
+        master: dependencies.master,
+        calculationContext: {
+          gameVersion: dependencies.master.manifest.gameVersion,
+          masterDataVersion: dependencies.master.manifest.dataVersion,
+          rngEngineVersion: client.engineVersion,
+          appSchemaVersion: CURRENT_CALCULATION_APP_SCHEMA_VERSION,
+        },
+        // Always on, exactly like the 9.1 batch (Issue #290): a replaced
+        // Entry's source is never used by a later Target of this batch.
+        excludeOtherTargetSources: true,
+      },
+    }
+  }, [dependencies, routeFilter, settings])
+  const onResearchStart = useCallback((): Promise<BuildListBefore> => {
+    setBatchSummary(null)
+    setResult(null)
+    setProgress(null)
+    setAddFeedback(null)
+    clearReplanProposal()
+    setSearchError(null)
+    setSearchNotice(null)
+    // The Build List before the batch's first replacement (18.3): returned to
+    // the batch, which replaces nothing before this read settled, so an Entry
+    // the batch replaces is never in it (a failed read is `null` and proposes
+    // nothing, as for the 9.1 batch).
+    const beforeRead = readBuildListBefore()
+    researchBeforeRef.current = beforeRead
+    return beforeRead
+  }, [clearReplanProposal, readBuildListBefore])
+  const onResearchFinish = useCallback((summary: BatchCandidateResearchSummary | null, failure: string | null) => {
+    if (failure) setSearchError(failure)
+    // The mirror, the 登録済み labels, both batch counts and the selection
+    // follow the persisted Build List.
+    reloadBuildListEntries()
+    const beforeRead = researchBeforeRef.current
+    researchBeforeRef.current = null
+    // Only the Entries the batch really replaced can propose - a cancelled or
+    // aborted batch keeps the ones saved before it stopped (18.3).
+    if (summary !== null && beforeRead !== null) {
+      const persisted = summary.outcomes.flatMap((outcome) => (outcome.status === 'replaced' ? [outcome.entry] : []))
+      const sequenceAtFinish = proposalSequenceRef.current
+      void beforeRead.then((before) => {
+        if (proposalSequenceRef.current === sequenceAtFinish) {
+          proposeReplan('batch', { operation: 'batch_replacement', persistedBuildListEntries: persisted }, before)
+        }
+      })
+    }
+  }, [proposeReplan, reloadBuildListEntries])
+  const research = useBatchCandidateResearch({
+    api: dependencies ?? null,
+    runContext: researchRunContext,
+    blocked: searching || batchRunning || adding || replacement.pending !== null || planGuard.busy || completion.pending !== null,
+    onStart: onResearchStart,
+    onFinish: onResearchFinish,
+  })
+  const anyBatchRunning = batchRunning || research.running
+  const researchTargetCount = research.selection?.targets.length ?? 0
+  const researchExcludedCount = research.selection?.excluded.length ?? 0
+  const { reloadSelection: reloadResearchSelection } = research
 
   useEffect(() => {
     if (!dependencies) {
@@ -471,8 +692,18 @@ export function SearchPage({ dependencies = defaultDependencies ?? undefined }: 
     }
   }, [dependencies])
 
+  // The re-search selection follows the persisted state the screen mirrors:
+  // read once the base data is loaded, and again after every change of the
+  // Build List mirror, the Targets or the weapons (a save, a batch, a
+  // completion). The read is the Domain's judgement, never the screen's.
+  useEffect(() => {
+    if (loading) return
+    reloadResearchSelection()
+  }, [buildListEntries, loading, ownedWeapons, reloadResearchSelection, targets])
+
   // Completed Targets are not offered for a new search (`docs/UI_FLOW.md` 8.2).
   const enabledTargets = useMemo(() => selectableSearchTargets(targets), [targets])
+  const reviewRequiredTargets = useMemo(() => reviewRequiredSearchTargets(targets), [targets])
   const targetById = useMemo(() => new Map(targets.map((target) => [target.id, target])), [targets])
   // Registered means the Build List holds an Entry for the Target - stale and
   // legacy duplicates included - and never forbids a single re-search.
@@ -489,11 +720,11 @@ export function SearchPage({ dependencies = defaultDependencies ?? undefined }: 
   const ownedIdeal = useMemo<{ weapons: OwnedGogmaArtianWeapon[]; error: string | null }>(() => {
     if (!selectedTarget || !masterForDisplay || selectedTarget.lifecycleStatus !== 'active') return { weapons: [], error: null }
     try {
-      return { weapons: findOwnedIdealWeaponsForTarget(selectedTarget, ownedWeapons, masterForDisplay), error: null }
+      return { weapons: findOwnedIdealWeaponsForTarget(selectedTarget, ownedWeapons, masterForDisplay, targets), error: null }
     } catch (caught: unknown) {
       return { weapons: [], error: `既所持の理想武器を判定できませんでした: ${caught instanceof Error ? caught.message : String(caught)}` }
     }
-  }, [masterForDisplay, ownedWeapons, selectedTarget])
+  }, [masterForDisplay, ownedWeapons, selectedTarget, targets])
 
   const updateSetting = (key: keyof CandidateSearchSettings, raw: string) => {
     const value = Number(raw)
@@ -501,7 +732,7 @@ export function SearchPage({ dependencies = defaultDependencies ?? undefined }: 
   }
 
   const startSearch = async () => {
-    if (!dependencies || !clientRef.current || targetWeaponId === '' || batchRunning) return
+    if (!dependencies || !clientRef.current || targetWeaponId === '' || anyBatchRunning) return
     const requestId = createSearchRunId()
     const client = clientRef.current
     // Fixed at the press: a Checkbox change while this search runs, or after
@@ -511,11 +742,13 @@ export function SearchPage({ dependencies = defaultDependencies ?? undefined }: 
     setSearchingExcludeOtherTargetSources(excludeOtherTargetSources)
     setSearching(true)
     setBatchSummary(null)
+    research.clearSummary()
     setSearchError(null)
     setSearchNotice(null)
     setAddFeedback(null)
+    // A search itself never proposes a replan; the last save's proposal goes with its result.
+    clearReplanProposal()
     setResult(null)
-    setIntermediateSelection(defaultIntermediateStateSelection())
     setProgress({
       targetWeaponId,
       phase: 'preparing',
@@ -579,7 +812,7 @@ export function SearchPage({ dependencies = defaultDependencies ?? undefined }: 
   }
 
   const batchBlocked =
-    searching || batchRunning || adding || replacement.pending !== null || planGuard.busy || completion.pending !== null
+    searching || anyBatchRunning || adding || replacement.pending !== null || planGuard.busy || completion.pending !== null
 
   const startBatch = () => {
     if (!dependencies || !clientRef.current || batchBlocked || batchTargets.length === 0) return
@@ -589,13 +822,17 @@ export function SearchPage({ dependencies = defaultDependencies ?? undefined }: 
     setBatchRunning(true)
     setBatchCancelling(false)
     setBatchSummary(null)
+    research.clearSummary()
     setBatchProgress(null)
     setResult(null)
     setProgress(null)
-    setIntermediateSelection(defaultIntermediateStateSelection())
     setAddFeedback(null)
+    clearReplanProposal()
     setSearchError(null)
     setSearchNotice(null)
+    // The Build List before the batch's first addition (18.3): every addition
+    // waits for this read, so an Entry the batch adds is never in it.
+    const beforeRead = readBuildListBefore()
     const run = runBatchCandidateSearch(
       {
         targets: batchTargets,
@@ -621,7 +858,10 @@ export function SearchPage({ dependencies = defaultDependencies ?? undefined }: 
         // is counted; the batch refuses an input that ignores the condition.
         prepareInput: (options) => dependencies.prepareInput(options),
         saveCandidates: (targetId, candidates) => dependencies.saveCandidates(targetId, candidates),
-        addCandidate: (candidate, target, selection) => dependencies.addCandidate(candidate, target, selection),
+        addCandidate: async (candidate, target) => {
+          await beforeRead
+          return dependencies.addCandidate(candidate, target)
+        },
       },
       (nextProgress) => {
         if (batchTokenRef.current === token) setBatchProgress(nextProgress)
@@ -639,6 +879,18 @@ export function SearchPage({ dependencies = defaultDependencies ?? undefined }: 
       if (failure) setSearchError(failure)
       // The 登録済み labels and the batch count follow the persisted Build List.
       reloadBuildListEntries()
+      // Only the Entries the batch really added can propose - a cancelled or
+      // aborted batch keeps the ones saved before it stopped (18.3).
+      if (summary !== null) {
+        const persisted = summary.outcomes.flatMap((outcome) => (outcome.status === 'added' ? [outcome.entry] : []))
+        const sequenceAtFinish = proposalSequenceRef.current
+        void beforeRead.then((before) => {
+          // Another operation started meanwhile: this batch's proposal no longer belongs on screen.
+          if (proposalSequenceRef.current === sequenceAtFinish) {
+            proposeReplan('batch', { operation: 'batch_addition', persistedBuildListEntries: persisted }, before)
+          }
+        })
+      }
     }
     void run.promise.then(
       (summary) => finish(summary, null),
@@ -659,37 +911,39 @@ export function SearchPage({ dependencies = defaultDependencies ?? undefined }: 
       return
     }
     if (adding || replacement.pending !== null || planGuard.busy) return
-    // The selection this click registers; a replacement sends exactly it.
-    const intermediateStateSelection = intermediateSelection
     setAdding(true)
     setAddFeedback(null)
+    clearReplanProposal()
+    replacementBeforeRef.current = null
     try {
-      const result = await dependencies.addCandidate(candidate, target, intermediateStateSelection)
+      // The Build List before this press's save, for its replan proposal (18.3).
+      const before = await readBuildListBefore()
+      const result = await dependencies.addCandidate(candidate, target)
       switch (result.status) {
         case 'added':
           setBuildListEntries((current) =>
             current.some(({ id }) => id === result.entry.id) ? current : [...current, result.entry],
           )
           setAddFeedback({ severity: 'info', message: 'ビルドリストへ追加しました。' })
+          proposeReplan('single', { operation: 'candidate_addition', persistedBuildListEntries: [result.entry] }, before)
           return
         case 'duplicate':
-          // An equivalent Candidate already in the Build List keeps its own
-          // selection: nothing was written (`docs/UI_FLOW.md` 9). The mirrored
-          // Entry turns the Candidate's state to "added", whose permanent
-          // guidance already carries the duplicate sentence, so no second copy
-          // of it is shown as feedback. The Entry's own selection is never
-          // copied back into this screen's draft.
+          // An equivalent Candidate already in the Build List is kept as it
+          // is: nothing was written (`docs/UI_FLOW.md` 9). The mirrored Entry
+          // turns the Candidate's state to "added", whose permanent guidance
+          // already carries the duplicate sentence, so no second copy of it is
+          // shown as feedback.
           setBuildListEntries((current) =>
             current.some(({ id }) => id === result.entry.id) ? current : [...current, result.entry],
           )
           return
         case 'replacement_required':
           // Nothing was written: the user confirms the replacement first.
+          replacementBeforeRef.current = { targetWeaponId: target.id, before }
           replacement.begin({
             request: {
               candidate,
               target,
-              intermediateStateSelection,
               expectedExistingEntryId: result.existingEntry.id,
             },
             existingEntry: result.existingEntry,
@@ -717,6 +971,18 @@ export function SearchPage({ dependencies = defaultDependencies ?? undefined }: 
   }
 
   const progressTarget = progress ? targetById.get(progress.targetWeaponId) : undefined
+  /** The proposal of the last save, where it belongs (the single add area or the batch summary); named, never by ID. */
+  const replanProposalNotice = (source: SearchReplanProposal['source']): ReactNode => {
+    if (replanProposal === null || replanProposal.source !== source) return null
+    const { planId, targetWeaponIds } = replanProposal
+    return (
+      <RunningPlanReplanProposalNotice
+        targetNames={targetWeaponIds.map((id) => targetById.get(id)?.name ?? RUNNING_PLAN_REPLAN_UNNAMED_TARGET)}
+        onOpen={() => openBuildListReplan(runningPlanReplanInclusionRequest(planId, targetWeaponIds))}
+        onDismiss={clearReplanProposal}
+      />
+    )
+  }
 
   return (
     <PageShell title="候補検索" description="目標武器ごとに、理想品へ到達する作成ルートを検索して作成リストへ追加します。">
@@ -734,8 +1000,13 @@ export function SearchPage({ dependencies = defaultDependencies ?? undefined }: 
             {completionNotice}
           </Alert>
         )}
-        {!loading && !loadError && enabledTargets.length === 0 && (
+        {!loading && !loadError && enabledTargets.length === 0 && reviewRequiredTargets.length === 0 && (
           <Alert severity="info">目標武器を登録してください。</Alert>
+        )}
+        {!loading && !loadError && enabledTargets.length === 0 && reviewRequiredTargets.length > 0 && (
+          <Alert severity="warning">
+            検索できる目標武器がありません。完成条件の再設定が必要な目標武器は、目標武器画面で内容を確認して保存すると検索できるようになります。
+          </Alert>
         )}
         {!loadError && enabledTargets.length > 0 && (
           <Paper
@@ -752,7 +1023,7 @@ export function SearchPage({ dependencies = defaultDependencies ?? undefined }: 
                 {/* One Target per search: reconciling several Targets is the
                     Production Planner's job (`docs/UI_FLOW.md` 9). */}
                 <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                  1回の検索は目標武器1件が対象です。理想品へ到達する作成ルートを探し、スキル進行と復元ボーナス進行それぞれの途中で妥協条件を満たす状態を候補として表示します。途中採用する状態を選ばなければ理想品まで進みます。作成リストに登録済みの目標武器には「登録済み」を表示します。
+                  1回の検索は目標武器1件が対象です。目標武器の完成条件（いずれかの完成ボーナス構成と完成スキル条件）を満たす作成ルートを探します。作成リストに登録済みの目標武器には「登録済み」を表示します。
                 </Typography>
               </Box>
               <Box
@@ -784,6 +1055,13 @@ export function SearchPage({ dependencies = defaultDependencies ?? undefined }: 
                         <TargetOptionLabel name={target.name} registered={registeredTargetIds.has(target.id)} />
                       </MenuItem>
                     ))}
+                    {/* Not selectable until the user reviews and saves the
+                        completion condition (`docs/UI_FLOW.md` 8.4 / 9). */}
+                    {reviewRequiredTargets.map((target) => (
+                      <MenuItem value={target.id} key={target.id} disabled sx={{ whiteSpace: 'normal', overflowWrap: 'anywhere' }}>
+                        {`${target.name}（${COMPLETION_CONDITION_REVIEW_CHIP_LABEL}・選択不可）`}
+                      </MenuItem>
+                    ))}
                   </Select>
                 </FormControl>
                 <FormControl fullWidth sx={{ minWidth: 0 }}>
@@ -807,7 +1085,7 @@ export function SearchPage({ dependencies = defaultDependencies ?? undefined }: 
                   weapons={ownedIdeal.weapons}
                   master={masterForDisplay}
                   onComplete={(weapon) => completion.begin(selectedTarget, weapon)}
-                  disabled={planGuard.busy || completion.pending !== null || batchRunning}
+                  disabled={planGuard.busy || completion.pending !== null || anyBatchRunning}
                 />
               )}
               {defaultsLoadFailed && (
@@ -859,7 +1137,7 @@ export function SearchPage({ dependencies = defaultDependencies ?? undefined }: 
                   <Button
                     variant="contained"
                     onClick={() => void startSearch()}
-                    disabled={searching || batchRunning || targetWeaponId === ''}
+                    disabled={searching || anyBatchRunning || targetWeaponId === ''}
                     sx={{ minHeight: 44, px: 3 }}
                   >
                     検索開始
@@ -872,6 +1150,17 @@ export function SearchPage({ dependencies = defaultDependencies ?? undefined }: 
                   >
                     未登録を一括検索・追加（{batchTargets.length}件）
                   </Button>
+                  {/* A separate operation from the 9.1 batch (`docs/UI_FLOW.md`
+                      9.3): the count is the Domain's selection, and a failed
+                      selection read withholds it instead of showing 0. */}
+                  <Button
+                    variant="outlined"
+                    onClick={research.openConfirmation}
+                    disabled={batchBlocked || research.selection === null || researchTargetCount === 0}
+                    sx={{ minHeight: 44, px: 3 }}
+                  >
+                    {batchResearchButtonLabel(researchTargetCount)}
+                  </Button>
                 </Stack>
                 <Typography variant="body2" color="text.secondary">
                   検索中は進捗を表示し、いつでもキャンセルできます。
@@ -881,8 +1170,33 @@ export function SearchPage({ dependencies = defaultDependencies ?? undefined }: 
                 <Typography variant="body2" color="text.secondary">
                   {batchTargets.length === 0
                     ? '作成リストに未登録の目標武器はありません。'
-                    : '一括検索・追加では、作成リストに未登録の目標武器を現在の作成ルートと探索量の上限で1件ずつ順に検索し、見つかった理想品候補を作成リストへ追加します。途中採用する状態は選ばず（理想品まで進む）、改善優先は「生産計画に任せる」で登録します。'}
+                    : '一括検索・追加では、作成リストに未登録の目標武器を現在の作成ルートと探索量の上限で1件ずつ順に検索し、見つかった完成条件を満たす候補を作成リストへ追加します。'}
                 </Typography>
+                {/* The counts are the Domain selection's: Targets to re-search
+                    and stale candidates left alone are told apart, the reasons
+                    can be read even with nothing to re-search, and only no
+                    stale candidate at all reads as "nothing to re-search". */}
+                {research.selectionError !== null ? (
+                  <Alert severity="warning">{research.selectionError}</Alert>
+                ) : research.selection !== null && researchTargetCount === 0 && researchExcludedCount > 0 ? (
+                  <Alert severity="info">{batchResearchExcludedOnlyNote(researchExcludedCount)}</Alert>
+                ) : (
+                  <Typography variant="body2" color="text.secondary">
+                    {research.selection !== null && researchTargetCount === 0 ? BATCH_RESEARCH_NONE_NOTE : BATCH_RESEARCH_DESCRIPTION}
+                  </Typography>
+                )}
+                {research.selection !== null && researchTargetCount > 0 && researchExcludedCount > 0 && (
+                  <Typography variant="body2" color="text.secondary">
+                    {batchResearchCountsNote(researchTargetCount, researchExcludedCount)}
+                  </Typography>
+                )}
+                {research.selection !== null && researchExcludedCount > 0 && (
+                  <BatchCandidateResearchExclusionDisclosure
+                    excluded={research.selection.excluded}
+                    title={batchResearchExcludedDisclosureTitle(researchExcludedCount)}
+                    headingLevel="h3"
+                  />
+                )}
               </Stack>
               {searchNotice && <Alert severity="info">{searchNotice}</Alert>}
               {searchError && <Alert severity="error">{searchError}</Alert>}
@@ -892,7 +1206,21 @@ export function SearchPage({ dependencies = defaultDependencies ?? undefined }: 
         {batchRunning && batchProgress && (
           <BatchCandidateSearchProgressPanel progress={batchProgress} cancelling={batchCancelling} onCancel={cancelBatch} />
         )}
-        {!batchRunning && batchSummary && <BatchCandidateSearchSummaryPanel summary={batchSummary} />}
+        {!batchRunning && batchSummary && (
+          <BatchCandidateSearchSummaryPanel summary={batchSummary} supplement={replanProposalNotice('batch')} />
+        )}
+        {research.running && research.progress && (
+          <BatchCandidateSearchProgressPanel
+            progress={research.progress}
+            cancelling={research.cancelling}
+            onCancel={research.cancel}
+            title={BATCH_RESEARCH_PROGRESS_TITLE}
+            cancelLabel={BATCH_RESEARCH_CANCEL_LABEL}
+          />
+        )}
+        {!research.running && research.summary && (
+          <BatchCandidateResearchSummaryPanel summary={research.summary} supplement={replanProposalNotice('batch')} />
+        )}
         {searching && progress && (
           <Paper
             component="section"
@@ -997,15 +1325,14 @@ export function SearchPage({ dependencies = defaultDependencies ?? undefined }: 
                   </Alert>
                 )
               })}
-              {/* No Ideal inside the configured extent is never a statement that
-                  no Ideal exists, and a compromise state found on the way is
-                  deliberately not offered: only a lane state of a real Ideal
-                  Route can be an intermediate state (`docs/SEARCH_SPEC.md` 5.7). */}
+              {/* No Candidate inside the configured extent is never a statement
+                  that none exists, and a state that does not meet the completion
+                  condition is never offered on its own (`docs/SEARCH_SPEC.md` 5.7). */}
               {targetResult.candidate === null && (
                 <Alert severity="info">
                   <Stack spacing={1}>
                     <Typography variant="body2">
-                      現在の探索範囲では理想品が見つかりませんでした。探索量の上限を上げると見つかる場合があります。詳細設定の「通常アーティア最大進行量」「復元ボーナス最大進行量」「スキル最大進行量」を見直してください。
+                      現在の探索範囲では完成条件を満たす候補が見つかりませんでした。探索量の上限を上げると見つかる場合があります。詳細設定の「通常アーティア最大進行量」「復元ボーナス最大進行量」「スキル最大進行量」を見直してください。
                     </Typography>
                     {/* Said only when this search really excluded a weapon;
                         the excluded weapons are never searched again on their own. */}
@@ -1025,30 +1352,33 @@ export function SearchPage({ dependencies = defaultDependencies ?? undefined }: 
                   searchSourceExclusion={sourceExclusion}
                   debugMode={debugMode}
                   buildListStatus={buildListStatus}
-                  intermediateStateSelection={intermediateSelection}
-                  onIntermediateStateSelectionChange={setIntermediateSelection}
                   onAdd={(selected) => void addToBuildList(selected)}
                   addDisabled={adding || replacement.pending !== null || planGuard.busy}
                   addFeedback={
-                    addFeedback && (
-                      <Alert severity={addFeedback.severity}>
-                        <Stack spacing={1.5} sx={{ alignItems: 'flex-start' }}>
-                          <Typography variant="body2" sx={{ overflowWrap: 'anywhere' }}>
-                            {addFeedback.message}
-                          </Typography>
-                          {addFeedback.buildListLinkLabel && (
-                            <Button
-                              component={RouterLink}
-                              to="/build-list"
-                              variant="outlined"
-                              color="inherit"
-                              sx={{ minHeight: 44 }}
-                            >
-                              {addFeedback.buildListLinkLabel}
-                            </Button>
-                          )}
-                        </Stack>
-                      </Alert>
+                    (addFeedback !== null || replanProposal?.source === 'single') && (
+                      <Stack spacing={1.5} sx={{ minWidth: 0 }}>
+                        {addFeedback && (
+                          <Alert severity={addFeedback.severity}>
+                            <Stack spacing={1.5} sx={{ alignItems: 'flex-start' }}>
+                              <Typography variant="body2" sx={{ overflowWrap: 'anywhere' }}>
+                                {addFeedback.message}
+                              </Typography>
+                              {addFeedback.buildListLinkLabel && (
+                                <Button
+                                  component={RouterLink}
+                                  to="/build-list"
+                                  variant="outlined"
+                                  color="inherit"
+                                  sx={{ minHeight: 44 }}
+                                >
+                                  {addFeedback.buildListLinkLabel}
+                                </Button>
+                              )}
+                            </Stack>
+                          </Alert>
+                        )}
+                        {replanProposalNotice('single')}
+                      </Stack>
                     )
                   }
                 />
@@ -1090,6 +1420,8 @@ export function SearchPage({ dependencies = defaultDependencies ?? undefined }: 
         <OwnedIdealCompletionDialog
           pending={completion.pending}
           affectedTargets={completion.affectedTargets}
+          otherSatisfiedTargets={completion.otherSatisfiedTargets}
+          unrecordedCompletedTargets={completion.unrecordedCompletedTargets}
           submitting={completion.submitting}
           error={completion.error}
           onCancel={completion.cancel}
@@ -1106,6 +1438,11 @@ export function SearchPage({ dependencies = defaultDependencies ?? undefined }: 
             onConfirm={() => void replacement.confirm()}
           />
         )}
+        <BatchCandidateResearchDialog
+          selection={research.confirming}
+          onCancel={research.cancelConfirmation}
+          onConfirm={research.start}
+        />
         <PlanBreakingChangeDialog controller={planGuard} />
       </Stack>
     </PageShell>

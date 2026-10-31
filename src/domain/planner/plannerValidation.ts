@@ -6,8 +6,10 @@ import type {
   InventoryChange,
   OwnedGogmaArtianWeapon,
   OwnedWeapon,
+  OwnedWeaponId,
   RestorationBonusSet,
   TargetWeapon,
+  TargetWeaponId,
 } from '../models/publicTypes'
 import {
   isBlindCreateNormalArtianOperation,
@@ -22,8 +24,11 @@ import {
   findBuildListTargetDuplicates,
   validateBuildListEntryReplacements,
 } from '../buildList'
-import { validateTargetPreferredOwnedWeapons } from '../target'
-import { derivePlannerCheckpointRequirements } from './plannerCheckpoints'
+import {
+  collectCompletionAssignedOwnedWeaponIds,
+  isCompletionAssignedElsewhere,
+  validateTargetPreferredOwnedWeapons,
+} from '../target'
 import { derivePlannerPlanningTargets } from './plannerPlanningTargets'
 import { collectReferencedOwnedWeaponIds } from '../models/hashing'
 import { deriveRngCapabilities } from '../rng/capabilities'
@@ -305,6 +310,7 @@ function currentEntryEligibility(
   dependencies: PlannerDependencies,
   entry: BuildListEntry,
   supportCache: PlannerPredictionSupportCache,
+  completionAssignments: ReadonlyMap<OwnedWeaponId, TargetWeaponId>,
 ): { valid: ValidatedBuildListEntry | null; reason: string; warningKind: PlannerWarning['kind'] } {
   const target = input.targetWeapons.find(({ id }) => id === entry.targetWeaponId) ?? null
   const staleness = evaluateBuildListEntryStaleness(entry, {
@@ -321,7 +327,15 @@ function currentEntryEligibility(
     return { valid: null, reason: 'references a completed TargetWeapon.', warningKind: 'completed_target_excluded' }
   }
   if (!isTargetWeaponPlanningEligible(target)) {
-    return { valid: null, reason: 'references a disabled TargetWeapon.', warningKind: 'build_list_entry_stale' }
+    // A Target whose migrated completion condition awaits the user's review is
+    // excluded by the same path as a disabled one (`docs/PLANNER_SPEC.md` 20.2).
+    return {
+      valid: null,
+      reason: target.isEnabled
+        ? 'references a TargetWeapon whose completion condition needs review.'
+        : 'references a disabled TargetWeapon.',
+      warningKind: 'build_list_entry_stale',
+    }
   }
   if (dependencies.rngEngine.version !== input.calculationContext.rngEngineVersion) {
     return { valid: null, reason: 'uses an RNG Engine incompatible with CalculationContext.', warningKind: 'calculation_context_incompatible' }
@@ -334,6 +348,19 @@ function currentEntryEligibility(
     const weapon = input.ownedWeapons.find(({ id }) => id === ownedWeaponId)
     if (!weapon || !validateOwnedWeapon(weapon).isValid) {
       return { valid: null, reason: `references an invalid or missing OwnedWeapon '${ownedWeaponId}'.`, warningKind: 'build_list_entry_stale' }
+    }
+  }
+  // A Route referencing a weapon another Target was completed with - the
+  // weapon of a zero-operation Candidate included - is left out of this run
+  // alone, exactly like a protected destructive use, and the Entry stays not
+  // stale (Issue #334, `docs/PLANNER_SPEC.md` 21.4).
+  const assignedReference = collectReferencedOwnedWeaponIds(entry.candidateSnapshot.route)
+    .find((ownedWeaponId) => isCompletionAssignedElsewhere(completionAssignments, ownedWeaponId, target.id))
+  if (assignedReference !== undefined) {
+    return {
+      valid: null,
+      reason: `references OwnedWeapon '${assignedReference}', the completion of TargetWeapon '${completionAssignments.get(assignedReference)}'.`,
+      warningKind: 'completion_assigned_weapon_required',
     }
   }
   const routeValidation = validateBuildRoute(
@@ -407,6 +434,9 @@ export function validatePlannerInput(
   const validConflictResolutions: PlannerConflictResolution[] = []
   const warningKeys = new Map<string, PlannerWarning>()
   const supportCache: PlannerPredictionSupportCache = new Map()
+  // The completion assignments of every input Target (Issue #334, 21.4), one
+  // derivation for the whole run.
+  const completionAssignments = collectCompletionAssignedOwnedWeaponIds(input.targetWeapons)
   const eligibilityByEntryId = new Map<string, ReturnType<typeof currentEntryEligibility>>()
   const validBuildListEntries: ValidatedBuildListEntry[] = []
   const excludedBuildListEntries: ExcludedBuildListEntry[] = []
@@ -417,15 +447,16 @@ export function validatePlannerInput(
   entriesByStableId.forEach((entry) => {
       // A malformed intermediate state selection is corrupted planning input,
       // not a stale Entry: it fails the whole input closed so that the
-      // selection is never read as empty and no other Entry of the Target
-      // stands in for it (`docs/PLANNER_SPEC.md` 7.5.9).
+      // selection is never read as empty (`docs/PLANNER_SPEC.md` 7.5.9). A
+      // well-formed selection on a valid Entry fails the input closed when the
+      // run starts (`createInitialPlannerSearchState()`, 20.10).
       const selection = validateBuildListEntryIntermediateStateSelection(entry)
       if (!selection.isValid) {
         const detail = selection.issues
           .map(({ path, message }) => `${path}: ${message}`)
           .join(' ')
         const message =
-          `BuildListEntry '${entry.id}' has an invalid intermediate state selection (${detail}). Clear that selection in the Build List before planning.`
+          `BuildListEntry '${entry.id}' has an invalid intermediate state selection (${detail}). Search its Target again and replace the BuildListEntry before planning.`
         issues.push(issue(`buildListEntries.${entry.id}.intermediateStateSelection`, 'invalid_state', message))
         warnings.push({ kind: 'invalid_checkpoint_selection', message })
       }
@@ -434,6 +465,7 @@ export function validatePlannerInput(
         dependencies,
         entry,
         supportCache,
+        completionAssignments,
       )
       eligibilityByEntryId.set(entry.id, eligibility)
       if (eligibility.valid) {
@@ -490,19 +522,6 @@ export function validatePlannerInput(
       ).issues,
     )
   }
-
-  // Collection-level checkpoint invariant (`docs/DATA_MODEL.md` 9.4,
-  // `docs/PLANNER_SPEC.md` 7.5.7): two checkpoint-selected Entries of one
-  // Target leave the user's intent unknown, so the input fails closed. The
-  // Planner never picks one by score, cost, or position.
-  derivePlannerCheckpointRequirements(
-    validBuildListEntries.map(({ entry }) => entry),
-  ).violations.forEach(({ targetWeaponId, buildListEntryIds }) => {
-    const message =
-      `TargetWeapon '${targetWeaponId}' has ${buildListEntryIds.length} BuildListEntries with a selected intermediate state (${buildListEntryIds.join(', ')}); at most one is allowed. Clear the selection of all but one in the Build List.`
-    issues.push(issue('buildListEntries', 'invalid_structure', message))
-    warnings.push({ kind: 'multiple_selected_checkpoint_entries', message })
-  })
 
   // The same collection-level authority the save Service and Candidate Search
   // use, so a preference pointing at a missing, incompatible, protected, or

@@ -73,11 +73,13 @@ const prepareProductionPlannerInteraction: PreparePlannerInteractionCalculation 
         context.excludedBuildListEntries,
         context.excludedBuildListEntryWarnings,
       ),
+      // Calculation schema 11..18 also projected each conflict's checkpoint
+      // participants; no current conflict carries one (Issue #100,
+      // `docs/PLANNER_SPEC.md` 20.7 / 20.10).
       currentConflicts: context.initialConflictDetection.conflicts.map(
-        ({ id, buildListEntryIds, checkpointParticipants }) => ({
+        ({ id, buildListEntryIds }) => ({
           id,
           buildListEntryIds: [...buildListEntryIds],
-          checkpointParticipants: structuredClone(checkpointParticipants ?? []),
         }),
       ),
     }

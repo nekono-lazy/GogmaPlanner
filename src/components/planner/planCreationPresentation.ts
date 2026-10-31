@@ -1,7 +1,14 @@
 import { RepositoryError } from '../../db/repositoryError'
 import { ExecutionRuntimeError } from '../../domain/execution'
 import type { PlanCreationMethodSelection } from '../../domain/planner/buildListOptimization'
-import type { PlanCreationNotStartedReason, PlanCreationOperation } from '../../services/planner/planCreationService'
+import {
+  isOrdinaryPlannerAuxiliaryOffered,
+  isOrdinaryPlannerAuxiliaryOfferedForPreparation,
+  type PlanCreationNotStartedReason,
+  type PlanCreationOperation,
+  type PlanCreationPreparation,
+  type PlanCreationSessionState,
+} from '../../services/planner/planCreationService'
 import { ORDINARY_PLANNER_AUXILIARY_LABEL } from './buildListOptimizationPresentation'
 import { productionPlannerDetailSettingsTitle } from './productionPlannerSettingsPresentation'
 
@@ -40,7 +47,7 @@ export function planCreationUnsupportedLead(validEntryCount: number): string {
 }
 
 export const PLAN_CREATION_INVALID_INPUT_MESSAGE =
-  '作成リストに整理が必要な項目があるため、生産計画を作成できません。候補一覧で「要整理」と表示された目標武器や、途中採用する状態の選択を確認してください。'
+  '作成リストに整理が必要な項目があるため、生産計画を作成できません。候補一覧で「要整理」と表示された目標武器を確認してください。以前の形式の候補が残っている場合は、候補検索で検索し直して置き換えてください。'
 
 export const PLAN_CREATION_NO_VALID_ENTRY_MESSAGE =
   '有効な候補が無いため、生産計画を作成できません。再検索が必要な候補や完了済みの目標武器の候補は、計画の対象になりません。候補検索で候補を作成リストへ追加し直してください。'
@@ -60,7 +67,7 @@ export const PLAN_CREATION_DRAFT_REPLACED_NOTE =
 
 /** While a calculation, a save or an adoption is in progress, the Build List is not edited on this screen (`docs/UI_FLOW.md` 10.4). */
 export const PLAN_CREATION_BUILD_LIST_LOCKED_NOTE =
-  '生産計画の計算・保存・採用の確認中は、作成リストの変更（途中採用する状態・改善優先の変更、削除）はできません。'
+  '生産計画の計算・保存・採用の確認中は、作成リストの変更（候補の削除）はできません。'
 
 /** The valid Entry count of a judgement: the Domain's `validBuildListEntries`, never a count of the screen's own. */
 export function planCreationValidEntryCount(selection: PlanCreationMethodSelection): number {
@@ -131,8 +138,6 @@ export function ordinaryPlannerRetryAction(operation: PlanCreationOperation): st
 
 // ------------------------------------------------------------------------------------------------ adoption
 
-export const ADOPTION_INSPECTING_MESSAGE = 'この試算を採用できるか確認しています…'
-
 /** Which typed cause refused an adoption (`docs/UI_FLOW.md` 10.4 「採用」, `docs/PLANNER_SPEC.md` 17.11). */
 export type BuildListOptimizationAdoptionRefusalCause =
   /** The state moved after the calculation started (the input token, a Draft, a running Plan, a stale generated Entry). */
@@ -190,6 +195,12 @@ export function presentBuildListOptimizationAdoptionRefusal(caught: unknown): Bu
           'この試算は保存できる内容ではなかったため、採用できませんでした',
           '保存前の確認で、この試算が保存できる条件を満たしていないことが分かりました。',
         )
+      case 'plan_completion_assignment_conflict':
+        return refused(
+          'not_persistable',
+          'この試算は1本の武器を2件の目標武器の完成品にするため、採用できませんでした',
+          '1本の所持武器を2件の目標武器の完成品にする計画、または別の目標武器の完成に使った武器を使う計画は保存できません。',
+        )
       case 'transaction_failed':
         return refused('save_failed', '保存に失敗したため、採用できませんでした', '保存処理が完了しませんでした。')
       default:
@@ -215,3 +226,48 @@ export function presentBuildListOptimizationAdoptionRefusal(caught: unknown): Bu
 
 /** The ordinary Planner auxiliary run's own Accordion reference, for the incomplete display (`docs/UI_FLOW.md` 10.1). */
 export const PLAN_CREATION_SETTINGS_HEADING = productionPlannerDetailSettingsTitle
+
+// ------------------------------------------------------------------------------------------------ the ordinary Planner settings
+
+/**
+ * The pre-start judgement as the screen holds it (`docs/UI_FLOW.md` 10.4): a settled one, or a re-read still running with the last
+ * settled one kept as `previous` - only for what must not flicker (the ordinary Planner settings, Issue #359), never shown as current.
+ */
+export type PlanCreationPreStartView =
+  | { status: 'loading'; previous?: PlanCreationPreparation }
+  | { status: 'ready'; preparation: PlanCreationPreparation }
+
+/**
+ * Whether 「生産計画の作成」 shows 「詳細設定（通常Planner用）」 (Issue #359, `docs/UI_FLOW.md` 10.0 「表示する条件」). Only an ordinary
+ * Planner operation reads 「最大計画ステップ数」 (U7), so the settings are shown while one is offered or has something to say, and stay out
+ * of the standard global optimization's way. What the operations actually do comes first; the pre-start judgement only stands in while
+ * no press has decided anything, because a press judges afresh and may have outdated it:
+ *
+ *   1. an auxiliary press reading or running (always the ordinary Planner), or refused for an invalid setting: shown
+ *   2. a primary press that started a method decides by its own state: the global optimization only while its result offers the
+ *      auxiliary operation (`isOrdinaryPlannerAuxiliaryOffered()`; never while it runs, for an `optimized` Preview, a cancellation or a
+ *      failure), the ordinary Planner always (its incomplete display points at the setting)
+ *   3. a primary press that started nothing: shown when its fresh judgement says the setting is invalid or offers the auxiliary
+ *      operation; otherwise the judgement read after it
+ *   4. otherwise (no press, a press still reading, one cancelled before a calculation) the pre-start judgement: the ordinary Planner (one
+ *      valid Entry), or the auxiliary operation offered beside its reasons. While it is read again, the last settled judgement keeps the
+ *      settings in place, so a re-read neither hides them nor takes the focus of a user editing them (the controller keeps no judgement
+ *      older than a press that judged afresh)
+ *
+ * It reads the Application's typed offers and the session state only; it judges no Planner availability of its own.
+ */
+export function isPlanCreationOrdinaryPlannerSettingsShown(
+  preStart: PlanCreationPreStartView,
+  state: PlanCreationSessionState,
+): boolean {
+  const { primary, auxiliary } = state
+  if (auxiliary.status === 'preparing' || auxiliary.status === 'ordinary_planner') return true
+  if (auxiliary.status === 'not_started' && auxiliary.reason.kind === 'planner_options_invalid') return true
+  if (primary.status === 'build_list_optimization') return isOrdinaryPlannerAuxiliaryOffered(state)
+  if (primary.status === 'ordinary_planner') return true
+  if (primary.status === 'not_started' && primary.reason.kind === 'planner_options_invalid') return true
+  if (isOrdinaryPlannerAuxiliaryOffered(state)) return true
+  const preparation = preStart.status === 'ready' ? preStart.preparation : preStart.previous ?? null
+  if (preparation === null || preparation.kind !== 'judged') return false
+  return preparation.selection.kind === 'ordinary_planner' || isOrdinaryPlannerAuxiliaryOfferedForPreparation(preparation)
+}

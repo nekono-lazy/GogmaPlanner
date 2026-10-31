@@ -3,7 +3,6 @@ import type {
   RecalculationReason,
   CompromiseConditionMatch,
   ConflictKind,
-  ImprovementPreference,
   NormalArtianRarity,
   OwnedWeaponStatus,
   PlanStepOperationType,
@@ -63,15 +62,14 @@ export const restorationBonusScopeGogmaHelpText =
 
 export const skillMatchModeLabels: Record<SkillMatchMode, string> = {
   all: 'すべて一致',
-  any: 'いずれか一致',
 }
 
 /**
- * How one compromise checkpoint state rates on each Target axis.
+ * How one compromise checkpoint state rated on each Target axis.
  *
- * Explanatory display only: an intermediate state is never an independent
- * Candidate, so these labels classify a lane state of the canonical Ideal
- * Route and the compromise checkpoint it forms, not a category.
+ * Kept only for the legacy `PlanStep.checkpointMilestones` a historical Plan
+ * still shows (`ProductionPlanStepList`); Issue #100 abolished the compromise
+ * checkpoints, so no current Candidate, Entry or Plan produces one.
  */
 export const compromiseBonusMatchLabels: Record<
   CompromiseConditionMatch['bonus'],
@@ -88,23 +86,6 @@ export const compromiseSkillMatchLabels: Record<
 > = {
   ideal: '理想',
   practical: '実用',
-}
-
-/** The improvement order the user asks the Planner to prefer after the checkpoint. */
-export const improvementPreferenceLabels: Record<ImprovementPreference, string> = {
-  planner: '生産計画に任せる',
-  skill_first: 'スキルを優先',
-  bonus_first: '復元ボーナスを優先',
-}
-
-/** The short badge one compromise checkpoint shows: the weaker of its two axes. */
-export function compromiseCheckpointBadgeLabel(
-  conditionMatch: CompromiseConditionMatch,
-): string {
-  if (conditionMatch.bonus === 'alternative') return '代替'
-  return conditionMatch.bonus === 'practical' || conditionMatch.skill === 'practical'
-    ? '実用'
-    : '理想'
 }
 
 export const routeKindLabels: Record<RouteKind, string> = {
@@ -217,22 +198,16 @@ export const plannerWarningLabels: Record<PlannerWarningKind, string> = {
   rng_state_missing: '必要なRNG状態または予測機能が不足しています',
   rng_prediction_unsupported: '指定されたRNG予測入力には対応していません',
   protected_weapon_required: '保護中の武器が必要なため実行できません',
+  completion_assigned_weapon_required: '別の目標武器の完成に使った武器が必要なため使えません',
   build_list_entry_stale: '再検索が必要なビルドリスト項目があります',
   calculation_context_incompatible: '計算に使用したバージョンに互換性がありません',
-  all_targets_already_satisfied: 'すべての目標武器をすでに満たしています',
   invalid_conflict_resolution: '選択した競合解決を現在の状態へ適用できません',
   max_steps_reached: '計画ステップ数の上限に到達しました',
-  multiple_selected_checkpoint_entries:
-    '同じ目標武器に途中採用する状態を選択した候補が2件以上あります。作成リストで片方の選択を解除してください',
-  selected_checkpoint_target_already_ideal:
-    '既に理想品を所持している目標武器に途中採用する状態が選択されています。作成リストでその選択を解除してください',
-  selected_checkpoint_fixes_target_entry:
-    '途中採用する状態を選択した候補がある目標武器では、その候補だけを作成ルートとして扱い、同じ目標武器の他の候補は使用しません',
   completed_target_excluded: '完了済みの目標武器は生産計画の対象外です',
   duplicate_build_list_entries_for_target:
     '同じ目標武器に複数の作成リスト候補が登録されています。使用する候補を1件にしてください',
   invalid_checkpoint_selection:
-    '途中採用する状態の選択内容が候補の内容と一致しません。作成リストでその候補の選択を解除し、必要なら候補を追加し直してください',
+    '途中採用する状態の選択は現在の生産計画では使用できません。目標武器を再検索して候補を置き換えてください',
 }
 
 export const candidateRouteFilterLabels: Record<CandidateRouteFilter, string> = {
@@ -277,6 +252,7 @@ export const skippedRouteReasonLabels: Record<SkippedRouteReason, string> = {
   skill_prediction_unsupported: 'スキル予測は現在のRNGエンジンで未対応です',
   gogma_prediction_unsupported: '巨戟アーティア予測は現在のRNGエンジンで未対応です',
   source_excluded_for_other_targets: '使える所持武器が、他の目標武器で使用するため除外したものだけでした',
+  source_completion_assigned: '使える所持武器が、別の目標武器の完成に使った武器だけでした',
 }
 
 export const staleReasonLabels: Record<BuildListEntryStaleReason, string> = {

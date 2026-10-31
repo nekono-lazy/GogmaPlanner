@@ -8,6 +8,10 @@ import type {
   DomainValidationIssue,
   DomainValidationResult,
 } from '../models/validation'
+import {
+  collectCompletionAssignedOwnedWeaponIds,
+  validateTargetCompletionAssignments,
+} from './completionAssignment'
 
 function issue(
   path: string,
@@ -25,16 +29,20 @@ function issue(
  * (`AGENTS.md` Owned Weapon Rules). Both Normal and Gogma weapons qualify, and
  * `status` is deliberately not a condition: a Material, Practical, or Ideal
  * Gogma is equally selectable, and preference stays independent of status
- * (`docs/DATA_MODEL.md` 8.5).
+ * (`docs/DATA_MODEL.md` 8.5). A completion-assigned weapon
+ * (`collectCompletionAssignedOwnedWeaponIds()`, 8.7) is never eligible, even
+ * once unprotected.
  */
 export function isEligiblePreferredOwnedWeapon(
   target: Pick<TargetWeapon, 'weaponTypeId' | 'elementId'>,
   weapon: OwnedWeapon,
+  completionAssignments: ReadonlyMap<OwnedWeaponId, TargetWeaponId>,
 ): boolean {
   return (
     weapon.weaponTypeId === target.weaponTypeId &&
     weapon.elementId === target.elementId &&
-    !weapon.isProtected
+    !weapon.isProtected &&
+    !completionAssignments.has(weapon.id)
   )
 }
 
@@ -65,9 +73,10 @@ export function isCompatiblePreferredOwnedWeapon(
  * never the authority (`docs/DATA_MODEL.md` 8.5).
  *
  * Fails closed on a missing weapon, a weapon type or element mismatch, a
- * protected weapon, and the same weapon being preferred by two Targets. Both
- * `normal` and `gogma` kinds are accepted, and a Target with no preference is
- * always valid.
+ * protected weapon, the same weapon being preferred by two Targets, and a
+ * completion-assigned weapon (Issue #334, `docs/DATA_MODEL.md` 8.5 / 8.7: the
+ * completion of another Target, unprotected or not). Both `normal` and `gogma`
+ * kinds are accepted, and a Target with no preference is always valid.
  */
 export function validateTargetPreferredOwnedWeapons(
   targets: readonly TargetWeapon[],
@@ -78,6 +87,7 @@ export function validateTargetPreferredOwnedWeapons(
     ownedWeapons.map((weapon) => [weapon.id, weapon]),
   )
   const claimedBy = new Map<OwnedWeaponId, TargetWeaponId>()
+  const assignments = collectCompletionAssignedOwnedWeaponIds(targets)
 
   targets.forEach((target, index) => {
     const preferredId = target.preferredOwnedWeaponId
@@ -129,8 +139,35 @@ export function validateTargetPreferredOwnedWeapons(
         ),
       )
     }
+    if (assignments.has(preferredId)) {
+      issues.push(
+        issue(
+          path,
+          'invalid_state',
+          '別の目標武器の完成に使った所持武器は優先起点に設定できません。',
+        ),
+      )
+    }
   })
 
+  return { isValid: issues.length === 0, issues }
+}
+
+/**
+ * The preferred owned weapon collection (`docs/DATA_MODEL.md` 8.5) and the
+ * completion assignment collection (8.7) together: what every write of the
+ * TargetWeapon collection - the save Services, the Execution transactions, the
+ * game save point restore, the direct completion and the full Import validation
+ * - re-validates. Issues keep each authority's order.
+ */
+export function validateTargetOwnedWeaponCollections(
+  targets: readonly TargetWeapon[],
+  ownedWeapons: readonly OwnedWeapon[],
+): DomainValidationResult {
+  const issues = [
+    ...validateTargetPreferredOwnedWeapons(targets, ownedWeapons).issues,
+    ...validateTargetCompletionAssignments(targets, ownedWeapons).issues,
+  ]
   return { isValid: issues.length === 0, issues }
 }
 

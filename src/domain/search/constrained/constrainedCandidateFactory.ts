@@ -12,7 +12,7 @@ import type {
   TargetWeapon,
 } from '../../models/publicTypes'
 import { validateBuildRoute } from '../../models/publicTypes'
-import { createIdealDifference, satisfiesIdealTarget } from '../../target'
+import { createIdealDifference, satisfiesCompletionTarget } from '../../target'
 import { candidateStableKey } from '../candidateProcessing'
 import { compareStableKeys, preferredSourceRank } from '../semanticKeys'
 import { createCandidateRouteEstimates } from '../candidateFactory'
@@ -33,7 +33,7 @@ export interface ConstrainedCandidatePrediction {
 /**
  * Builds one transient `ConstrainedCandidate`.
  *
- * Every field comes from an existing Domain authority: `satisfiesIdealTarget()`,
+ * Every field comes from an existing Domain authority: `satisfiesCompletionTarget()`,
  * `createIdealDifference()`, `createCandidateRouteEstimates()`,
  * `createSearchStateHash()` and `createReferencedOwnedWeaponsHash()`.
  * `CandidateSearchSettings` never reaches this boundary, and no `id`,
@@ -56,7 +56,7 @@ export function createConstrainedCandidate(
   advanceMeasure: 'operation_sum' | 'origin_reach' = 'operation_sum',
 ): ConstrainedCandidate | null {
   if (
-    !satisfiesIdealTarget(
+    !satisfiesCompletionTarget(
       target,
       prediction.finalBonuses,
       prediction.restorationBonusScope,
@@ -81,6 +81,7 @@ export function createConstrainedCandidate(
     prediction.finalBonuses,
     prediction.seriesSkillId,
     prediction.groupSkillId,
+    origin.master,
   )
   return {
     targetWeaponId: target.id,

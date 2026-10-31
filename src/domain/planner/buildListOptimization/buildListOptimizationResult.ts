@@ -25,7 +25,10 @@ export type BuildListOptimizationUnsupportedReason =
   | { kind: 'invalid_planner_input'; issues: { path: string; code: string; message: string }[] }
   /** No valid Entry gives a planning Target. */
   | { kind: 'no_planning_target' }
-  /** A planning Target's valid Entry holds an explicitly selected intermediate state (never cleared or reread). */
+  /**
+   * A planning Target's current Entry holds an explicitly selected intermediate state (never cleared or reread). In the Build List
+   * optimization that Entry is the planning Target's valid Entry; in the running Plan replan re-optimization (18.5) a stale one counts.
+   */
   | { kind: 'checkpoint_selection'; entries: { buildListEntryId: BuildListEntryId; targetWeaponId: TargetWeaponId }[] }
   /** Base Seed, Skill Counter or Gogma Counter is not a confirmed value. */
   | { kind: 'unconfirmed_rng_state'; missing: ('base_seed' | 'skill_counter' | 'gogma_counter')[] }
@@ -77,11 +80,18 @@ export interface BuildListOptimizationOutOfScopeTargetCounts {
   excludedEntryOnly: number
   /** The Target is not enabled for search. */
   disabled: number
+  /** The Target's completion condition awaits the user's review and explicit save (`docs/DATA_MODEL.md` 8.6). */
+  completionConditionReview: number
   /** The Target is completed. */
   completed: number
 }
 
-export interface BuildListOptimizationSummary {
+/**
+ * The final Plan's figures of an optimized calculation, read from the accepted Stage D' verdict: shared by the Build List global
+ * optimization's summary and the running Plan replan re-optimization's (18.6), which has no out-of-scope Target count of its own (its
+ * Targets are classified by the replan target set, 18.2).
+ */
+export interface BuildListOptimizationPlanSummary {
   /** `planStepCount − nonPhysicalStepCount`: the in-game operations (`REQUIREMENTS.md` 22.1). */
   physicalOperationCount: number
   /** `plan.steps.length` (the `confirm_owned_ideal` Steps included). */
@@ -96,6 +106,9 @@ export interface BuildListOptimizationSummary {
   totalTargetCount: number
   /** The final verification bound the Domain derived (`docs/PLANNER_SPEC.md` 17.13); read for display, never recomputed. */
   maxPlanSteps: number
+}
+
+export interface BuildListOptimizationSummary extends BuildListOptimizationPlanSummary {
   outOfScopeTargetCounts: BuildListOptimizationOutOfScopeTargetCounts
 }
 

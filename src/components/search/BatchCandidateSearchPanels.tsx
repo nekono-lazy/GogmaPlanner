@@ -1,14 +1,22 @@
-import { useId } from 'react'
+import { useId, type ReactNode } from 'react'
 import { Link as RouterLink } from 'react-router-dom'
 import { Alert, Box, Button, LinearProgress, Paper, Stack, Typography } from '@mui/material'
 import { DisclosureAccordion } from '../DisclosureAccordion'
 import { StatusChip } from '../StatusChip'
+import type { BatchCandidateResearchSummary, BatchCandidateResearchTargetOutcome } from '../../services/search/batchStaleCandidateReplacement'
 import type {
   BatchCandidateSearchProgress,
   BatchCandidateSearchSummary,
   BatchCandidateSearchTargetOutcome,
+  BatchCandidateSearchTermination,
 } from '../../services/search/batchCandidateSearch'
 import { candidateSearchProgressPhaseLabels } from '../../presentation/labels'
+import {
+  BATCH_RESEARCH_KEPT_NOTE,
+  BATCH_RESEARCH_SUMMARY_COUNTS_LABEL,
+  BATCH_RESEARCH_SUMMARY_TITLE,
+  batchResearchRefusalReasonLabels,
+} from './batchStaleCandidateReplacementPresentation'
 import { batchSourceExclusionCountNote, sourceExclusionConditionLabel } from './sourceExclusionPresentation'
 
 type NotAddedReason = Extract<BatchCandidateSearchTargetOutcome, { status: 'not_added' }>['reason']
@@ -24,10 +32,15 @@ export function BatchCandidateSearchProgressPanel({
   progress,
   cancelling,
   onCancel,
+  title = '一括検索・追加中',
+  cancelLabel = '一括検索をキャンセル',
 }: {
   progress: BatchCandidateSearchProgress
   cancelling: boolean
   onCancel: () => void
+  /** The operation running: 「未登録を一括検索・追加」 by default, or 「再検索が必要な候補を一括再検索・置換」 (9.3). */
+  title?: string
+  cancelLabel?: string
 }) {
   const headingId = useId()
   return (
@@ -42,7 +55,7 @@ export function BatchCandidateSearchProgressPanel({
       <Stack spacing={1.5}>
         <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: 'wrap', alignItems: 'center' }}>
           <Typography id={headingId} component="h2" variant="h2">
-            一括検索・追加中
+            {title}
           </Typography>
           <StatusChip label={candidateSearchProgressPhaseLabels[progress.search.phase]} tone="info" />
         </Stack>
@@ -78,7 +91,7 @@ export function BatchCandidateSearchProgressPanel({
           disabled={cancelling}
           sx={{ minHeight: 44, alignSelf: { xs: 'stretch', sm: 'flex-start' } }}
         >
-          {cancelling ? 'キャンセル中…' : '一括検索をキャンセル'}
+          {cancelling ? 'キャンセル中…' : cancelLabel}
         </Button>
       </Stack>
     </Paper>
@@ -121,57 +134,43 @@ function TargetList({ items }: { items: readonly TargetListItem[] }) {
   )
 }
 
-export function BatchCandidateSearchSummaryPanel({ summary }: { summary: BatchCandidateSearchSummary }) {
+/** One outcome group of a finished batch: its label, its Targets, and whether it is listed even when empty. */
+interface SummaryGroup {
+  key: string
+  label: string
+  items: TargetListItem[]
+  /** A group shown among the counts only while it has members (「未処理」, which exists only after a stop). */
+  countedOnlyWhenPresent?: boolean
+}
+
+/**
+ * The layout every finished batch of this screen shares (`docs/UI_FLOW.md` 9.1
+ * / 9.3): the heading with the exclusion condition the batch ran with, the
+ * termination notice, the counts per outcome group in text, each non-empty
+ * group's Targets behind a disclosure, the caller's supplement and the Build
+ * List link. The groups and the notices are the caller's; nothing here judges
+ * an outcome.
+ */
+function BatchSummaryLayout({
+  title,
+  countsLabel,
+  excludeOtherTargetSources,
+  termination,
+  completedMessage,
+  cancelledMessage,
+  groups,
+  supplement,
+}: {
+  title: string
+  countsLabel: string
+  excludeOtherTargetSources: boolean
+  termination: BatchCandidateSearchTermination
+  completedMessage: string
+  cancelledMessage: string
+  groups: readonly SummaryGroup[]
+  supplement: ReactNode
+}) {
   const headingId = useId()
-  const byStatus = <S extends BatchCandidateSearchTargetOutcome['status']>(status: S) =>
-    summary.outcomes.filter(
-      (outcome): outcome is Extract<BatchCandidateSearchTargetOutcome, { status: S }> => outcome.status === status,
-    )
-  const added = byStatus('added')
-  const noCandidate = byStatus('no_candidate')
-  const failed = byStatus('failed')
-  const notAdded = byStatus('not_added')
-  const groups = [
-    {
-      key: 'added',
-      label: '作成リストへ追加',
-      items: added.map(({ target }) => ({ key: target.id, name: target.name })),
-    },
-    {
-      key: 'no_candidate',
-      label: '候補なし',
-      // Only a search that ran with the exclusion and really excluded weapons
-      // says so; an added Target lists no exclusion detail (`docs/UI_FLOW.md` 9.2).
-      items: noCandidate.map(({ target, excludedSourceOwnedWeaponIds }): TargetListItem => ({
-        key: target.id,
-        name: target.name,
-        ...(summary.excludeOtherTargetSources && excludedSourceOwnedWeaponIds.length > 0
-          ? { note: batchSourceExclusionCountNote(excludedSourceOwnedWeaponIds.length) }
-          : {}),
-        detail: '現在の探索範囲では理想品が見つかりませんでした。',
-      })),
-    },
-    {
-      key: 'failed',
-      label: '検索失敗',
-      items: failed.map(({ target, message }) => ({ key: target.id, name: target.name, detail: message })),
-    },
-    {
-      key: 'not_added',
-      label: '追加しなかった',
-      items: notAdded.map(({ target, reason }) => ({
-        key: target.id,
-        name: target.name,
-        detail: batchNotAddedReasonLabels[reason],
-      })),
-    },
-    {
-      key: 'not_started',
-      label: '未処理',
-      items: summary.notStarted.map((target) => ({ key: target.id, name: target.name })),
-    },
-  ]
-  const termination = summary.termination
   return (
     <Paper
       component="section"
@@ -182,21 +181,15 @@ export function BatchCandidateSearchSummaryPanel({ summary }: { summary: BatchCa
       <Stack spacing={2}>
         <Box>
           <Typography id={headingId} component="h2" variant="h2">
-            一括検索・追加の結果
+            {title}
           </Typography>
           {/* The condition this batch ran with; a later Checkbox change never relabels it. */}
           <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5, overflowWrap: 'anywhere' }}>
-            {sourceExclusionConditionLabel(summary.excludeOtherTargetSources)}
+            {sourceExclusionConditionLabel(excludeOtherTargetSources)}
           </Typography>
         </Box>
-        {termination.status === 'completed' && (
-          <Alert severity="success">{summary.total}件の目標武器を検索しました。</Alert>
-        )}
-        {termination.status === 'cancelled' && (
-          <Alert severity="info">
-            一括検索をキャンセルしました。キャンセル前に作成リストへ追加した候補は、そのまま登録されています。
-          </Alert>
-        )}
+        {termination.status === 'completed' && <Alert severity="success">{completedMessage}</Alert>}
+        {termination.status === 'cancelled' && <Alert severity="info">{cancelledMessage}</Alert>}
         {termination.status === 'aborted' && (
           <Alert severity="error">
             {termination.message} 以降の目標武器は検索していません。
@@ -204,7 +197,7 @@ export function BatchCandidateSearchSummaryPanel({ summary }: { summary: BatchCa
         )}
         <Box
           component="ul"
-          aria-label="一括検索・追加の件数"
+          aria-label={countsLabel}
           sx={{
             m: 0,
             p: 0,
@@ -215,7 +208,7 @@ export function BatchCandidateSearchSummaryPanel({ summary }: { summary: BatchCa
           }}
         >
           {groups
-            .filter(({ key, items }) => key !== 'not_started' || items.length > 0)
+            .filter(({ countedOnlyWhenPresent, items }) => !countedOnlyWhenPresent || items.length > 0)
             .map(({ key, label, items }) => (
               <Box
                 component="li"
@@ -238,11 +231,7 @@ export function BatchCandidateSearchSummaryPanel({ summary }: { summary: BatchCa
               <TargetList items={items} />
             </DisclosureAccordion>
           ))}
-        {added.length > 0 && (
-          <Typography variant="body2" color="text.secondary">
-            追加した候補は、途中採用する状態を選ばず（理想品まで進む）、改善優先を「生産計画に任せる」で登録しています。必要な目標武器だけ作成リストで変更してください。
-          </Typography>
-        )}
+        {supplement}
         <Button
           component={RouterLink}
           to="/build-list"
@@ -253,5 +242,158 @@ export function BatchCandidateSearchSummaryPanel({ summary }: { summary: BatchCa
         </Button>
       </Stack>
     </Paper>
+  )
+}
+
+/** The 「候補なし」 row of either batch: the exclusion count only when that batch excluded and the search really excluded weapons. */
+function noCandidateItem(
+  outcome: Extract<BatchCandidateSearchTargetOutcome, { status: 'no_candidate' }>,
+  excludeOtherTargetSources: boolean,
+  detail: string,
+): TargetListItem {
+  return {
+    key: outcome.target.id,
+    name: outcome.target.name,
+    ...(excludeOtherTargetSources && outcome.excludedSourceOwnedWeaponIds.length > 0
+      ? { note: batchSourceExclusionCountNote(outcome.excludedSourceOwnedWeaponIds.length) }
+      : {}),
+    detail,
+  }
+}
+
+/**
+ * The finished batch (`docs/UI_FLOW.md` 9.1). `supplement` is what the screen adds after the outcome groups - the replan proposal for
+ * the Targets the batch really added (Issue #276 PR-6B) - without changing any of the summary's own content.
+ */
+export function BatchCandidateSearchSummaryPanel({
+  summary,
+  supplement = null,
+}: {
+  summary: BatchCandidateSearchSummary
+  supplement?: ReactNode
+}) {
+  const byStatus = <S extends BatchCandidateSearchTargetOutcome['status']>(status: S) =>
+    summary.outcomes.filter(
+      (outcome): outcome is Extract<BatchCandidateSearchTargetOutcome, { status: S }> => outcome.status === status,
+    )
+  const groups: SummaryGroup[] = [
+    {
+      key: 'added',
+      label: '作成リストへ追加',
+      items: byStatus('added').map(({ target }) => ({ key: target.id, name: target.name })),
+    },
+    {
+      key: 'no_candidate',
+      label: '候補なし',
+      // Only a search that ran with the exclusion and really excluded weapons
+      // says so; an added Target lists no exclusion detail (`docs/UI_FLOW.md` 9.2).
+      items: byStatus('no_candidate').map((outcome) =>
+        noCandidateItem(outcome, summary.excludeOtherTargetSources, '現在の探索範囲では完成条件を満たす候補が見つかりませんでした。')),
+    },
+    {
+      key: 'failed',
+      label: '検索失敗',
+      items: byStatus('failed').map(({ target, message }) => ({ key: target.id, name: target.name, detail: message })),
+    },
+    {
+      key: 'not_added',
+      label: '追加しなかった',
+      items: byStatus('not_added').map(({ target, reason }) => ({
+        key: target.id,
+        name: target.name,
+        detail: batchNotAddedReasonLabels[reason],
+      })),
+    },
+    {
+      key: 'not_started',
+      label: '未処理',
+      items: summary.notStarted.map((target) => ({ key: target.id, name: target.name })),
+      countedOnlyWhenPresent: true,
+    },
+  ]
+  return (
+    <BatchSummaryLayout
+      title="一括検索・追加の結果"
+      countsLabel="一括検索・追加の件数"
+      excludeOtherTargetSources={summary.excludeOtherTargetSources}
+      termination={summary.termination}
+      completedMessage={`${summary.total}件の目標武器を検索しました。`}
+      cancelledMessage="一括検索をキャンセルしました。キャンセル前に作成リストへ追加した候補は、そのまま登録されています。"
+      groups={groups}
+      supplement={supplement}
+    />
+  )
+}
+
+/**
+ * The finished 「再検索が必要な候補を一括再検索・置換」 (`docs/UI_FLOW.md` 9.3). Every
+ * group but 「置き換えた」 says in text that the original candidate is still
+ * registered, so a cancelled, failed or refused Target is never read as a
+ * lost Entry. `supplement` is the screen's replan proposal for the Targets
+ * whose Entry was really replaced.
+ */
+export function BatchCandidateResearchSummaryPanel({
+  summary,
+  supplement = null,
+}: {
+  summary: BatchCandidateResearchSummary
+  supplement?: ReactNode
+}) {
+  const byStatus = <S extends BatchCandidateResearchTargetOutcome['status']>(status: S) =>
+    summary.outcomes.filter(
+      (outcome): outcome is Extract<BatchCandidateResearchTargetOutcome, { status: S }> => outcome.status === status,
+    )
+  const groups: SummaryGroup[] = [
+    {
+      key: 'replaced',
+      label: '候補を置き換えた',
+      items: byStatus('replaced').map(({ target }) => ({ key: target.id, name: target.name })),
+    },
+    {
+      key: 'no_candidate',
+      label: '候補なし',
+      items: byStatus('no_candidate').map((outcome) =>
+        noCandidateItem(
+          outcome,
+          summary.excludeOtherTargetSources,
+          `現在の探索範囲では完成条件を満たす候補が見つかりませんでした。${BATCH_RESEARCH_KEPT_NOTE}`,
+        )),
+    },
+    {
+      key: 'failed',
+      label: '検索失敗',
+      items: byStatus('failed').map(({ target, message }) => ({
+        key: target.id,
+        name: target.name,
+        detail: `${message} ${BATCH_RESEARCH_KEPT_NOTE}`,
+      })),
+    },
+    {
+      key: 'not_replaced',
+      label: '置き換えなかった',
+      items: byStatus('not_replaced').map(({ target, reason }) => ({
+        key: target.id,
+        name: target.name,
+        detail: `${batchResearchRefusalReasonLabels[reason]} ${BATCH_RESEARCH_KEPT_NOTE}`,
+      })),
+    },
+    {
+      key: 'not_started',
+      label: '未処理',
+      items: summary.notStarted.map((target) => ({ key: target.id, name: target.name, detail: BATCH_RESEARCH_KEPT_NOTE })),
+      countedOnlyWhenPresent: true,
+    },
+  ]
+  return (
+    <BatchSummaryLayout
+      title={BATCH_RESEARCH_SUMMARY_TITLE}
+      countsLabel={BATCH_RESEARCH_SUMMARY_COUNTS_LABEL}
+      excludeOtherTargetSources={summary.excludeOtherTargetSources}
+      termination={summary.termination}
+      completedMessage={`${summary.total}件の目標武器を再検索しました。`}
+      cancelledMessage="一括再検索をキャンセルしました。キャンセル前に置き換えた候補はそのまま登録され、処理していない目標武器の候補は元のまま残っています。"
+      groups={groups}
+      supplement={supplement}
+    />
   )
 }

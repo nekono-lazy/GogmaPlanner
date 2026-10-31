@@ -6,8 +6,8 @@
  * planning Target of a `BuildListOptimizationContext`, the Counter positions inside an explicit window at
  * which the Production RNG reaches the Target's Ideal, per stream and per source. Only the given
  * `RngEngine`'s public prediction API, `getPredictionSupport()`, the Keep family authority
- * (`keepFamilyLayoutKey()` / `keepFamilyMultisetKey()`) and the Target evaluators
- * (`satisfiesIdealBonuses()` / `evaluateSkillCondition()`) are read. No weight, Counter advance, Gate or
+ * (`keepFamilyLayoutKey()` / `completionVariantKeepFamilyMultisetKeys()`) and the Target evaluators
+ * (`satisfiesCompletionBonuses()` / `evaluateSkillCondition()`) are read. No weight, Counter advance, Gate or
  * game rule is computed here, no Route is built, and nothing outside the window is recorded as absent.
  *
  * Predictions are shared between Targets of one weapon type / element through a memo
@@ -17,19 +17,22 @@
  * set with that layout; prediction *support* is still asked of every concrete five-slot input, and two
  * inputs of one layout that disagree fail closed as an Engine contract violation.
  *
- * The existing BuildListEntries of the context are not read here (design 4.1): the Target set is the
+ * The existing BuildListEntries' Routes are not read here (design 4.1): the Target set is the
  * context's, and the sources / positions come from the PlannerInput's RngState, Normal Counters,
- * OwnedWeapons and Targets alone. `TargetWeapon.preferredOwnedWeaponId` is not an input either.
+ * OwnedWeapons and Targets alone. The only Entry field read is a planning Target's intermediate state
+ * selection, for the checkpoint precondition (`docs/PLANNER_SPEC.md` 17.4 O2 / 18.5).
+ * `TargetWeapon.preferredOwnedWeaponId` is not an input either.
  *
  * The window is the caller's: this module applies no window of its own, widens none, and reads neither the
  * Candidate Search defaults nor a saved setting (`docs/PLANNER_SPEC.md` 17.13).
  */
-import type { BuildListEntryId, ElementId, OwnedWeapon, RestorationBonusSet, TargetWeapon, TargetWeaponId, WeaponTypeId } from '../../models/publicTypes'
+import type { BuildListEntryId, ElementId, OwnedWeapon, OwnedWeaponId, RestorationBonusSet, TargetWeapon, TargetWeaponId, WeaponTypeId } from '../../models/publicTypes'
 import type { PlannerInput } from '../plannerTypes'
-import { keepFamilyLayoutKey, keepFamilyMultisetKey } from '../../rng/gogmaBonusFamily'
+import { completionVariantKeepFamilyMultisetKeys, keepFamilyLayoutKey } from '../../rng/gogmaBonusFamily'
 import type { NormalizedSeed, RngEngine, RngPredictionSupportInput } from '../../rng/rngEngine'
 import { evaluateSkillCondition } from '../../target/skillConditionEvaluator'
-import { satisfiesIdealBonuses } from '../../target/targetEvaluator'
+import { collectCompletionAssignedOwnedWeaponIds, isCompletionAssignedElsewhere } from '../../target/completionAssignment'
+import { createCompletionBonusMatcher } from '../../target/completionCondition'
 import type { BuildListOptimizationUnsupportedReason } from './buildListOptimizationResult'
 import {
   BuildListOptimizationInvariantError,
@@ -97,17 +100,27 @@ function compatibleOwnedWeapons(input: PlannerInput, group: Group): OwnedWeapon[
     .sort((left, right) => compareStable(left.id, right.id))
 }
 
-/** Design 5.2 source rules: a protected Gogma only while already Ideal on both axes; a protected Normal never. */
-function classifyOwnedSource(target: TargetWeapon, weapon: OwnedWeapon, master: PlannerInput['master']):
+/**
+ * Design 5.2 source rules: a protected Gogma only while already Ideal on both axes; a protected Normal never. A weapon another
+ * Target was completed with is never a source (Issue #334, `docs/PLANNER_SPEC.md` 21.4 / 21.7), checked first and whatever its
+ * protection; with no completion assignment every weapon is classified exactly as before.
+ */
+function classifyOwnedSource(
+  target: TargetWeapon,
+  weapon: OwnedWeapon,
+  master: PlannerInput['master'],
+  completionAssignments: ReadonlyMap<OwnedWeaponId, TargetWeaponId>,
+):
   | { kind: 'source'; gogma: { currentSkillIdeal: boolean; currentBonusIdeal: boolean } | null }
   | { kind: 'excluded'; reason: ExcludedOwnedWeaponReason } {
+  if (isCompletionAssignedElsewhere(completionAssignments, weapon.id, target.id)) return { kind: 'excluded', reason: 'completion_assigned' }
   if (weapon.kind === 'normal') {
     if (weapon.rarity !== 8) return { kind: 'excluded', reason: 'normal_rarity_not_8' }
     if (weapon.isProtected) return { kind: 'excluded', reason: 'protected_normal' }
     return { kind: 'source', gogma: null }
   }
-  const currentSkillIdeal = evaluateSkillCondition(target.idealSkillCondition, weapon.seriesSkillId, weapon.groupSkillId)
-  const currentBonusIdeal = satisfiesIdealBonuses(target, weapon.restorationBonuses, weapon.restorationBonusScope, master)
+  const currentSkillIdeal = evaluateSkillCondition(target.completionSkillCondition, weapon.seriesSkillId, weapon.groupSkillId)
+  const currentBonusIdeal = createCompletionBonusMatcher(target, master).satisfies(weapon.restorationBonuses, weapon.restorationBonusScope)
   if (weapon.isProtected && !(currentSkillIdeal && currentBonusIdeal)) return { kind: 'excluded', reason: 'protected_gogma_not_ideal' }
   return { kind: 'source', gogma: { currentSkillIdeal, currentBonusIdeal } }
 }
@@ -124,7 +137,7 @@ export type ReachTablePreconditionViolation =
 
 /**
  * The ReachTable's input preconditions over a context, in the order the scan checks them: the confirmed Base Seed / Skill Counter /
- * Gogma Counter, no selected intermediate state on a planning Target's valid Entry (design 15.1: this design places no pin), and
+ * Gogma Counter, no selected intermediate state on a planning Target's current Entry (design 15.1: this design places no pin), and
  * for every planning Target (grouped by weapon type / element, in the order the first Target of each group appears) an owned
  * source or a confirmed rarity-8 Normal Counter whose Normal prediction is supported (the blind variant is never an option).
  *
@@ -136,6 +149,7 @@ export function collectReachTablePreconditionViolations(context: BuildListOptimi
   const violations: ReachTablePreconditionViolation[] = []
   const input = context.plannerInput
   const master = input.master
+  const completionAssignments = collectCompletionAssignedOwnedWeaponIds(input.targetWeapons)
   const { baseSeed, skillCounter, gogmaCounter } = input.rngState
   if (!baseSeed.isConfirmed || baseSeed.value === null || !skillCounter.isConfirmed || skillCounter.value === null
     || !gogmaCounter.isConfirmed || gogmaCounter.value === null) {
@@ -146,11 +160,15 @@ export function collectReachTablePreconditionViolations(context: BuildListOptimi
     violations.push({ reason: 'unconfirmed_rng_state', missing, detail: `No confirmed value for: ${missing.map(value => label[value]).join(', ')}.` })
     if (!options.all) return violations
   }
-  // Design 15.1: this design places no intermediate state pin, so a selected state is not planned here.
-  const pinned = context.validation.validBuildListEntries
-    .filter(({ entry }) => context.planningTargetIds.has(entry.targetWeaponId) && entry.intermediateStateSelection !== undefined
+  // Design 15.1: this design places no intermediate state pin, so a selected state is not planned here. The rule reads every current
+  // Entry of a planning Target in the input, in Entry ID order (`docs/PLANNER_SPEC.md` 17.4 O2 / 18.5): in the Build List
+  // optimization that is the planning Target's one Entry, its valid Entry (the input validation fails a planning Target's second Entry
+  // closed); in the running Plan replan re-optimization it is a replan Target's current Entry, a stale one included, which the
+  // re-optimization would otherwise replace and so drop its selection silently.
+  const pinned = [...input.buildListEntries]
+    .sort((left, right) => compareStable(left.id, right.id))
+    .filter(entry => context.planningTargetIds.has(entry.targetWeaponId) && entry.intermediateStateSelection !== undefined
       && (entry.intermediateStateSelection.skillOpportunityId !== null || entry.intermediateStateSelection.bonusOpportunityId !== null))
-    .map(({ entry }) => entry)
   if (pinned.length > 0) {
     violations.push({ reason: 'checkpoint_selection', entries: pinned.map(entry => ({ buildListEntryId: entry.id, targetWeaponId: entry.targetWeaponId })),
       detail: `BuildListEntries with a selected intermediate state: ${pinned.map(entry => entry.id).join(', ')}.` })
@@ -161,7 +179,7 @@ export function collectReachTablePreconditionViolations(context: BuildListOptimi
     const counter = confirmedRarity8Counter(input, group.weaponTypeId)
     const normalSupported = engine.getPredictionSupport({ type: 'normal_artian', weaponTypeId: group.weaponTypeId, elementId: group.elementId, rarity: 8 }).supported
     for (const target of group.targets) {
-      const hasOwnedSource = compatibleOwnedWeapons(input, group).some(weapon => classifyOwnedSource(target, weapon, master).kind === 'source')
+      const hasOwnedSource = compatibleOwnedWeapons(input, group).some(weapon => classifyOwnedSource(target, weapon, master, completionAssignments).kind === 'source')
       if (hasOwnedSource) continue
       if (counter === null) {
         violations.push({ reason: 'target_without_source', targetWeaponId: target.id,
@@ -225,6 +243,7 @@ export async function buildReachTable(context: BuildListOptimizationContext, eng
   assertReachOptionSet(optionSet)
   const input = context.plannerInput
   const master = input.master
+  const completionAssignments = collectCompletionAssignedOwnedWeaponIds(input.targetWeapons)
   // The first precondition that does not hold, with the very Engine queries the scan always made before it predicts.
   const [violation] = collectReachTablePreconditionViolations(context, engine, { all: false })
   if (violation !== undefined) return { kind: 'unsupported_input', reason: violation.reason, detail: violation.detail }
@@ -338,15 +357,18 @@ export async function buildReachTable(context: BuildListOptimizationContext, eng
         if (!skillSupport.supported) unsupported.push({ targetWeaponId: target.id, prediction: 'skill', reason: skillSupport.reason })
         if (!resetSupport.supported) unsupported.push({ targetWeaponId: target.id, prediction: 'gogma_reset', reason: resetSupport.reason })
         if (!normalSupport.supported) unsupported.push({ targetWeaponId: target.id, prediction: 'normal_artian', reason: normalSupport.reason })
-        const idealMultiset = keepFamilyMultisetKey(target.idealBonuses, master)
-        const ofInterest = (layout: LayoutKey) => layout.split('\u0000').sort().join('\u0000') === idealMultiset
+        // Issue #100: a layout is of interest when its family multiset is that of any completion Variant
+        // (membership in the union over Variants, never one option per Variant).
+        const completionMultisets = completionVariantKeepFamilyMultisetKeys(target.completionBonusVariants, master)
+        const ofInterest = (layout: LayoutKey) => completionMultisets.has(layout.split('\u0000').sort().join('\u0000'))
+        const completion = createCompletionBonusMatcher(target, master)
 
         const sources: SourceCandidate[] = []
         const excludedOwnedWeapons: TargetReach['excludedOwnedWeapons'] = []
         // Layout-of-interest inputs in deterministic order: owned by ID, Normal by position, Reset by position.
         const interestInputs: { layout: LayoutKey; bonuses: RestorationBonusSet }[] = []
         for (const weapon of owned) {
-          const classified = classifyOwnedSource(target, weapon, master)
+          const classified = classifyOwnedSource(target, weapon, master, completionAssignments)
           if (classified.kind === 'excluded') { excludedOwnedWeapons.push({ ownedWeaponId: weapon.id, reason: classified.reason }); continue }
           const layout = keepFamilyLayoutKey(weapon.restorationBonuses, master)
           const keepSupported = keepSupport(weapon.restorationBonuses, layout)
@@ -386,20 +408,20 @@ export async function buildReachTable(context: BuildListOptimizationContext, eng
           const positions: number[] = []
           for (let position = gogmaRange.from; position <= gogmaRange.to; position++) {
             await checkpoint()
-            if (satisfiesIdealBonuses(target, keep(layout, position), 'gogma_artian', master)) positions.push(position)
+            if (completion.satisfies(keep(layout, position), 'gogma_artian')) positions.push(position)
           }
           keepIdealPositionsByLayout.set(layout, positions)
         }
 
         const idealPositions: number[] = []
         for (const [position, result] of skills) {
-          if (evaluateSkillCondition(target.idealSkillCondition, result.seriesSkillId, result.groupSkillId)) idealPositions.push(position)
+          if (evaluateSkillCondition(target.completionSkillCondition, result.seriesSkillId, result.groupSkillId)) idealPositions.push(position)
         }
         const resetIdealPositions: number[] = []
         const resetLayoutByPosition = new Map<number, LayoutKey>()
         for (const [position, reset] of resets) {
           resetLayoutByPosition.set(position, reset.layout)
-          if (satisfiesIdealBonuses(target, reset.bonuses, 'gogma_artian', master)) resetIdealPositions.push(position)
+          if (completion.satisfies(reset.bonuses, 'gogma_artian')) resetIdealPositions.push(position)
         }
         // Every Target after the first reads the group's Skill / Reset / Normal results from the memo.
         if (group.targets.indexOf(target) > 0) { memoHits.skill += skills.size; memoHits.gogmaReset += resets.size; memoHits.normal += normals.size }

@@ -75,12 +75,18 @@ function StartLinkPreview({ preview, onRetry }: { preview: PlanStartPreviewState
  * Plan. Starting is the runtime's decision; this component never changes a Plan
  * status or a Target on its own. A stale Plan is left to the page's existing
  * recalculation guidance.
+ *
+ * `completionAssignmentBlocked` (Issue #334, `docs/UI_FLOW.md` 12.11): the Plan's
+ * completions would make one weapon the completion of two Targets, which the page
+ * explains above. A draft then offers no 「作成開始」, and an active Plan offers
+ * the Execution Navigator for its state controls only - never as 「再開」.
  */
 export function PlanExecutionEntry({
   plan,
   starting,
   startError,
   startPreview,
+  completionAssignmentBlocked = false,
   onRetryStartPreview,
   onStart,
 }: {
@@ -88,6 +94,7 @@ export function PlanExecutionEntry({
   starting: boolean
   startError: string | null
   startPreview: PlanStartPreviewState
+  completionAssignmentBlocked?: boolean
   onRetryStartPreview(): void
   onStart(): void
 }) {
@@ -100,7 +107,7 @@ export function PlanExecutionEntry({
           <Button
             variant="contained"
             size="large"
-            disabled={starting || startPreview.status !== 'ready'}
+            disabled={starting || startPreview.status !== 'ready' || completionAssignmentBlocked}
             onClick={onStart}
             sx={buttonSx}
           >
@@ -115,6 +122,20 @@ export function PlanExecutionEntry({
         </Stack>
       )
     case 'active':
+      if (completionAssignmentBlocked) {
+        return (
+          <Button
+            component={RouterLink}
+            to={`/plans/${plan.id}/run`}
+            variant="outlined"
+            color="inherit"
+            size="large"
+            sx={buttonSx}
+          >
+            実行ナビを開く（実行状態の管理）
+          </Button>
+        )
+      }
       return (
         <Button
           component={RouterLink}

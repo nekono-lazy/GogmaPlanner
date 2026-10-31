@@ -6,6 +6,7 @@ import type {
   ExecutionHistory,
   ExecutionHistoryId,
   ExecutionSavePoint,
+  ExecutionUndoSnapshot,
   ISODateTimeString,
   NormalArtianCounter,
   OwnedWeapon,
@@ -37,8 +38,10 @@ import {
   assertAbandonedStateValid,
   assertRunningPlanSavePointDecision,
   deriveRunningPlanSavePointChoiceRequirement,
+  runningPlanSavePointChoiceOptions,
   withoutPlanInProgress,
   type PlanAbandonSavePointDecision,
+  type RunningPlanSavePointChoiceOptions,
 } from './planAbandonment'
 
 /**
@@ -145,6 +148,18 @@ export function detectPlanBreakingMutation(input: PlanBreakingMutationInput): Pl
       { targetWeapons: [], dependentTargetWeaponIds: [] },
     ).ownedWeaponsHash
   if (scopeWeaponsHash(before) !== scopeWeaponsHash(after)) reasons.add('owned_weapon_changed')
+  // Making an execution scope weapon the completion of a Target outside the
+  // Plan's own completion effects - the direct completion - breaks the Plan
+  // even when the weapon's hashed fields do not move (it may already be a
+  // protected Ideal). The completion assignment is in no `ExpectedPlanState`
+  // hash (Issue #334, `docs/PLANNER_SPEC.md` 21.4 / 21.9), so it is judged
+  // explicitly: a new assignment of a scope weapon is `owned_weapon_changed`.
+  const scopeAssignments = (state: PlanBreakingMutableState) =>
+    state.targetWeapons
+      .filter((target) => target.completedWithOwnedWeaponId !== null && scopeWeaponIds.has(target.completedWithOwnedWeaponId))
+      .map((target) => `${target.id}\u0000${target.completedWithOwnedWeaponId}`)
+  const assignedBefore = new Set(scopeAssignments(before))
+  if (scopeAssignments(after).some((assignment) => !assignedBefore.has(assignment))) reasons.add('owned_weapon_changed')
 
   const dependentTargetIds = [...new Set([
     ...collectProductionPlanDependentTargetWeaponIds(plan, before.buildListEntries),
@@ -176,7 +191,17 @@ export function detectPlanBreakingMutation(input: PlanBreakingMutationInput): Pl
 export interface PlanGuardedMutationBase extends PlanBreakingMutableState {
   buildCandidates: readonly BuildCandidate[]
   productionPlans: readonly ProductionPlan[]
+  /** The metadata of every ExecutionHistory record. */
   executionHistory: readonly ExecutionHistory[]
+  /**
+   * The Undo bodies the guard read (`docs/DATA_MODEL.md` 14.6): every body when
+   * the mutation declares `readsExecutionUndoSnapshots` (the OwnedWeapon delete
+   * reference check), the bodies of the active Plan's records after its game
+   * save point when the approval restores it, and none otherwise. `null` means
+   * the bodies were not read at all, so a mutation needing them never mistakes
+   * an unread collection for an empty one.
+   */
+  executionUndoSnapshots: readonly ExecutionUndoSnapshot[] | null
 }
 
 export interface PlanGuardPersistedState extends PlanGuardedMutationBase {
@@ -192,9 +217,17 @@ export interface PlanGuardPersistedState extends PlanGuardedMutationBase {
  * again to the restored state (`docs/PLANNER_SPEC.md` 16.10). A validation or
  * reference failure is thrown and nothing is written.
  */
-export type PlanGuardedMutation<R> = (base: PlanGuardedMutationBase) => {
-  state: PlanBreakingMutableState
-  result: R
+export interface PlanGuardedMutation<R> {
+  (base: PlanGuardedMutationBase): {
+    state: PlanBreakingMutableState
+    result: R
+  }
+  /**
+   * The mutation reads every ExecutionHistory Undo body (the OwnedWeapon delete
+   * reference check, `docs/DATA_MODEL.md` 14.6), so the guard reads them all
+   * and judges every record. Any other mutation reads none.
+   */
+  readonly readsExecutionUndoSnapshots?: true
 }
 
 function sameUserValue(left: unknown, right: unknown): boolean {
@@ -229,7 +262,8 @@ export interface ObservedBreakingPlan {
 /**
  * What the breaking-change warning (`docs/UI_FLOW.md` 16.3) and, when needed,
  * the 16.2 save point choice are built from. Read-only and advisory: applying
- * the change re-derives everything in its own transaction.
+ * the change re-derives everything in its own transaction. The restore is
+ * offered only where `savePointRestore` says it can run (Issue #335).
  */
 export type PlanBreakingChangeInspection =
   | { approvalRequired: false }
@@ -237,16 +271,7 @@ export type PlanBreakingChangeInspection =
       approvalRequired: true
       reasons: PlanBreakingReason[]
       observedPlan: ObservedBreakingPlan
-    } & (
-      | { savePointChoiceRequired: false }
-      | {
-          savePointChoiceRequired: true
-          savePointRecordedAt: ISODateTimeString
-          savePointLastExecutionHistoryId: ExecutionHistoryId | null
-          /** The Plan's current Step when the save point was recorded. */
-          savePointCurrentStepId: PlanStepId | null
-        }
-    ))
+    } & RunningPlanSavePointChoiceOptions)
 
 /**
  * The user's approval of 「生産計画を破棄して保存」: the Plan they saw and their
@@ -364,29 +389,23 @@ function approvalRequiredInspection(
   plan: ProductionPlan,
   reasons: PlanBreakingReason[],
   state: PlanGuardPersistedState,
+  currentCalculationContext: CalculationContext,
 ): Extract<PlanBreakingChangeInspection, { approvalRequired: true }> {
-  const base = {
-    approvalRequired: true as const,
-    reasons,
-    observedPlan: {
-      planId: plan.id,
-      status: 'active' as const,
-      currentStepId: plan.currentStepId,
-      updatedAt: plan.updatedAt,
-    },
-  }
   const choice = deriveRunningPlanSavePointChoiceRequirement(
     plan,
     planSavePoint(plan, state.executionSavePoints),
     planHistory(plan, state.executionHistory),
   )
-  if (!choice.required) return { ...base, savePointChoiceRequired: false }
   return {
-    ...base,
-    savePointChoiceRequired: true,
-    savePointRecordedAt: choice.savePoint.recordedAt,
-    savePointLastExecutionHistoryId: choice.savePoint.lastExecutionHistoryId,
-    savePointCurrentStepId: choice.savePoint.productionPlan.currentStepId,
+    approvalRequired: true,
+    reasons,
+    observedPlan: {
+      planId: plan.id,
+      status: 'active',
+      currentStepId: plan.currentStepId,
+      updatedAt: plan.updatedAt,
+    },
+    ...runningPlanSavePointChoiceOptions(plan, choice, currentCalculationContext),
   }
 }
 
@@ -398,10 +417,11 @@ function approvalRequiredInspection(
 export function inspectPlanGuardedMutation<R>(
   state: PlanGuardPersistedState,
   mutation: PlanGuardedMutation<R>,
+  currentCalculationContext: CalculationContext,
 ): PlanBreakingChangeInspection {
   const { activePlan, breaking } = evaluateMutation(state, mutation)
   if (activePlan === null || !breaking.breaksPlan) return { approvalRequired: false }
-  return approvalRequiredInspection(activePlan, breaking.reasons, state)
+  return approvalRequiredInspection(activePlan, breaking.reasons, state, currentCalculationContext)
 }
 
 /**
@@ -438,7 +458,9 @@ export function preparePlanGuardedMutation<R>(input: PlanGuardedMutationInput<R>
     return { result: applied.result, state: applied.state, planTermination: null }
   }
   if (approval === null) {
-    throw new PlanBreakingChangeApprovalRequiredError(approvalRequiredInspection(activePlan, breaking.reasons, state))
+    throw new PlanBreakingChangeApprovalRequiredError(
+      approvalRequiredInspection(activePlan, breaking.reasons, state, input.currentCalculationContext),
+    )
   }
 
   const history = planHistory(activePlan, state.executionHistory)
@@ -507,6 +529,7 @@ function applyAfterSavePointRestore<R>(
       targetWeapons: state.targetWeapons,
       buildListEntries: state.buildListEntries,
       planExecutionHistory: history,
+      undoSnapshotsAfterSavePoint: state.executionUndoSnapshots ?? [],
       executionSavePoint: savePoint,
     },
     currentCalculationContext: input.currentCalculationContext,
@@ -528,6 +551,9 @@ function applyAfterSavePointRestore<R>(
     buildCandidates: state.buildCandidates,
     productionPlans: state.productionPlans.map((stored) => (stored.id === plan.id ? restore.plan : stored)),
     executionHistory: state.executionHistory.filter(({ id }) => !deletedHistory.has(id)),
+    executionUndoSnapshots: state.executionUndoSnapshots === null
+      ? null
+      : state.executionUndoSnapshots.filter(({ executionHistoryId }) => !deletedHistory.has(executionHistoryId)),
   }
   // The user's change, applied to the restored state: nothing read before the
   // restore is written back over it.

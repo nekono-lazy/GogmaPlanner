@@ -91,8 +91,14 @@ export interface ProductionPlanListItemPresentation {
   totalStepCount: number
   /** From `createProductionPlanSummary()`, never `selectedBuildListEntryIds.length`. */
   targetWeaponCount: number
-  /** Only an `active` Plan resumes the Execution Navigator. */
+  /**
+   * Only an `active` Plan resumes the Execution Navigator, and never one whose
+   * completions would make one weapon the completion of two Targets (Issue
+   * #334, `docs/UI_FLOW.md` 12.11).
+   */
   canResumeExecution: boolean
+  /** Why a running Plan cannot go on, or `null` (Issue #334). */
+  continuationNote: string | null
   /** Only the not-yet-started Draft may be deleted from the list. */
   canDeleteDraft: boolean
 }
@@ -119,10 +125,20 @@ function reasonLabelsFor(plan: ProductionPlan): string[] {
   }
 }
 
+export const PRODUCTION_PLAN_LIST_COMPLETION_ASSIGNMENT_NOTE =
+  '1本の所持武器を2件の目標武器の完成品にする予定を含むため、続行できません。「詳細を見る」で理由と再計画の導線を確認できます。'
+
+/**
+ * `completionAssignmentConflict`: the read-only continuation judgement
+ * (`ProductionPlanExecutionService.inspectProductionPlanContinuation()`) refused
+ * this Plan for its completion assignments. Display only.
+ */
 export function createProductionPlanListItemPresentation(
   plan: ProductionPlan,
+  options: { completionAssignmentConflict?: boolean } = {},
 ): ProductionPlanListItemPresentation {
   const summary = createProductionPlanSummary(plan)
+  const blocked = options.completionAssignmentConflict === true && (plan.status === 'active' || plan.status === 'stale')
   return {
     planId: plan.id,
     status: plan.status,
@@ -137,7 +153,8 @@ export function createProductionPlanListItemPresentation(
     completedStepCount: plan.steps.filter((step) => step.isCompleted).length,
     totalStepCount: plan.steps.length,
     targetWeaponCount: summary.targetWeaponCount,
-    canResumeExecution: plan.status === 'active',
+    canResumeExecution: plan.status === 'active' && !blocked,
+    continuationNote: blocked ? PRODUCTION_PLAN_LIST_COMPLETION_ASSIGNMENT_NOTE : null,
     canDeleteDraft: plan.status === 'draft',
   }
 }

@@ -5,6 +5,7 @@ import type {
   ExecutionHistory,
   ExecutionHistoryId,
   ExecutionSavePoint,
+  ExecutionUndoSnapshot,
   ISODateTimeString,
   NormalArtianCounter,
   OwnedWeapon,
@@ -27,8 +28,8 @@ import {
   validateTargetWeapon,
 } from '../models/publicTypes'
 import { collectProductionPlanDependentTargetWeaponIds } from '../planner/productionPlanGeneration'
-import { validateTargetPreferredOwnedWeapons } from '../target/preferredOwnedWeapon'
-import { executionFailure } from './executionRuntimeError'
+import { validateTargetOwnedWeaponCollections } from '../target/preferredOwnedWeapon'
+import { ExecutionRuntimeError, executionFailure } from './executionRuntimeError'
 import { assertExecutableProductionPlan, type ExecutionPersistedState } from './planExecutionState'
 import { requireExecutableCurrentStep } from './stepExecution'
 
@@ -80,7 +81,7 @@ export function collectExecutionScopeOwnedWeaponIds(
   return sortedUnique([
     ...collectPlanRouteOwnedWeaponIds(plan, state.buildListEntries),
     ...orderedPlanHistory(plan, [...state.planExecutionHistory])
-      .flatMap(({ undoSnapshot }) => undoSnapshot.addedOwnedWeaponIds)
+      .flatMap(({ addedOwnedWeaponIds }) => addedOwnedWeaponIds)
       .filter((id) => existing.has(id)),
     ...state.ownedWeapons
       .filter(({ executionInProgress }) => executionInProgress?.productionPlanId === plan.id)
@@ -143,7 +144,7 @@ function missingExecutionScope(
   const requiredOwnedWeaponIds = sortedUnique([
     ...collectExecutionScopeOwnedWeaponIds(plan, scopeState),
     ...orderedPlanHistory(plan, [...scopeState.planExecutionHistory])
-      .flatMap(({ undoSnapshot }) => undoSnapshot.addedOwnedWeaponIds),
+      .flatMap(({ addedOwnedWeaponIds }) => addedOwnedWeaponIds),
     ...plan.steps.flatMap((step) => {
       const tracked = step.executionEffects?.trackedOwnedWeaponId ?? null
       return step.isCompleted && tracked !== null ? [tracked] : []
@@ -154,6 +155,12 @@ function missingExecutionScope(
     targetWeaponIds: collectExecutionScopeTargetWeaponIds(plan, scopeState, requiredOwnedWeaponIds)
       .filter((id) => !snapshotTargets.has(id)),
   }
+}
+
+/** A record ordered after the save point boundary, with the Undo body the restore reads for it. */
+interface RecordAfterSavePoint {
+  history: ExecutionHistory
+  undoSnapshot: ExecutionUndoSnapshot
 }
 
 /**
@@ -170,17 +177,17 @@ function reconstructScopeStateAtSavePoint(
   savePoint: ExecutionSavePoint,
   state: Pick<ExecutionPersistedState, 'ownedWeapons' | 'targetWeapons' | 'buildListEntries'>,
   kept: readonly ExecutionHistory[],
-  after: readonly ExecutionHistory[],
+  after: readonly RecordAfterSavePoint[],
 ): ExecutionScopeState {
-  const addedAfter = new Set<string>(after.flatMap(({ undoSnapshot }) => undoSnapshot.addedOwnedWeaponIds))
+  const addedAfter = new Set<string>(after.flatMap(({ history }) => history.addedOwnedWeaponIds))
   function outsideSnapshot<T extends { id: string; updatedAt: ISODateTimeString }>(
     snapshot: readonly T[],
     current: readonly T[],
-    befores: (history: ExecutionHistory) => readonly T[],
+    befores: (undoSnapshot: ExecutionUndoSnapshot) => readonly T[],
   ): T[] {
     const inSnapshot = new Set<string>(snapshot.map(({ id }) => id))
     const bodies = new Map<string, T>()
-    after.forEach((history) => befores(history).forEach((body) => {
+    after.forEach(({ undoSnapshot }) => befores(undoSnapshot).forEach((body) => {
       if (!bodies.has(body.id)) bodies.set(body.id, body)
     }))
     current.forEach((body) => {
@@ -192,14 +199,14 @@ function reconstructScopeStateAtSavePoint(
   return {
     ownedWeapons: [
       ...savePoint.ownedWeapons,
-      ...outsideSnapshot(savePoint.ownedWeapons, state.ownedWeapons, ({ undoSnapshot }) => [
+      ...outsideSnapshot(savePoint.ownedWeapons, state.ownedWeapons, (undoSnapshot) => [
         ...undoSnapshot.affectedOwnedWeaponsBefore,
         ...undoSnapshot.removedOwnedWeaponsBefore,
       ]),
     ],
     targetWeapons: [
       ...savePoint.targetWeapons,
-      ...outsideSnapshot(savePoint.targetWeapons, state.targetWeapons, ({ undoSnapshot }) => undoSnapshot.affectedTargetWeaponsBefore),
+      ...outsideSnapshot(savePoint.targetWeapons, state.targetWeapons, (undoSnapshot) => undoSnapshot.affectedTargetWeaponsBefore),
     ],
     buildListEntries: state.buildListEntries,
     planExecutionHistory: kept,
@@ -236,12 +243,14 @@ export function prepareExecutionSavePointRecord(input: ExecutionSavePointRecordI
       `ProductionPlan '${plan.id}' is '${plan.status}'; a game save point is recorded only for an active Plan.`,
     )
   }
+  // Recording advances nothing, so it stays usable for a Plan whose
+  // completion assignments are unsafe (Issue #334, 21.4.1).
   requireExecutableCurrentStep({
     plan,
     planStepId: plan.currentStepId as NonNullable<ProductionPlan['currentStepId']>,
     state,
     currentCalculationContext: input.currentCalculationContext,
-  })
+  }, { advancesPlan: false })
 
   const ownedWeaponIds = collectExecutionScopeOwnedWeaponIds(plan, state)
   const weaponById = new Map(state.ownedWeapons.map((weapon) => [weapon.id, weapon]))
@@ -304,7 +313,12 @@ export interface ExecutionSavePointRestoreInput {
   recordedAt: ISODateTimeString
   state: Pick<
     ExecutionPersistedState,
-    'ownedWeapons' | 'targetWeapons' | 'buildListEntries' | 'planExecutionHistory' | 'executionSavePoint'
+    | 'ownedWeapons'
+    | 'targetWeapons'
+    | 'buildListEntries'
+    | 'planExecutionHistory'
+    | 'undoSnapshotsAfterSavePoint'
+    | 'executionSavePoint'
   >
   currentCalculationContext: CalculationContext
 }
@@ -330,7 +344,10 @@ export interface ExecutionSavePointRestoreWrite {
    */
   restoredTargetWeapons: TargetWeapon[]
   plan: ProductionPlan
-  /** The Plan's ExecutionHistory recorded after the save point, oldest first. */
+  /**
+   * The Plan's ExecutionHistory recorded after the save point, oldest first:
+   * the metadata and the Undo body of each are both deleted.
+   */
   deletedExecutionHistoryIds: ExecutionHistoryId[]
   savePoint: ExecutionSavePoint
 }
@@ -368,6 +385,27 @@ export function splitExecutionHistoryAtSavePoint(
   return {
     kept: ordered.filter((history) => compareExecutionHistoryOrder(history, boundary) <= 0),
     after: ordered.filter((history) => compareExecutionHistoryOrder(history, boundary) > 0),
+  }
+}
+
+/**
+ * The IDs of the Plan's records ordered after its save point boundary: the
+ * records whose Undo bodies a save point restore reads, and the only ones
+ * (`docs/DATA_MODEL.md` 14.6). Empty with no save point, and with a boundary
+ * that is missing or foreign, which the restore itself then refuses
+ * (`save_point_snapshot_invalid`) before it reads any body.
+ */
+export function executionHistoryIdsAfterSavePoint(
+  plan: Pick<ProductionPlan, 'id'>,
+  savePoint: ExecutionSavePoint | null,
+  planExecutionHistory: readonly ExecutionHistory[],
+): ExecutionHistoryId[] {
+  if (savePoint === null) return []
+  try {
+    return splitExecutionHistoryAtSavePoint(plan, savePoint, planExecutionHistory).after.map(({ id }) => id)
+  } catch (caught: unknown) {
+    if (caught instanceof ExecutionRuntimeError && caught.code === 'save_point_snapshot_invalid') return []
+    throw caught
   }
 }
 
@@ -424,7 +462,17 @@ export function prepareExecutionSavePointRestore(input: ExecutionSavePointRestor
     snapshotInvalid(`The snapshot Plan of the game save point is '${snapshotPlan.status}', not active.`)
   }
   assertExecutableProductionPlan(snapshotPlan, input.currentCalculationContext)
-  const { kept, after } = splitExecutionHistoryAtSavePoint(plan, savePoint, state.planExecutionHistory)
+  const { kept, after: afterHistory } = splitExecutionHistoryAtSavePoint(plan, savePoint, state.planExecutionHistory)
+  // The restore reads the Undo body of every record after the save point and
+  // nothing else (`docs/DATA_MODEL.md` 14.6); a missing one is never filled in.
+  const undoSnapshotById = new Map(state.undoSnapshotsAfterSavePoint.map((undoSnapshot) => [undoSnapshot.executionHistoryId, undoSnapshot]))
+  const after: RecordAfterSavePoint[] = afterHistory.map((history) => {
+    const undoSnapshot = undoSnapshotById.get(history.id)
+    if (undoSnapshot === undefined) {
+      snapshotInvalid(`ExecutionHistory '${history.id}' after the game save point has no Undo body to restore from.`)
+    }
+    return { history, undoSnapshot }
+  })
 
   // Fail closed before any write when the restored Plan needs a deleted entity.
   const weapons = new Map(state.ownedWeapons.map((weapon) => [weapon.id, weapon]))
@@ -456,7 +504,7 @@ export function prepareExecutionSavePointRestore(input: ExecutionSavePointRestor
   }
 
   const snapshotWeaponIds = new Set<string>(savePoint.ownedWeapons.map(({ id }) => id))
-  const addedAfter = sortedUnique(after.flatMap(({ undoSnapshot }) => undoSnapshot.addedOwnedWeaponIds))
+  const addedAfter = sortedUnique(afterHistory.flatMap(({ addedOwnedWeaponIds }) => addedOwnedWeaponIds))
   const contradiction = addedAfter.find((id) => snapshotWeaponIds.has(id))
   if (contradiction !== undefined) {
     snapshotInvalid(`OwnedWeapon '${contradiction}' is in the save point yet was registered after it.`)
@@ -495,8 +543,8 @@ export function prepareExecutionSavePointRestore(input: ExecutionSavePointRestor
     assertRestoredValid(`TargetWeapon '${target.id}'`, validateTargetWeapon(target)))
   assertRestoredValid(`ProductionPlan '${restoredPlan.id}'`, validateProductionPlan(restoredPlan))
   assertRestoredValid(
-    'The Target preferred owned weapon collection',
-    validateTargetPreferredOwnedWeapons([...targets.values()], [...weapons.values()]),
+    'The Target preferred owned weapon and completion assignment collections',
+    validateTargetOwnedWeaponCollections([...targets.values()], [...weapons.values()]),
   )
   assertRestoredValid('ExecutionSavePoint', validateExecutionSavePoint(savePoint))
   assertRestoredValid(
@@ -511,7 +559,7 @@ export function prepareExecutionSavePointRestore(input: ExecutionSavePointRestor
     restoredOwnedWeapons,
     restoredTargetWeapons,
     plan: restoredPlan,
-    deletedExecutionHistoryIds: after.map(({ id }) => id),
+    deletedExecutionHistoryIds: afterHistory.map(({ id }) => id),
     savePoint,
   }
 }

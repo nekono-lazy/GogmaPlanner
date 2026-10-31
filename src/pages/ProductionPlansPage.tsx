@@ -23,6 +23,11 @@ import {
 } from '../components/planner/productionPlanListPresentation'
 import type { ProductionPlan, ProductionPlanId } from '../domain/models/publicTypes'
 import { productionPlanRepository } from '../db/repositories/productionPlanRepository'
+import { loadMasterData } from '../domain/master/loadMasterData'
+import {
+  createProductionPlanExecutionService,
+  type ProductionPlanContinuationInspection,
+} from '../services/execution/productionPlanExecutionService'
 import { RepositoryError } from '../db/repositoryError'
 import { useSettingsStore } from '../stores/settingsStore'
 
@@ -39,11 +44,23 @@ export interface ProductionPlansPageDependencies {
    * `draft`, so a Plan started after the list was drawn is never deleted.
    */
   deleteDraftProductionPlan(id: ProductionPlanId): Promise<void>
+  /**
+   * The read-only continuation judgement of a running Plan (Issue #334,
+   * `docs/UI_FLOW.md` 12.11). Absent, no running Plan is judged here; the
+   * Execution runtime refuses an unsafe Plan on its own either way.
+   */
+  inspectProductionPlanContinuation?(planId: ProductionPlanId): Promise<ProductionPlanContinuationInspection>
 }
+
+const loadedMaster = loadMasterData()
+const executionService = loadedMaster.ok ? createProductionPlanExecutionService(loadedMaster.data) : null
 
 const defaultDependencies: ProductionPlansPageDependencies = {
   getAllProductionPlans: () => productionPlanRepository.getAllProductionPlans(),
   deleteDraftProductionPlan: (id) => productionPlanRepository.deleteDraftProductionPlan(id),
+  ...(executionService === null
+    ? {}
+    : { inspectProductionPlanContinuation: (planId: ProductionPlanId) => executionService.inspectProductionPlanContinuation(planId) }),
 }
 
 type LoadState =
@@ -126,6 +143,12 @@ function ProductionPlanListItem({
             </Typography>
           )}
         </Typography>
+
+        {item.continuationNote !== null && (
+          <Typography variant="body2" sx={{ overflowWrap: 'anywhere' }}>
+            {item.continuationNote}
+          </Typography>
+        )}
 
         {item.reasonLabels.length > 0 && (
           <Stack component="ul" spacing={0.25} sx={{ m: 0, pl: 2.5 }}>
@@ -320,9 +343,35 @@ export function ProductionPlansPage({
     }
   }
 
+  // The running Plan (at most one) is judged for its completion assignments
+  // after the list is read; a failed judgement shows nothing extra.
+  const runningPlanId = state.status === 'ready'
+    ? state.plans.find(({ status }) => status === 'active' || status === 'stale')?.id ?? null
+    : null
+  const [unsafePlanIds, setUnsafePlanIds] = useState<ReadonlySet<ProductionPlanId>>(new Set())
+  useEffect(() => {
+    const inspect = dependencies.inspectProductionPlanContinuation
+    if (runningPlanId === null || inspect === undefined) return
+    let active = true
+    inspect(runningPlanId).then(
+      (inspection) => {
+        if (active) {
+          setUnsafePlanIds(inspection.continuation.kind === 'completion_assignment_conflict' ? new Set([runningPlanId]) : new Set())
+        }
+      },
+      () => {
+        if (active) setUnsafePlanIds(new Set())
+      },
+    )
+    return () => {
+      active = false
+    }
+  }, [dependencies, runningPlanId, loadSequence])
+
   const items =
     state.status === 'ready'
-      ? sortProductionPlansForList(state.plans).map(createProductionPlanListItemPresentation)
+      ? sortProductionPlansForList(state.plans).map((plan) =>
+          createProductionPlanListItemPresentation(plan, { completionAssignmentConflict: unsafePlanIds.has(plan.id) }))
       : []
 
   return (

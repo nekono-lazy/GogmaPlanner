@@ -224,6 +224,77 @@ export function validateBuildListEntryReplacements(
 }
 
 /**
+ * One Target-scoped addition of the running Plan replan re-optimization
+ * (`docs/PLANNER_SPEC.md` 18.6): `targetWeaponId` holds no persisted
+ * BuildListEntry, and the Planner-generated BuildListEntry `G` is added for it.
+ *
+ * It is not a replacement - there is no `O` - so it is never written as a
+ * `BuildListEntryReplacement` with an invented `replacedBuildListEntryId`, and
+ * the replacement authority above keeps refusing a generated Entry whose Target
+ * holds no Entry (`replaced_entry_missing`). Like a replacement, it is runtime
+ * metadata only: never a `BuildListEntry` field, never a `PlannerInput` field,
+ * never persisted.
+ */
+export interface BuildListEntryAddition {
+  targetWeaponId: TargetWeaponId
+  /** `G`: the Planner-generated Entry added for a Target that holds no Entry. */
+  generatedBuildListEntryId: BuildListEntryId
+}
+
+/**
+ * The additions of one Entry collection that already holds them, beside the
+ * replacements of the same change (`docs/PLANNER_SPEC.md` 18.6,
+ * `docs/DATA_MODEL.md` 9.4.1): each addition names one Target and one generated
+ * Entry; no Target or generated Entry appears in two additions, and none is also
+ * a Target, a replaced Entry or a generated Entry of a replacement; and each
+ * Target of an addition holds exactly its `G`, whose ID no other Target holds.
+ * A Target without an addition is never looked at here.
+ */
+export function validateBuildListEntryAdditions(
+  entries: readonly Pick<BuildListEntry, 'id' | 'targetWeaponId'>[],
+  additions: readonly BuildListEntryAddition[],
+  replacements: readonly BuildListEntryReplacement[],
+): DomainValidationResult {
+  const issues: DomainValidationIssue[] = []
+  const repeated = (values: readonly string[]) =>
+    [...new Set(values.filter((value, index) => values.indexOf(value) !== index))].sort(compareStableStrings)
+  repeated(additions.map(({ targetWeaponId }) => targetWeaponId)).forEach((targetWeaponId) => {
+    issues.push(issue(`TargetWeapon '${targetWeaponId}' has more than one added BuildListEntry; a Target holds at most one Entry.`))
+  })
+  repeated(additions.map(({ generatedBuildListEntryId }) => generatedBuildListEntryId)).forEach((id) => {
+    issues.push(issue(`Added BuildListEntry '${id}' is added for more than one Target.`))
+  })
+  const replacedTargets = new Set<string>(replacements.map(({ targetWeaponId }) => targetWeaponId))
+  const replacementIds = new Set<string>(
+    replacements.flatMap(({ replacedBuildListEntryId, generatedBuildListEntryId }) => [replacedBuildListEntryId, generatedBuildListEntryId]),
+  )
+  const ordered = [...additions].sort(
+    (left, right) =>
+      compareStableStrings(left.targetWeaponId, right.targetWeaponId) ||
+      compareStableStrings(left.generatedBuildListEntryId, right.generatedBuildListEntryId),
+  )
+  ordered.forEach(({ targetWeaponId, generatedBuildListEntryId }) => {
+    if (replacedTargets.has(targetWeaponId)) {
+      issues.push(issue(`TargetWeapon '${targetWeaponId}' has both a replaced and an added BuildListEntry.`))
+    }
+    if (replacementIds.has(generatedBuildListEntryId)) {
+      issues.push(issue(`Added BuildListEntry '${generatedBuildListEntryId}' is also an Entry of a replacement.`))
+    }
+    const targetIds = entries
+      .filter((entry) => entry.targetWeaponId === targetWeaponId)
+      .map(({ id }) => id)
+      .sort(compareStableStrings)
+    if (targetIds.length !== 1 || targetIds[0] !== generatedBuildListEntryId) {
+      issues.push(issue(`TargetWeapon '${targetWeaponId}' must hold exactly its added BuildListEntry '${generatedBuildListEntryId}', but holds [${targetIds.join(', ')}].`))
+    }
+    if (entries.some((entry) => entry.targetWeaponId !== targetWeaponId && entry.id === generatedBuildListEntryId)) {
+      issues.push(issue(`Added BuildListEntry ID '${generatedBuildListEntryId}' of TargetWeapon '${targetWeaponId}' is held by another Target.`))
+    }
+  })
+  return { isValid: issues.length === 0, issues }
+}
+
+/**
  * The pairing a Planner orchestration result must carry to be persisted
  * (`docs/PLANNER_SPEC.md` 9.2.14 / 9.2.18): exactly one replacement per
  * generated Entry, naming that Entry and its own Target. A result whose

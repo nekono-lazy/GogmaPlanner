@@ -1,7 +1,6 @@
 import type {
   ActualResult,
   CalculationContext,
-  ExecutionHistory,
   ExecutionHistoryId,
   GroupSkillId,
   ISODateTimeString,
@@ -25,12 +24,11 @@ import type { ExecutableProductionPlanStep, ExecutionPersistedState } from './pl
 import {
   applyRngAdvance,
   applyTargetLinks,
-  assertExecutionHistoryValid,
+  createExecutionRecord,
   assertStepResultValid,
   changedEntity,
   changedNormalCounters,
   collectEntityChanges,
-  createExecutionUndoSnapshot,
   createMutableExecutionState,
   inconsistent,
   markTrackedWeaponInProgress,
@@ -313,9 +311,8 @@ function toPersistedActualResult(actual: ExecutionActualResultObservation, note:
  * The operation really consumed its Counter, so `rngAdvance` applies and the
  * Step is completed. The tracked weapon holds the actual result (a
  * production-target Normal is registered with it), the start-of-production
- * effects apply (in progress, target links), and the compromise label and the
- * target completion do not, because the expected state was never reached. The
- * Plan becomes `stale` with `unexpected_result`, stays at the next incomplete
+ * effects apply (in progress, target links), and the target completion does
+ * not, because the expected state was never reached. The Plan becomes `stale` with `unexpected_result`, stays at the next incomplete
  * Step (or none), and keeps every in-progress weapon and its save point.
  * `expectedStateAfter` is not compared: the result differs by definition.
  */
@@ -349,18 +346,23 @@ export function prepareActualResultDifferent(input: ActualResultDifferentInput):
   const changes = collectEntityChanges(state, mutable)
   assertStepResultValid(changes, nextPlan)
 
-  const history: ExecutionHistory = {
-    id: input.executionHistoryId,
-    planId: plan.id,
-    planStepId: step.id,
-    action: 'actual_result_different',
-    actualResult: toPersistedActualResult(input.actualResult, input.note),
-    wasExpected: false,
-    recalculationReason: 'unexpected_result',
-    undoSnapshot: createExecutionUndoSnapshot(plan, state, changes),
-    createdAt: now,
-  }
-  assertExecutionHistoryValid(history)
+  const record = createExecutionRecord({
+    metadata: {
+      id: input.executionHistoryId,
+      planId: plan.id,
+      planStepId: step.id,
+      action: 'actual_result_different',
+      actualResult: toPersistedActualResult(input.actualResult, input.note),
+      wasExpected: false,
+      recalculationReason: 'unexpected_result',
+      createdAt: now,
+    },
+    planBefore: plan,
+    planAfter: nextPlan,
+    state,
+    changes,
+    deletesExecutionSavePoint: false,
+  })
 
   return {
     rngState: changedEntity(state.rngState, counters.rngState) ? counters.rngState : null,
@@ -368,7 +370,8 @@ export function prepareActualResultDifferent(input: ActualResultDifferentInput):
     ownedWeapons: changes.changedWeapons,
     targetWeapons: changes.changedTargets,
     plan: nextPlan,
-    history,
+    history: record.history,
+    undoSnapshot: record.undoSnapshot,
     deletesExecutionSavePoint: false,
   }
 }
@@ -394,25 +397,31 @@ export function prepareOperationUncertain(input: OperationUncertainInput): Execu
   if (!planValidation.isValid) {
     executionFailure('entity_validation_failed', `ProductionPlan '${plan.id}' fails Domain validation after the record.`, planValidation.issues)
   }
-  const history: ExecutionHistory = {
-    id: input.executionHistoryId,
-    planId: plan.id,
-    planStepId: step.id,
-    action: 'operation_uncertain',
-    actualResult: null,
-    wasExpected: false,
-    recalculationReason: 'execution_operation_uncertain',
-    undoSnapshot: createExecutionUndoSnapshot(plan, state, { changedWeapons: [], changedTargets: [] }),
-    createdAt: now,
-  }
-  assertExecutionHistoryValid(history)
+  const record = createExecutionRecord({
+    metadata: {
+      id: input.executionHistoryId,
+      planId: plan.id,
+      planStepId: step.id,
+      action: 'operation_uncertain',
+      actualResult: null,
+      wasExpected: false,
+      recalculationReason: 'execution_operation_uncertain',
+      createdAt: now,
+    },
+    planBefore: plan,
+    planAfter: nextPlan,
+    state,
+    changes: { changedWeapons: [], changedTargets: [] },
+    deletesExecutionSavePoint: false,
+  })
   return {
     rngState: null,
     normalCounters: [],
     ownedWeapons: [],
     targetWeapons: [],
     plan: nextPlan,
-    history,
+    history: record.history,
+    undoSnapshot: record.undoSnapshot,
     deletesExecutionSavePoint: false,
   }
 }

@@ -10,9 +10,18 @@ import type {
   OwnedWeapon,
   TargetWeapon,
 } from './entities'
+import { convertExecutionHistoryCollection } from './executionHistoryConversion'
+import type { LegacyExecutionHistory } from './legacyExecutionHistory'
+import {
+  hasCompletionConditionTargetField,
+  LegacyTargetWeaponMigrationError,
+  migrateLegacyTargetWeaponList,
+  type LegacyTargetWeapon,
+} from './legacyTargetWeapon'
 import type {
   ExecutionHistory,
   ExecutionSavePoint,
+  ExecutionUndoSnapshot,
   ProductionPlan,
 } from './planning'
 import {
@@ -20,6 +29,7 @@ import {
   fillNormalCounterIdentificationProvenance,
   fillProductionPlanConflictRepairLineage,
   fillRngStateIdentificationProvenance,
+  fillTargetWeaponListCompletionAssignment,
   hasConflictRepairLineageField,
   hasIdentificationProvenanceField,
   hasProductionPlanLifecycleField,
@@ -27,11 +37,13 @@ import {
   isLegacyAppSettingsRecord,
   isTerminalProductionPlanRecord,
   RNG_STATE_PROVENANCE_SCHEMA_VERSION,
+  TARGET_COMPLETION_ASSIGNMENT_FIELD,
+  TargetCompletionAssignmentMigrationError,
   upgradeAppSettingsToV2,
 } from './persistenceCompatibility'
 import {
   EXECUTION_PLAN_CONTRACT_APP_SCHEMA_VERSION,
-  validateExecutionHistory,
+  validateExecutionRecordCollection,
   validateExecutionSavePoint,
   validateExecutionSavePointReferences,
   validateNormalArtianCounter,
@@ -69,8 +81,23 @@ import {
  * 11.1.1 / 15.3) to every Plan body - top-level, inside a game save point,
  * inside an Undo snapshot and inside the save point an Undo snapshot holds; a
  * schema 12 root's bodies get `null` on migration.
+ * Version 14 splits the ExecutionHistory records into their metadata
+ * (`executionHistory`) and their Undo bodies (`executionUndoSnapshots`), which
+ * no longer copy the whole Plan (`docs/DATA_MODEL.md` 12.2 / 15.1, Issue #312);
+ * a schema 13 root's records are converted by the rule the Dexie version(11)
+ * upgrade shares, and a record that cannot be converted refuses the root.
+ * Version 15 moves every TargetWeapon body - top-level, in a game save point,
+ * in an Undo body and in the save point an Undo body holds - to the Issue #100
+ * completion condition (`docs/DATA_MODEL.md` 8 / 15.1): a schema 14 root's
+ * bodies are converted by the one Target conversion the Dexie version(12)
+ * upgrade shares.
+ * Version 16 adds the completion assignment `completedWithOwnedWeaponId`
+ * (Issue #334, `docs/DATA_MODEL.md` 8.7 / 15.1) to every TargetWeapon body -
+ * top-level, in a game save point, in an Undo body and in the save point an
+ * Undo body holds; a schema 15 root's bodies get `null` ("not recorded") by
+ * the one fill the Dexie version(13) upgrade shares, never an inferred weapon.
  */
-export const EXPORT_SCHEMA_VERSION = 13
+export const EXPORT_SCHEMA_VERSION = 16
 
 export const EXPORT_APP_NAME = 'mh-wilds-gogma-artian-planner'
 
@@ -85,9 +112,48 @@ export interface ExportRoot {
   buildCandidates: BuildCandidate[]
   buildListEntries: BuildListEntry[]
   productionPlans: ProductionPlan[]
+  /** The ExecutionHistory metadata (`docs/DATA_MODEL.md` 12.2). */
   executionHistory: ExecutionHistory[]
+  /** The ExecutionHistory Undo bodies, 1:1 with `executionHistory`. */
+  executionUndoSnapshots: ExecutionUndoSnapshot[]
   executionSavePoints: ExecutionSavePoint[]
   settings: AppSettings
+}
+
+/** A schema 15 TargetWeapon body: the current body before the completion assignment existed. */
+export type TargetWeaponV15 = Omit<TargetWeapon, 'completedWithOwnedWeaponId'>
+
+/**
+ * The schema 15 Export shape: every TargetWeapon body has the Issue #100
+ * completion condition but no `completedWithOwnedWeaponId` yet. The nested save
+ * point and Undo body types are the current ones only for reading convenience;
+ * their Target bodies lack the field too.
+ */
+export interface ExportRootV15 extends Omit<ExportRoot, 'schemaVersion' | 'targetWeapons'> {
+  schemaVersion: 15
+  targetWeapons: TargetWeaponV15[]
+}
+
+/**
+ * The schema 14 Export shape: every TargetWeapon body is still the legacy
+ * (calculation schema 18) Ideal five slots plus compromise conditions
+ * (`LegacyTargetWeapon`). The nested save point and Undo body types are the
+ * current ones only for reading convenience; their Target bodies are legacy
+ * too.
+ */
+export interface ExportRootV14 extends Omit<ExportRootV15, 'schemaVersion' | 'targetWeapons'> {
+  schemaVersion: 14
+  targetWeapons: LegacyTargetWeapon[]
+}
+
+/**
+ * The schema 13 Export shape: every ExecutionHistory record holds its Undo
+ * snapshot with the whole Plan before the Step (`LegacyExecutionHistory`), and
+ * there is no `executionUndoSnapshots`.
+ */
+export interface ExportRootV13 extends Omit<ExportRootV14, 'schemaVersion' | 'executionHistory' | 'executionUndoSnapshots'> {
+  schemaVersion: 13
+  executionHistory: LegacyExecutionHistory[]
 }
 
 type SchemaV6OwnedWeapon = OwnedWeapon extends infer T
@@ -97,7 +163,7 @@ type SchemaV6OwnedWeapon = OwnedWeapon extends infer T
   : never
 
 type SchemaV6TargetWeapon = Omit<
-  TargetWeapon,
+  LegacyTargetWeapon,
   'lifecycleStatus' | 'completedAt' | 'completedByProductionPlanId'
 >
 
@@ -110,7 +176,7 @@ export type AppSettingsV1 = Omit<AppSettings, 'schemaVersion' | 'candidateSearch
  * The shape every Export schema 6..11 root shares: the current entity types
  * (each schema narrows them below where it differs) with an AppSettings v1.
  */
-interface LegacySettingsExportRoot extends Omit<ExportRoot, 'schemaVersion' | 'settings'> {
+interface LegacySettingsExportRoot extends Omit<ExportRootV13, 'schemaVersion' | 'settings'> {
   settings: AppSettingsV1
 }
 
@@ -178,7 +244,7 @@ export interface ExportRootV11 extends LegacySettingsExportRoot {
  * `conflictRepairLineage`; the entity types are the current ones only for
  * reading convenience.
  */
-export interface ExportRootV12 extends Omit<ExportRoot, 'schemaVersion'> {
+export interface ExportRootV12 extends Omit<ExportRootV13, 'schemaVersion'> {
   schemaVersion: 12
 }
 
@@ -725,7 +791,7 @@ export function migrateExportRootV11ToV12(
  */
 export function migrateExportRootV12ToV13(
   root: ExportRootV12,
-): ExportRootMigrationResult {
+): { ok: true; root: ExportRootV13 } | { ok: false; issues: DomainValidationIssue[] } {
   if (!isRecord(root)) {
     return { ok: false, issues: [structureIssue('', 'Export root must be an object.')] }
   }
@@ -783,7 +849,216 @@ export function migrateExportRootV12ToV13(
     const savePointBefore = snapshot.executionSavePointBefore
     if (isRecord(savePointBefore)) fillPlan(savePointBefore.productionPlan)
   })
-  return { ok: true, root: { ...migrated, schemaVersion: EXPORT_SCHEMA_VERSION } }
+  return { ok: true, root: { ...migrated, schemaVersion: 13 } }
+}
+
+/**
+ * Pure migration from Export schema 13 to 14 (`docs/DATA_MODEL.md` 14.2 / 15.1,
+ * `docs/PLANNER_SPEC.md` 19.8): every ExecutionHistory record becomes its
+ * `docs/DATA_MODEL.md` 12.2 metadata and Undo body through
+ * `convertExecutionHistoryCollection()` - the order rule, the reference Plan rule
+ * and the per-record rule the Dexie version(11) upgrade uses - with the root's
+ * `productionPlans` as the Plans as they are now. Nothing else is converted and
+ * nothing is guessed.
+ *
+ * Fails closed, applying nothing, when any record cannot be converted (a schema
+ * 14 root never holds such a record, unlike a database the upgrade left in
+ * case 2), or when the root already holds a schema 14 part: `executionUndoSnapshots`,
+ * a record with a top-level `addedOwnedWeaponIds`, or an Undo snapshot with a
+ * `productionPlanStateBefore`.
+ */
+export function migrateExportRootV13ToV14(
+  root: ExportRootV13,
+): { ok: true; root: ExportRootV14 } | { ok: false; issues: DomainValidationIssue[] } {
+  if (!isRecord(root)) {
+    return { ok: false, issues: [structureIssue('', 'Export root must be an object.')] }
+  }
+  const record = root as unknown as Record<string, unknown>
+  const shapeIssues = ['productionPlans', 'executionHistory']
+    .flatMap((field) => collectionShapeIssues(record, field))
+  if (shapeIssues.length > 0) return { ok: false, issues: shapeIssues }
+
+  const issues: DomainValidationIssue[] = []
+  if ('executionUndoSnapshots' in record) {
+    issues.push(structureIssue('executionUndoSnapshots', 'A schema 13 Export cannot carry executionUndoSnapshots.'))
+  }
+  root.executionHistory.forEach((history, index) => {
+    const body = history as unknown as Record<string, unknown>
+    const path = `executionHistory[${index}]`
+    if ('addedOwnedWeaponIds' in body) {
+      issues.push(structureIssue(`${path}.addedOwnedWeaponIds`, 'A schema 13 ExecutionHistory cannot carry the schema 14 addedOwnedWeaponIds.'))
+    }
+    if (isRecord(body.undoSnapshot) && 'productionPlanStateBefore' in body.undoSnapshot) {
+      issues.push(structureIssue(`${path}.undoSnapshot.productionPlanStateBefore`, 'A schema 13 Undo snapshot cannot carry the schema 14 productionPlanStateBefore.'))
+    }
+  })
+  if (issues.length > 0) return { ok: false, issues }
+
+  let migrated: ExportRootV13
+  try {
+    migrated = structuredClone(root)
+  } catch {
+    return { ok: false, issues: [structureIssue('', 'Export root cannot be copied.')] }
+  }
+  const conversions = convertExecutionHistoryCollection(migrated.executionHistory, migrated.productionPlans)
+  const executionHistory: ExecutionHistory[] = []
+  const executionUndoSnapshots: ExecutionUndoSnapshot[] = []
+  conversions.forEach((conversion, index) => {
+    const path = `executionHistory[${index}]`
+    if (conversion.kind === 'unconvertible') {
+      issues.push(
+        { path, code: 'invalid_structure', message: `${conversion.message} (${conversion.failure})` },
+        ...conversion.issues.map((issue) => ({ ...issue, path: issue.path ? `${path}.${issue.path}` : path })),
+      )
+      return
+    }
+    executionHistory.push(conversion.executionHistory)
+    executionUndoSnapshots.push(conversion.executionUndoSnapshot)
+  })
+  if (issues.length > 0) return { ok: false, issues }
+  return {
+    ok: true,
+    root: { ...migrated, schemaVersion: 14, executionHistory, executionUndoSnapshots },
+  }
+}
+
+/** Every TargetWeapon body list of an Export root with its path (`docs/DATA_MODEL.md` 15.1 schema 15). */
+function targetWeaponBodyLists(root: Record<string, unknown>): { owner: Record<string, unknown>; field: string; path: string }[] {
+  const lists: { owner: Record<string, unknown>; field: string; path: string }[] = [
+    { owner: root, field: 'targetWeapons', path: 'targetWeapons' },
+  ]
+  const savePoints = root.executionSavePoints
+  if (Array.isArray(savePoints)) {
+    savePoints.forEach((savePoint: unknown, index) => {
+      if (isRecord(savePoint)) lists.push({ owner: savePoint, field: 'targetWeapons', path: `executionSavePoints[${index}].targetWeapons` })
+    })
+  }
+  const snapshots = root.executionUndoSnapshots
+  if (Array.isArray(snapshots)) {
+    snapshots.forEach((snapshot: unknown, index) => {
+      if (!isRecord(snapshot)) return
+      const path = `executionUndoSnapshots[${index}]`
+      lists.push({ owner: snapshot, field: 'affectedTargetWeaponsBefore', path: `${path}.affectedTargetWeaponsBefore` })
+      const deleted = snapshot.deletedExecutionSavePoint
+      if (isRecord(deleted)) lists.push({ owner: deleted, field: 'targetWeapons', path: `${path}.deletedExecutionSavePoint.targetWeapons` })
+    })
+  }
+  return lists
+}
+
+/**
+ * Pure migration from Export schema 14 to 15 (`docs/DATA_MODEL.md` 8.6 / 15.1,
+ * `docs/PLANNER_SPEC.md` 20.8): every TargetWeapon body - top-level, in a game
+ * save point, in an Undo body and in the save point an Undo body holds - goes
+ * through `migrateLegacyTargetWeaponToCompletionConditions()`, the conversion
+ * the Dexie version(12) upgrade shares. Nothing else is converted and nothing
+ * is guessed: BuildCandidate / BuildListEntry / ProductionPlan /
+ * ExecutionHistory bodies keep their contents and fail closed at the
+ * calculation schema 19 boundary.
+ *
+ * Fails closed, applying nothing, when a Target body already carries a schema
+ * 15 field (it is not a schema 14 body) or lacks the legacy structure.
+ */
+export function migrateExportRootV14ToV15(
+  root: ExportRootV14,
+): { ok: true; root: ExportRootV15 } | { ok: false; issues: DomainValidationIssue[] } {
+  if (!isRecord(root)) {
+    return { ok: false, issues: [structureIssue('', 'Export root must be an object.')] }
+  }
+  const record = root as unknown as Record<string, unknown>
+  const shapeIssues = ['targetWeapons', 'executionSavePoints', 'executionUndoSnapshots']
+    .flatMap((field) => collectionShapeIssues(record, field))
+  if (shapeIssues.length > 0) return { ok: false, issues: shapeIssues }
+
+  const issues: DomainValidationIssue[] = []
+  targetWeaponBodyLists(record).forEach(({ owner, field, path }) => {
+    const list = owner[field]
+    if (!Array.isArray(list)) {
+      issues.push(structureIssue(path, `${path} must be an array.`))
+      return
+    }
+    list.forEach((target: unknown, index) => {
+      if (isRecord(target) && hasCompletionConditionTargetField(target)) {
+        issues.push(structureIssue(`${path}[${index}]`, 'A schema 14 TargetWeapon cannot carry a schema 15 completion condition field.'))
+      }
+    })
+  })
+  if (issues.length > 0) return { ok: false, issues }
+
+  let migrated: Record<string, unknown>
+  try {
+    migrated = structuredClone(record)
+  } catch {
+    return { ok: false, issues: [structureIssue('', 'Export root cannot be copied.')] }
+  }
+  try {
+    targetWeaponBodyLists(migrated).forEach(({ owner, field, path }) => {
+      owner[field] = migrateLegacyTargetWeaponList(owner[field], path)
+    })
+  } catch (error) {
+    if (error instanceof LegacyTargetWeaponMigrationError) {
+      return { ok: false, issues: [structureIssue(error.path, error.message)] }
+    }
+    throw error
+  }
+  return { ok: true, root: { ...(migrated as unknown as ExportRootV15), schemaVersion: 15 } }
+}
+
+/**
+ * Pure migration from Export schema 15 to 16 (Issue #334, `docs/DATA_MODEL.md`
+ * 8.7 / 15.1, `docs/PLANNER_SPEC.md` 21.3 / 21.9): every TargetWeapon body -
+ * top-level, in a game save point, in an Undo body and in the save point an
+ * Undo body holds - gets `completedWithOwnedWeaponId = null` through
+ * `fillTargetWeaponCompletionAssignment()`, the fill the Dexie version(13)
+ * upgrade shares. A `completed` Target gets `null` ("not recorded") too:
+ * nothing is inferred from `completedByProductionPlanId`, a Plan's
+ * `targetCompletions` or an owned Ideal weapon, and every other collection and
+ * field keeps its exact contents.
+ *
+ * Fails closed, applying nothing, when a Target body already carries the field
+ * (a root claiming schema 15 whose bodies are not schema 15 bodies).
+ */
+export function migrateExportRootV15ToV16(root: ExportRootV15): ExportRootMigrationResult {
+  if (!isRecord(root)) {
+    return { ok: false, issues: [structureIssue('', 'Export root must be an object.')] }
+  }
+  const record = root as unknown as Record<string, unknown>
+  const shapeIssues = ['targetWeapons', 'executionSavePoints', 'executionUndoSnapshots']
+    .flatMap((field) => collectionShapeIssues(record, field))
+  if (shapeIssues.length > 0) return { ok: false, issues: shapeIssues }
+
+  const issues: DomainValidationIssue[] = []
+  targetWeaponBodyLists(record).forEach(({ owner, field, path }) => {
+    const list = owner[field]
+    if (!Array.isArray(list)) {
+      issues.push(structureIssue(path, `${path} must be an array.`))
+      return
+    }
+    list.forEach((target: unknown, index) => {
+      if (isRecord(target) && TARGET_COMPLETION_ASSIGNMENT_FIELD in target) {
+        issues.push(structureIssue(`${path}[${index}]`, 'A schema 15 TargetWeapon cannot carry the schema 16 completedWithOwnedWeaponId field.'))
+      }
+    })
+  })
+  if (issues.length > 0) return { ok: false, issues }
+
+  let migrated: Record<string, unknown>
+  try {
+    migrated = structuredClone(record)
+  } catch {
+    return { ok: false, issues: [structureIssue('', 'Export root cannot be copied.')] }
+  }
+  try {
+    targetWeaponBodyLists(migrated).forEach(({ owner, field, path }) => {
+      fillTargetWeaponListCompletionAssignment(owner[field], path)
+    })
+  } catch (error) {
+    if (error instanceof TargetCompletionAssignmentMigrationError) {
+      return { ok: false, issues: [structureIssue(error.path, error.message)] }
+    }
+    throw error
+  }
+  return { ok: true, root: { ...(migrated as unknown as ExportRoot), schemaVersion: EXPORT_SCHEMA_VERSION } }
 }
 
 function prefixed(
@@ -796,6 +1071,17 @@ function prefixed(
       ? `${prefix}${issue.path.startsWith('[') ? '' : '.'}${issue.path}`
       : prefix,
   }))
+}
+
+/**
+ * The ExecutionHistory records of a current-schema root (`docs/DATA_MODEL.md`
+ * 12.2 / 15.2), through the one record collection authority
+ * `validateExecutionRecordCollection()`. A record of the schema 13 shape fails
+ * the metadata validation, and no Plan body before a Step is validated record
+ * by record.
+ */
+function executionRecordIssues(root: ExportRoot): DomainValidationIssue[] {
+  return validateExecutionRecordCollection(root.executionHistory, root.executionUndoSnapshots, root.productionPlans).issues
 }
 
 /**
@@ -828,6 +1114,7 @@ export function validateExportRootExecutionLifecycle(
     'targetWeapons',
     'productionPlans',
     'executionHistory',
+    'executionUndoSnapshots',
     'executionSavePoints',
   ].flatMap((field) => collectionShapeIssues(record, field))
   if (shapeIssues.length > 0) {
@@ -853,10 +1140,7 @@ export function validateExportRootExecutionLifecycle(
     const path = `productionPlans[${index}]`
     issues.push(...runTypedValidation(path, () => prefixed(path, validateProductionPlan(plan))))
   })
-  root.executionHistory.forEach((history, index) => {
-    const path = `executionHistory[${index}]`
-    issues.push(...runTypedValidation(path, () => prefixed(path, validateExecutionHistory(history))))
-  })
+  issues.push(...executionRecordIssues(root))
   root.executionSavePoints.forEach((savePoint, index) => {
     const path = `executionSavePoints[${index}]`
     issues.push(...runTypedValidation(path, () => prefixed(path, validateExecutionSavePoint(savePoint))))
@@ -927,15 +1211,19 @@ export function validateCurrentExportRoot(root: ExportRoot): DomainValidationRes
 /**
  * Brings a parsed Export object to the current schema and validates its
  * Execution lifecycle state and root-level RNG persistent state, failing closed
- * on anything else. Schema 13 is read as is; schema 12 goes through
- * `migrateExportRootV12ToV13()`; schema 11 through `migrateExportRootV11ToV12()`
- * and then 12 -> 13 (its one Draft is current data and is never deleted);
+ * on anything else. Schema 16 is read as is; schema 15 goes through
+ * `migrateExportRootV15ToV16()`; schema 14 through `migrateExportRootV14ToV15()`
+ * and then 15 -> 16; schema 13 through `migrateExportRootV13ToV14()` and then
+ * 14 -> 15 -> 16; schema 12 through `migrateExportRootV12ToV13()` and then
+ * 13 -> 14 -> 15 -> 16; schema 11 through `migrateExportRootV11ToV12()` and then
+ * 12 -> 13 -> 14 -> 15 -> 16 (its one Draft is current data and is never deleted);
  * schema 10, 9, 8, 7 and 6 go through the pure migrations in order
  * (`migrateExportRootV6ToV7()`, `migrateExportRootV7ToV8()`,
  * `migrateExportRootV8ToV9()`, `migrateExportRootV9ToV10()`,
  * `migrateExportRootV10ToV11()`, `migrateExportRootV11ToV12()`,
- * `migrateExportRootV12ToV13()`), and every other version is refused. Nothing
- * is applied here: the caller replaces its data only after a successful result.
+ * `migrateExportRootV12ToV13()`, `migrateExportRootV13ToV14()`,
+ * `migrateExportRootV14ToV15()`, `migrateExportRootV15ToV16()`), and every other version is refused. Nothing is applied here: the caller replaces its data only
+ * after a successful result.
  */
 export function prepareExportRootForImport(
   input: unknown,
@@ -955,8 +1243,20 @@ export function prepareExportRootForImport(
   }
   // Each step of the chain runs the pure migrations in order and stops at the
   // first refusal.
-  const fromV12 = (v12: ExportRootV12): ExportRootMigrationResult =>
-    migrateExportRootV12ToV13(v12)
+  const fromV15 = (v15: ExportRootV15): ExportRootMigrationResult =>
+    migrateExportRootV15ToV16(v15)
+  const fromV14 = (v14: ExportRootV14): ExportRootMigrationResult => {
+    const toV15 = migrateExportRootV14ToV15(v14)
+    return toV15.ok ? fromV15(toV15.root) : toV15
+  }
+  const fromV13 = (v13: ExportRootV13): ExportRootMigrationResult => {
+    const toV14 = migrateExportRootV13ToV14(v13)
+    return toV14.ok ? fromV14(toV14.root) : toV14
+  }
+  const fromV12 = (v12: ExportRootV12): ExportRootMigrationResult => {
+    const toV13 = migrateExportRootV12ToV13(v12)
+    return toV13.ok ? fromV13(toV13.root) : toV13
+  }
   const fromV11 = (v11: ExportRootV11): ExportRootMigrationResult => {
     const toV12 = migrateExportRootV11ToV12(v11)
     return toV12.ok ? fromV12(toV12.root) : toV12
@@ -984,6 +1284,7 @@ export function prepareExportRootForImport(
       'targetWeapons',
       'productionPlans',
       'executionHistory',
+      'executionUndoSnapshots',
       'executionSavePoints',
     ].flatMap((field) => collectionShapeIssues(candidate, field))
     if (shapeIssues.length > 0) return { ok: false, issues: shapeIssues }
@@ -992,6 +1293,12 @@ export function prepareExportRootForImport(
     } catch {
       return { ok: false, issues: [structureIssue('', 'Export root cannot be copied.')] }
     }
+  } else if (candidate.schemaVersion === 15) {
+    migrated = fromV15(input as ExportRootV15)
+  } else if (candidate.schemaVersion === 14) {
+    migrated = fromV14(input as ExportRootV14)
+  } else if (candidate.schemaVersion === 13) {
+    migrated = fromV13(input as ExportRootV13)
   } else if (candidate.schemaVersion === 12) {
     migrated = fromV12(input as ExportRootV12)
   } else if (candidate.schemaVersion === 11) {

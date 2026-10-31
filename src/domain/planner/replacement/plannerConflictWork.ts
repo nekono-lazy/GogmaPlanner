@@ -1,5 +1,4 @@
 import type { TargetWeaponId } from '../../models/publicTypes'
-import type { PlannerCheckpointRequirements } from '../plannerCheckpoints'
 import {
   plannerConflictResourceKey,
   type PlannerConflictContext,
@@ -14,6 +13,10 @@ import {
  * 9.2.19.16): the Planner Alternative kernel reads the scenario-only works of
  * `preparePlannerConflictScenario()`. The legacy B8 constrained re-search that
  * also built them was removed in Phase 6-B2b.
+ *
+ * Calculation schema 11..18 also marked a work blocked by a selected compromise
+ * checkpoint; Issue #100 removed the selection (`docs/PLANNER_SPEC.md` 20.7 /
+ * 20.10), and an input with one fails closed before any scenario exists.
  */
 
 /** One Target that must be re-searched because of one fixed conflict choice. */
@@ -22,15 +25,6 @@ export interface PlannerConflictWork {
   originalConflictId: string
   constraint: PlannerFixedConflictConstraint
   targetWeaponId: TargetWeaponId
-  /**
-   * This Target has a required checkpoint Entry somewhere in the current
-   * Planner input - not necessarily among this conflict's participants. No
-   * Route replacement is attempted for the Target: an alternate Route would
-   * bypass that checkpoint, and the Planner never drops, moves, or empties a
-   * selection (`docs/PLANNER_SPEC.md` 9.5.2). The conflict stays a conflict
-   * until the Build List selection changes.
-   */
-  blockedBySelectedCheckpoint: boolean
   orderKey: string
 }
 
@@ -51,7 +45,6 @@ function compareStableStrings(left: string, right: string): number {
 export function createPlannerConflictWorks(
   constraints: readonly PlannerFixedConflictConstraint[],
   conflictContexts: readonly PlannerConflictContext[],
-  checkpointRequirements: PlannerCheckpointRequirements,
 ): PlannerConflictWork[] {
   const contextById = new Map(
     conflictContexts.map((context) => [context.conflictId, context]),
@@ -71,19 +64,6 @@ export function createPlannerConflictWorks(
         originalConflictId: constraint.originalConflictId,
         constraint,
         targetWeaponId: participant.targetWeaponId,
-        // Target-wide, from the whole valid Entry set of the run: a required
-        // checkpoint Entry of this Target blocks its re-search even when the
-        // participant here is another, selection-free Entry. The participant
-        // flag is kept as a second, narrower witness of the same fact.
-        blockedBySelectedCheckpoint:
-          checkpointRequirements.requiredEntryIdByTargetId.has(
-            participant.targetWeaponId,
-          ) ||
-          context.participants.some(
-            (other) =>
-              other.targetWeaponId === participant.targetWeaponId &&
-              other.hasSelectedCheckpoints,
-          ),
         orderKey: [
           plannerConflictResourceKey(constraint.resourceIdentity),
           constraint.fixedBuildListEntryId,

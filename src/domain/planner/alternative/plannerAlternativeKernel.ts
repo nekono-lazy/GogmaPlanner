@@ -165,7 +165,6 @@ export type PlannerAlternativeKernelTrialEventResult =
  */
 export type PlannerAlternativeKernelInstrumentationEvent =
   | ({ type: 'target_started' } & PlannerAlternativeKernelTargetEventBase)
-  | ({ type: 'target_skipped_checkpoint' } & PlannerAlternativeKernelTargetEventBase)
   | ({ type: 'target_stopped_rerun_bound' } & PlannerAlternativeKernelTargetEventBase)
   | ({ type: 'search_started' } & PlannerAlternativeKernelTargetEventBase)
   | ({
@@ -239,8 +238,6 @@ export type PlannerAlternativeKernelOutcome =
   | { status: 'stopped_by_search_extent_bound' }
   | { status: 'stopped_by_candidate_trial_bound' }
   | { status: 'stopped_by_planner_rerun_bound' }
-  /** A required checkpoint Entry of this Target: no alternative is searched (9.5.2). */
-  | { status: 'blocked_by_selected_checkpoint' }
 
 export interface PlannerAlternativeKernelTrialRecord {
   candidateKey: string
@@ -343,8 +340,8 @@ export type PlannerAlternativeKernelPreparationResult =
 /**
  * The request-entry extent check (`docs/PLANNER_SPEC.md` 9.2.19.12): the extent
  * is caller-required, so it is refused before any preparation - not only when
- * a Target's search reaches the Search Domain, which a checkpoint-blocked
- * Target or a spent budget never does. The rule itself is the Search Domain's
+ * a Target's search reaches the Search Domain, which a Target behind a spent
+ * budget never does. The rule itself is the Search Domain's
  * `validatePlannerAlternativeSearchExtent()`; no value is substituted,
  * completed or clamped.
  */
@@ -575,12 +572,6 @@ export async function runPreparedPlannerAlternativeKernel(
       invalidatedRouteKey,
       fixedRouteBuildListEntryIds,
       excludedRouteKeys,
-    }
-    if (work.blockedBySelectedCheckpoint) {
-      // A selected checkpoint is a hard constraint on this Target's Route: no
-      // alternative is searched, materialized or trialled (9.5.2).
-      onEvent?.({ type: 'target_skipped_checkpoint', ...targetEventBase(work, targetOrdinal) })
-      return { ...base, reservation: null, outcome: { status: 'blocked_by_selected_checkpoint' }, search: null, trials: [], skippedExcludedRouteKeys: [] }
     }
     if (budget.exhausted) {
       // No full Planner run is left to judge anything for this Target.

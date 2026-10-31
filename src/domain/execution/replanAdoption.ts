@@ -12,6 +12,7 @@ import type {
 import { collectReferencedOwnedWeaponIds } from '../models/hashing'
 import {
   isCalculationContextCompatible,
+  isExecutionContractProductionPlan,
   validateOwnedWeapon,
   validateProductionPlan,
 } from '../models/publicTypes'
@@ -27,8 +28,12 @@ import {
   createDependentBuildListEntriesHash,
   createDependentTargetDefinitionsHash,
 } from '../planner/productionPlanGeneration'
-import { validateTargetPreferredOwnedWeapons } from '../target/preferredOwnedWeapon'
-import { executionFailure } from './executionRuntimeError'
+import {
+  inspectProductionPlanCompletionAssignmentSafety,
+  type ProductionPlanCompletionAssignmentIssue,
+} from '../planner/productionPlanCompletionAssignmentSafety'
+import { validateTargetOwnedWeaponCollections } from '../target/preferredOwnedWeapon'
+import { ExecutionRuntimeError, executionFailure } from './executionRuntimeError'
 import {
   prepareExecutionSavePointRestore,
   type ExecutionSavePointRestoreWrite,
@@ -36,7 +41,9 @@ import {
 import {
   assertRunningPlanSavePointDecision,
   deriveRunningPlanSavePointChoiceRequirement,
+  runningPlanSavePointChoiceOptions,
   type PlanAbandonSavePointDecision,
+  type RunningPlanSavePointChoiceOptions,
   type RunningProductionPlanStatus,
 } from './planAbandonment'
 import {
@@ -93,6 +100,20 @@ export interface ProductionPlanReplanPreview {
 export type ProductionPlanReplanPreviewAdoptability =
   | { adoptable: true; plan: ProductionPlan }
   | { adoptable: false; reason: 'no_plan' | 'incomplete_search' | 'invalid_result'; message: string }
+  /**
+   * The new Plan itself would make one weapon the completion of two Targets
+   * (Issue #334, `docs/PLANNER_SPEC.md` 21.4.1 item 4) - under the current
+   * Planner, two zero-operation Candidates on one owned Gogma. Judged from the
+   * Plan alone (`inspectProductionPlanCompletionAssignmentSafety()` with no
+   * Target collection); a weapon assigned elsewhere since the Preview is refused
+   * by the adoption's Plan start.
+   */
+  | {
+      adoptable: false
+      reason: 'completion_assignment_conflict'
+      message: string
+      issues: ProductionPlanCompletionAssignmentIssue[]
+    }
 
 /**
  * The running-Plan token of a replan Preview. Only an `active` or `stale` Plan
@@ -157,12 +178,29 @@ export function describeReplanPreviewAdoptability(
   if (issue !== null) {
     return { adoptable: false, reason: 'invalid_result', message: issueMessage(issue) }
   }
+  // The Plan's own completions, whatever the persisted Targets are: a fresh
+  // Planner input already excludes a completion-assigned weapon, so only one
+  // weapon completing two of the new Plan's Targets is left (21.4.1).
+  const safety = isExecutionContractProductionPlan(plan)
+    ? inspectProductionPlanCompletionAssignmentSafety(plan, [])
+    : { safe: true as const }
+  if (!safety.safe) {
+    return {
+      adoptable: false,
+      reason: 'completion_assignment_conflict',
+      message: `The replan Preview's Plan would make one owned weapon the completion of two Targets (${safety.issues.map(({ reason }) => reason).join(', ')}).`,
+      issues: safety.issues,
+    }
+  }
   return { adoptable: true, plan }
 }
 
 function requireAdoptablePlan(preview: ProductionPlanReplanPreview): ProductionPlan {
   const adoptability = describeReplanPreviewAdoptability(preview)
   if (adoptability.adoptable) return adoptability.plan
+  if (adoptability.reason === 'completion_assignment_conflict') {
+    throw new ExecutionRuntimeError('completion_assignment_conflict', adoptability.message, [], adoptability.issues)
+  }
   const { plan, termination } = preview.result
   const issue = plan === null ? null : checkPersistableOrdinaryPlannerResultShape(plan, termination)
   executionFailure(
@@ -174,9 +212,10 @@ function requireAdoptablePlan(preview: ProductionPlanReplanPreview): ProductionP
 
 /**
  * The running Plan must still be exactly the one the Preview started from
- * (16.8): same Plan, same status, same current Step.
+ * (16.8): same Plan, same status, same current Step. Shared with the running
+ * Plan replan re-optimization adoption (`docs/PLANNER_SPEC.md` 18.8).
  */
-function assertRunningPlanTokenHolds(plan: ProductionPlan, token: ReplanRunningPlanToken): void {
+export function assertReplanRunningPlanTokenHolds(plan: ProductionPlan, token: ReplanRunningPlanToken): void {
   if (
     plan.id !== token.planId ||
     plan.status !== token.status ||
@@ -191,7 +230,7 @@ function assertRunningPlanTokenHolds(plan: ProductionPlan, token: ReplanRunningP
 
 type ReplanAdoptionReadState = Pick<
   ExecutionPersistedState,
-  'ownedWeapons' | 'targetWeapons' | 'buildListEntries' | 'planExecutionHistory' | 'executionSavePoint'
+  'ownedWeapons' | 'targetWeapons' | 'buildListEntries' | 'planExecutionHistory' | 'undoSnapshotsAfterSavePoint' | 'executionSavePoint'
 >
 
 /**
@@ -205,46 +244,34 @@ export type ProductionPlanReplanAdoptionOptions = {
   runningPlanStatus: RunningProductionPlanStatus
   runningPlanCurrentStepId: PlanStepId | null
   newPlanId: ProductionPlanId
-} & (
-  | { savePointChoiceRequired: false }
-  | {
-      savePointChoiceRequired: true
-      savePointRecordedAt: ISODateTimeString
-      savePointLastExecutionHistoryId: ExecutionSavePointRestoreWrite['savePoint']['lastExecutionHistoryId']
-      /** The running Plan's current Step when the save point was recorded. */
-      savePointCurrentStepId: PlanStepId | null
-    }
-)
+} & RunningPlanSavePointChoiceOptions
 
 /**
  * Reads what adopting the Preview would ask. It refuses a Preview that can
  * never be adopted or whose running Plan already moved on, and changes nothing.
+ * The restore is offered only where `savePointRestore` says it can run: a
+ * running Plan the current CalculationContext cannot execute is still adopted
+ * from its current state (Issue #335).
  */
 export function inspectProductionPlanReplanAdoption(
   preview: ProductionPlanReplanPreview,
   runningPlan: ProductionPlan,
   state: Pick<ReplanAdoptionReadState, 'planExecutionHistory' | 'executionSavePoint'>,
+  currentCalculationContext: CalculationContext,
 ): ProductionPlanReplanAdoptionOptions {
-  assertRunningPlanTokenHolds(runningPlan, preview.runningPlanToken)
+  assertReplanRunningPlanTokenHolds(runningPlan, preview.runningPlanToken)
   const newPlan = requireAdoptablePlan(preview)
-  const base = {
-    runningPlanId: runningPlan.id,
-    runningPlanStatus: preview.runningPlanToken.status,
-    runningPlanCurrentStepId: runningPlan.currentStepId,
-    newPlanId: newPlan.id,
-  }
   const choice = deriveRunningPlanSavePointChoiceRequirement(
     runningPlan,
     state.executionSavePoint,
     state.planExecutionHistory,
   )
-  if (!choice.required) return { ...base, savePointChoiceRequired: false }
   return {
-    ...base,
-    savePointChoiceRequired: true,
-    savePointRecordedAt: choice.savePoint.recordedAt,
-    savePointLastExecutionHistoryId: choice.savePoint.lastExecutionHistoryId,
-    savePointCurrentStepId: choice.savePoint.productionPlan.currentStepId,
+    runningPlanId: runningPlan.id,
+    runningPlanStatus: preview.runningPlanToken.status,
+    runningPlanCurrentStepId: runningPlan.currentStepId,
+    newPlanId: newPlan.id,
+    ...runningPlanSavePointChoiceOptions(runningPlan, choice, currentCalculationContext),
   }
 }
 
@@ -298,7 +325,12 @@ function replanStateChanged(message: string): never {
   executionFailure('replan_state_changed', `${message} Preview again from the current state.`)
 }
 
-function throwAdoptionIssue(issue: PlannerResultPersistenceIssue | null): void {
+/**
+ * Maps a shared save-time issue onto the replan adoption's error boundary
+ * (16.8 / 18.8): a state change is `replan_state_changed`, anything about the
+ * result itself `replan_result_invalid`; `null` passes.
+ */
+export function throwReplanAdoptionIssue(issue: PlannerResultPersistenceIssue | null): void {
   if (issue === null) return
   if (issue.kind === 'state_changed') replanStateChanged(issue.message)
   executionFailure(
@@ -328,7 +360,7 @@ export function prepareProductionPlanReplanAdoption(
   input: ProductionPlanReplanAdoptionInput,
 ): ProductionPlanReplanAdoptionWrite {
   const { preview, runningPlan, savePointDecision, state, now } = input
-  assertRunningPlanTokenHolds(runningPlan, preview.runningPlanToken)
+  assertReplanRunningPlanTokenHolds(runningPlan, preview.runningPlanToken)
   const newPlan = requireAdoptablePlan(preview)
 
   const choice = deriveRunningPlanSavePointChoiceRequirement(
@@ -374,34 +406,9 @@ export function prepareProductionPlanReplanAdoption(
     now,
   })
   const startedPlan = start.plan
-
-  const oldPlan: ProductionPlan = {
-    // `currentStepId`, every Step completion and `recalculationReasons` stay:
-    // the Plan records where it stopped, and a stale reason survives (16.2).
-    ...structuredClone(runningPlan),
-    status: 'abandoned',
-    abandonmentReason: 'replan_adopted',
-    abandonedAt: now,
-    completedAt: null,
-    updatedAt: now,
-  }
-
-  const trackedByNewPlan = collectNewPlanTrackedOwnedWeaponIds(startedPlan, buildListEntries, state.ownedWeapons)
-  const ownedWeapons = state.ownedWeapons.flatMap((weapon): OwnedWeapon[] => {
-    const inProgress = weapon.executionInProgress
-    if (inProgress?.productionPlanId !== runningPlan.id) return []
-    return [{
-      ...structuredClone(weapon),
-      // The physical production that started under the running Plan goes on
-      // under the new Plan, so its start time is kept (16.10.1).
-      executionInProgress: trackedByNewPlan.has(weapon.id)
-        ? { productionPlanId: startedPlan.id, startedAt: inProgress.startedAt }
-        : null,
-      updatedAt: now,
-    }]
-  })
-
-  assertAdoptedStateValid(oldPlan, startedPlan, ownedWeapons, start.targetWeapons, input)
+  const oldPlan = replanAdoptedRunningPlan(runningPlan, now)
+  const ownedWeapons = transferReplanInProgressWeapons(runningPlan.id, startedPlan, buildListEntries, state.ownedWeapons, now)
+  assertReplanAdoptedStateValid(oldPlan, startedPlan, ownedWeapons, start.targetWeapons, state)
   return {
     kind: 'adopted',
     savePointHandling: savePointDecision === null ? 'no_choice' : 'keep_current',
@@ -466,12 +473,59 @@ function assertPreviewStateHolds(
       'The current RNG, Normal Counter, OwnedWeapon or Plan-dependent Target state differs from the state the replan Preview was calculated from.',
     )
   }
-  throwAdoptionIssue(checkProductionPlanBuildListEntryReferences(newPlan, buildListEntries))
+  throwReplanAdoptionIssue(checkProductionPlanBuildListEntryReferences(newPlan, buildListEntries))
   // No save changes the Target of an existing Entry (a replacement adds a new
   // Entry), so each rejected Entry still in the Build List carries the Target
   // the Preview's Plan generation copied (DATA_MODEL 11.9).
-  throwAdoptionIssue(checkRejectedBuildListEntryTargets(newPlan, buildListEntries))
+  throwReplanAdoptionIssue(checkRejectedBuildListEntryTargets(newPlan, buildListEntries))
   return buildListEntries
+}
+
+/**
+ * The running Plan as a replan adoption ends it (16.8 / 18.8): `abandoned` with
+ * `replan_adopted`. `currentStepId`, every Step completion and
+ * `recalculationReasons` stay: the Plan records where it stopped, and a stale
+ * reason survives (16.2).
+ */
+export function replanAdoptedRunningPlan(runningPlan: ProductionPlan, now: ISODateTimeString): ProductionPlan {
+  return {
+    ...structuredClone(runningPlan),
+    status: 'abandoned',
+    abandonmentReason: 'replan_adopted',
+    abandonedAt: now,
+    completedAt: null,
+    updatedAt: now,
+  }
+}
+
+/**
+ * The weapons in progress for the running Plan after a replan adoption (16.8 /
+ * 16.10.1 / 18.4): a weapon the started new Plan keeps tracking (a selected
+ * Entry Route of the new Plan in `buildListEntries` references it, and it
+ * exists) moves to the new Plan with its `startedAt` kept - the physical
+ * production that started under the running Plan goes on -, every other one
+ * stops being in progress. A weapon not in progress for the running Plan is
+ * never touched, so no weapon becomes in progress by the adoption alone.
+ */
+export function transferReplanInProgressWeapons(
+  runningPlanId: ProductionPlanId,
+  startedPlan: ProductionPlan,
+  buildListEntries: readonly BuildListEntry[],
+  ownedWeapons: readonly OwnedWeapon[],
+  now: ISODateTimeString,
+): OwnedWeapon[] {
+  const trackedByNewPlan = collectNewPlanTrackedOwnedWeaponIds(startedPlan, buildListEntries, ownedWeapons)
+  return ownedWeapons.flatMap((weapon): OwnedWeapon[] => {
+    const inProgress = weapon.executionInProgress
+    if (inProgress?.productionPlanId !== runningPlanId) return []
+    return [{
+      ...structuredClone(weapon),
+      executionInProgress: trackedByNewPlan.has(weapon.id)
+        ? { productionPlanId: startedPlan.id, startedAt: inProgress.startedAt }
+        : null,
+      updatedAt: now,
+    }]
+  })
 }
 
 /**
@@ -499,14 +553,14 @@ function collectNewPlanTrackedOwnedWeaponIds(
  * The adopted state validated before any write: both Plans, every changed
  * weapon, the Target preference collection over the next weapons and the
  * Targets the new Plan's start effect changed, and no weapon left in progress
- * for the abandoned Plan.
+ * for the abandoned Plan. `state` is the persisted state the changes apply to.
  */
-function assertAdoptedStateValid(
+export function assertReplanAdoptedStateValid(
   oldPlan: ProductionPlan,
   newPlan: ProductionPlan,
   changedWeapons: readonly OwnedWeapon[],
   changedTargets: readonly TargetWeapon[],
-  input: ProductionPlanReplanAdoptionInput,
+  state: Pick<ExecutionPersistedState, 'ownedWeapons' | 'targetWeapons'>,
 ): void {
   for (const plan of [oldPlan, newPlan]) {
     const validation = validateProductionPlan(plan)
@@ -521,12 +575,12 @@ function assertAdoptedStateValid(
     }
   }
   const changedById = new Map(changedWeapons.map((weapon) => [weapon.id, weapon]))
-  const nextWeapons = input.state.ownedWeapons.map((weapon) => changedById.get(weapon.id) ?? weapon)
+  const nextWeapons = state.ownedWeapons.map((weapon) => changedById.get(weapon.id) ?? weapon)
   const targetById = new Map(changedTargets.map((target) => [target.id, target]))
-  const nextTargets = input.state.targetWeapons.map((target) => targetById.get(target.id) ?? target)
-  const preferences = validateTargetPreferredOwnedWeapons(nextTargets, nextWeapons)
+  const nextTargets = state.targetWeapons.map((target) => targetById.get(target.id) ?? target)
+  const preferences = validateTargetOwnedWeaponCollections(nextTargets, nextWeapons)
   if (!preferences.isValid) {
-    executionFailure('collection_validation_failed', 'The Target preferred owned weapon collection is invalid after the replan adoption.', preferences.issues)
+    executionFailure('collection_validation_failed', 'The Target preferred owned weapon or completion assignment collection is invalid after the replan adoption.', preferences.issues)
   }
   const stillInProgress = nextWeapons.find(({ executionInProgress }) => executionInProgress?.productionPlanId === oldPlan.id)
   if (stillInProgress !== undefined) {

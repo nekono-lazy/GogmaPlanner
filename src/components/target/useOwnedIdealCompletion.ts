@@ -1,8 +1,16 @@
 import { useCallback, useMemo, useState } from 'react'
 import type { PlanBreakingChangeApproval, PlanBreakingChangeInspection } from '../../domain/execution'
 import type { OwnedGogmaArtianWeapon, OwnedWeaponId, TargetWeapon, TargetWeaponId } from '../../domain/models/publicTypes'
+import {
+  findOtherTargetsSatisfiedByOwnedWeapon,
+  findUnrecordedCompletedTargetsSatisfiedByOwnedWeapon,
+  type TargetEvaluationMasterSubset,
+} from '../../domain/target'
 import type { TargetOwnedIdealCompletion } from '../../services/crud/targetWeaponLifecycleService'
-import type { PlanBreakingChangeApprovalController } from '../execution/usePlanBreakingChangeApproval'
+import type {
+  PlanBreakingChangeApprovalController,
+  PlanBreakingReplanExclusionRequest,
+} from '../execution/usePlanBreakingChangeApproval'
 import {
   COMPLETE_WITH_OWNED_IDEAL_PLAN_BREAKING_NOTE,
   targetLifecycleErrorMessage,
@@ -31,6 +39,13 @@ export interface OwnedIdealCompletionController {
   pending: OwnedIdealCompletionPending | null
   /** The other Targets preferring the pending weapon, named in the confirmation. */
   affectedTargets: TargetWeapon[]
+  /**
+   * The other active Targets the pending weapon also satisfies (Issue #334,
+   * `docs/UI_FLOW.md` 8.2): they stay active and need another weapon. Display only.
+   */
+  otherSatisfiedTargets: TargetWeapon[]
+  /** The completed Targets with no recorded completion weapon the pending weapon satisfies. Display only. */
+  unrecordedCompletedTargets: TargetWeapon[]
   submitting: boolean
   /** A refusal or failure of the pending completion, shown inside the confirmation. */
   error: string | null
@@ -47,7 +62,16 @@ export interface UseOwnedIdealCompletionOptions {
   planGuard: PlanBreakingChangeApprovalController
   /** The Targets the screen shows, for naming the affected ones. Display only. */
   targets: readonly TargetWeapon[]
+  /** The Master the cross-satisfaction notes are judged with; `null` shows none. */
+  master: TargetEvaluationMasterSubset | null
   onApplied(result: TargetOwnedIdealCompletion, planAbandoned: boolean): void
+  /**
+   * The user chose 「保存せずに再計画を開く」 in the breaking-change warning
+   * (Issue #276 PR-6B, `docs/PLANNER_SPEC.md` 18.3): nothing was completed,
+   * the confirmation closed, and the screen opens the replan with the Target
+   * left out. Without it, the warning never offers that choice here.
+   */
+  onReplanExclusion?(request: PlanBreakingReplanExclusionRequest): void
 }
 
 /**
@@ -58,7 +82,14 @@ export interface UseOwnedIdealCompletionOptions {
  * judges nothing itself: the affected Targets it names are display only, and
  * every refusal comes from the Service by typed code.
  */
-export function useOwnedIdealCompletion({ api, planGuard, targets, onApplied }: UseOwnedIdealCompletionOptions): OwnedIdealCompletionController {
+export function useOwnedIdealCompletion({
+  api,
+  planGuard,
+  targets,
+  master,
+  onApplied,
+  onReplanExclusion,
+}: UseOwnedIdealCompletionOptions): OwnedIdealCompletionController {
   const [pending, setPending] = useState<OwnedIdealCompletionPending | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -66,6 +97,14 @@ export function useOwnedIdealCompletion({ api, planGuard, targets, onApplied }: 
   const affectedTargets = useMemo(
     () => (pending === null ? [] : targetsReleasedByCompletion(targets, pending.target, pending.weapon)),
     [pending, targets],
+  )
+  const otherSatisfiedTargets = useMemo(
+    () => (pending === null || master === null ? [] : findOtherTargetsSatisfiedByOwnedWeapon(pending.target, pending.weapon, targets, master)),
+    [master, pending, targets],
+  )
+  const unrecordedCompletedTargets = useMemo(
+    () => (pending === null || master === null ? [] : findUnrecordedCompletedTargetsSatisfiedByOwnedWeapon(pending.weapon, targets, master)),
+    [master, pending, targets],
   )
 
   const begin = useCallback((target: TargetWeapon, weapon: OwnedGogmaArtianWeapon) => {
@@ -91,8 +130,17 @@ export function useOwnedIdealCompletion({ api, planGuard, targets, onApplied }: 
         inspect: () => api.inspectCompleteWithOwnedIdeal(target.id, weapon.id),
         apply: (approval) => api.completeWithOwnedIdeal(target.id, weapon.id, approval),
         note: COMPLETE_WITH_OWNED_IDEAL_PLAN_BREAKING_NOTE,
+        ...(onReplanExclusion === undefined ? {} : { replanExclusionTargetWeaponId: target.id }),
       })
-      if (outcome.status === 'cancelled') return
+      if (outcome.status === 'cancelled') {
+        // 「保存せずに再計画を開く」: nothing was completed; the confirmation
+        // closes before the screen leaves for the replan.
+        if (outcome.replanExclusion !== undefined && onReplanExclusion !== undefined) {
+          setPending(null)
+          onReplanExclusion(outcome.replanExclusion)
+        }
+        return
+      }
       if (outcome.status === 'refused') {
         setError(outcome.message)
         return
@@ -107,7 +155,7 @@ export function useOwnedIdealCompletion({ api, planGuard, targets, onApplied }: 
     } finally {
       setSubmitting(false)
     }
-  }, [api, onApplied, pending, planGuard, submitting])
+  }, [api, onApplied, onReplanExclusion, pending, planGuard, submitting])
 
-  return { pending, affectedTargets, submitting, error, begin, cancel, confirm }
+  return { pending, affectedTargets, otherSatisfiedTargets, unrecordedCompletedTargets, submitting, error, begin, cancel, confirm }
 }

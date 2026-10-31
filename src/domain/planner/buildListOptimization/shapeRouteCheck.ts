@@ -40,7 +40,7 @@ import type { NormalizedSeed, RngEngine } from '../../rng/rngEngine'
 import { emptyPlannerAlternativeReservation, normalizePlannerAlternativeReservation, type PlannerAlternativeReservation } from '../../search/alternative'
 import { createCandidateRouteEstimates } from '../../search/candidateFactory'
 import { createCounterReservation, heldPrefixNormalCreation, type CounterReservation } from '../../search/counterReservation'
-import { satisfiesIdealTarget } from '../../target'
+import { satisfiesCompletionTarget } from '../../target'
 import { derivePlannerAlternativeReservation } from '../alternative/plannerAlternativeReservation'
 import { createPlannerRouteUnitPlans } from '../plannerRouteProgress'
 import type { BuildListOptimizationContext, ReachTable } from './buildListOptimizationTypes'
@@ -365,7 +365,7 @@ export function checkShapeConstrainedRoute(input: ShapeRouteCheckInput): RouteCh
     if (!areRestorationBonusSetsEqual(state.bonuses, match.finalBonuses) || state.scope !== match.restorationBonusScope || state.seriesSkillId !== match.seriesSkillId || state.groupSkillId !== match.groupSkillId) {
       issue('final_state_mismatch', null, 'The re-predicted final weapon is not the shape\'s required-only replay.')
     }
-    if (!satisfiesIdealTarget(target, state.bonuses, state.scope, state.seriesSkillId, state.groupSkillId, master)) issue('not_ideal', null, 'The re-predicted final weapon is not Ideal for the Target.')
+    if (!satisfiesCompletionTarget(target, state.bonuses, state.scope, state.seriesSkillId, state.groupSkillId, master)) issue('not_ideal', null, 'The re-predicted final weapon does not satisfy the Target completion condition.')
   }
 
   // 5: hashes, CalculationContext and estimates against the Production authorities.

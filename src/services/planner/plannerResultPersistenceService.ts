@@ -23,7 +23,6 @@ import type {
   BuildListEntry,
   CalculationContext,
   ExpectedPlanState,
-  ImprovementPreference,
   ISODateTimeString,
   NormalArtianCounter,
   OwnedWeapon,
@@ -36,6 +35,7 @@ import type {
 import {
   createExpectedPlanState,
   isCalculationContextCompatible,
+  isExecutionContractProductionPlan,
   validateRngState,
 } from '../../domain/models/publicTypes'
 import {
@@ -49,7 +49,7 @@ import {
   collectProductionPlanDependentTargetWeaponIds,
   createPlanningBuildListEntriesHash,
   createPlanningTargetWeaponsHash,
-  entryImprovementPreference,
+  inspectProductionPlanCompletionAssignmentSafety,
   prepareFinalReplacementBuildList,
   type PlannerConflictResolution,
   type PlannerResult,
@@ -198,11 +198,13 @@ export type BuildListOptimizationAdoptionSaveOutcome = Extract<
   { kind: 'saved' }
 >
 
-/** One Entry the adoption replaces, with the improvement preference its replacement does not carry over (17.5). */
-export interface BuildListOptimizationAdoptionReplacementInspection extends BuildListEntryReplacement {
-  /** The persisted `O`'s `improvementPreference`; the generated `G` starts at `planner`. */
-  replacedImprovementPreference: ImprovementPreference
-}
+/**
+ * One Entry the adoption replaces (`O -> G`). Until Issue #336 PR-2 it also
+ * carried the replaced Entry's legacy `improvementPreference`
+ * (`replacedImprovementPreference`), which no screen read since Issue #100
+ * PR-6; the adoption never wrote it and nothing else changes.
+ */
+export type BuildListOptimizationAdoptionReplacementInspection = BuildListEntryReplacement
 
 /**
  * What adopting one Build List optimization would write, read in the same
@@ -620,6 +622,23 @@ export class PlannerResultPersistenceService {
         currentCalculationContext,
       )
       this.assertPlanReferences(persistable, finalEntries)
+      // A Plan that would make one weapon the completion of two Targets - two
+      // zero-operation Candidates on one owned Gogma under the current Planner -
+      // or that names a weapon another Target was completed with is never saved
+      // (Issue #334, `docs/PLANNER_SPEC.md` 21.4 / 21.4.1); the previous Draft
+      // stays. Every Plan a Planner of the Execution contract generates states
+      // its completions; a Plan of an earlier calculation schema never starts
+      // (`plan_not_executable`), so it has no completion assignment to judge.
+      const safety = isExecutionContractProductionPlan(plan)
+        ? inspectProductionPlanCompletionAssignmentSafety(plan, current.targetWeapons)
+        : { safe: true as const }
+      if (!safety.safe) {
+        throw new RepositoryError(
+          'plan_completion_assignment_conflict',
+          `The calculated Plan would make one owned weapon the completion of two Targets (${safety.issues.map(({ reason }) => reason).join(', ')}).`,
+          { completionAssignmentIssues: safety.issues },
+        )
+      }
       if (persistable.conflictResolutions.length > 0) {
         throwIssue(checkPreferredBuildListEntriesCompleted(plan, persistable.conflictResolutions, finalEntries))
       }
@@ -716,16 +735,11 @@ export class PlannerResultPersistenceService {
     premises: BuildListOptimizationAdoptionPremises,
     current: PlannerSaveCurrentState,
   ): BuildListOptimizationAdoptionInspection {
-    const currentById = new Map(current.buildListEntries.map((entry) => [entry.id, entry]))
+    // Each `O` is its Target's current Entry (checked by the shared replacement set against `current` above).
+    void current
     return {
       replacedDraftPlanId: premises.observedDraftPlanId,
-      replacements: persistable.replacements.map((replacement) => ({
-        ...replacement,
-        // Each `O` is its Target's current Entry (checked by the shared replacement set above).
-        replacedImprovementPreference: entryImprovementPreference(
-          currentById.get(replacement.replacedBuildListEntryId) as BuildListEntry,
-        ),
-      })),
+      replacements: persistable.replacements.map((replacement) => ({ ...replacement })),
       unchangedTargetWeaponIds: [...premises.unchangedTargetWeaponIds],
     }
   }

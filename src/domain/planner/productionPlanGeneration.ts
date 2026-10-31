@@ -3,8 +3,13 @@ import type {
   BuildListEntry,
   BuildListEntryId,
   ExpectedPlanState,
+  IntermediateBonusOpportunity,
+  IntermediateBonusStateGroup,
+  IntermediateSkillOpportunity,
+  IntermediateSkillStateGroup,
+  IntermediateStateAxis,
+  IntermediateStateOpportunityId,
   MaterialRequirement,
-  PlanStep,
   PlanningInputSnapshot,
   ProductionPlan,
   RejectedBuildListEntry,
@@ -13,15 +18,8 @@ import type {
   TargetWeaponId,
 } from '../models/publicTypes'
 import { hashStableValue } from '../models/publicTypes'
-import { createTargetDefinitionHash } from '../buildList'
+import { createTargetDefinitionHash, hasIntermediateStateSelection } from '../buildList'
 import { runPlannerDeterministicSchedule } from './plannerDeterministicScheduler'
-import {
-  derivePlannerCheckpointRequirements,
-  entryIntermediateSelection,
-  hasIntermediateStateSelection,
-  isIntermediatePinHeldAtRouteStart,
-  routeLaneLengths,
-} from './plannerCheckpoints'
 import {
   replayPlannerSearchTrace,
   type PlannerTraceReplayResult,
@@ -93,10 +91,44 @@ function normalizeCandidateSnapshot(candidate: BuildCandidate) {
   }
 }
 
+/** The Route operation count of each stream lane (the hash normalization below). */
+function routeLaneLengths(candidate: BuildCandidate): { skill: number; bonus: number } {
+  let skill = 0
+  let bonus = 0
+  candidate.route.operations.forEach(({ type }) => {
+    if (type === 'reset_skills') skill += 1
+    else if (type === 'reset_bonuses' || type === 'keep_bonuses') bonus += 1
+  })
+  return { skill, bonus }
+}
+
+/** One selected opportunity of a legacy Entry, resolved against its own Candidate Snapshot. */
+function resolvedLegacySelection(
+  entry: BuildListEntry,
+  axis: IntermediateStateAxis,
+  opportunityId: IntermediateStateOpportunityId,
+) {
+  for (const group of entry.candidateSnapshot.intermediateStateGroups ?? []) {
+    if (group.axis !== axis) continue
+    const opportunity = group.opportunities.find(({ id }) => id === opportunityId)
+    if (opportunity) return { group, opportunity }
+  }
+  return null
+}
+
 /**
- * The compromise checkpoint pin pair an Entry with a selection makes the
+ * The compromise checkpoint pin pair an Entry with a selection made the
  * Planner hold, for the planning Build List hash (`docs/PLANNER_SPEC.md`
- * 7.5.2 / 7.5.5).
+ * 7.5.2 / 7.5.5, historical).
+ *
+ * Issue #100 removed the selection and the pin (20.7 / 20.10), and a valid
+ * Entry carrying a selection fails the Planner input closed. The normalization
+ * stays exactly as calculation schema 11..18 defined it so that no
+ * `buildListEntriesHash` / `dependentBuildListEntriesHash` moves: above all the
+ * selection-free `null`, which every schema 19 Entry hashes - changing it would
+ * make a Plan calculated before the removal `build_list_changed` (20.3) - and
+ * the value of a legacy Entry still in the Build List, which a Draft's
+ * whole-input hash covers. What follows is that historical definition.
  *
  * The hard constraint is never the selected opportunity alone: the checkpoint
  * is the pinned state of *both* lanes - the selected state of a selected
@@ -122,8 +154,17 @@ function normalizeCheckpointPinMeaning(entry: BuildListEntry) {
   if (!hasIntermediateStateSelection(entry)) return null
   const selection = entry.intermediateStateSelection
   const candidate = entry.candidateSnapshot
-  const resolved = entryIntermediateSelection(entry)
-  const laneLengths = routeLaneLengths(candidate.route.operations)
+  const resolved = {
+    skill: (selection?.skillOpportunityId == null
+      ? null
+      : resolvedLegacySelection(entry, 'skill', selection.skillOpportunityId)) as
+      { group: IntermediateSkillStateGroup; opportunity: IntermediateSkillOpportunity } | null,
+    bonus: (selection?.bonusOpportunityId == null
+      ? null
+      : resolvedLegacySelection(entry, 'bonus', selection.bonusOpportunityId)) as
+      { group: IntermediateBonusStateGroup; opportunity: IntermediateBonusOpportunity } | null,
+  }
+  const laneLengths = routeLaneLengths(candidate)
   const orderedSlots = (slots: BuildCandidate['finalBonuses']) =>
     slots.map(({ bonusTypeId, bonusRankId }) => ({ bonusTypeId, bonusRankId }))
 
@@ -184,8 +225,8 @@ function normalizeCheckpointPinMeaning(entry: BuildListEntry) {
  *
  * It is its own contract, never `createTargetDefinitionHash()` reused: the
  * performance definition hash is one field of it, and `priority`, `isEnabled`,
- * `preferredOwnedWeaponId` and `lifecycleStatus` - planning input that no
- * longer stales a BuildListEntry - are added beside it. `name`, `memo`,
+ * `preferredOwnedWeaponId`, `lifecycleStatus` and `completionConditionReview` -
+ * planning input that no longer stales a BuildListEntry - are added beside it. `name`, `memo`,
  * completion metadata and timestamps stay out.
  */
 export function createPlanningTargetWeaponsHash(
@@ -200,6 +241,7 @@ export function createPlanningTargetWeaponsHash(
         isEnabled: target.isEnabled,
         preferredOwnedWeaponId: target.preferredOwnedWeaponId,
         lifecycleStatus: target.lifecycleStatus,
+        completionConditionReview: [...target.completionConditionReview].sort(compareStableStrings),
       }))
       .sort((left, right) => compareStableStrings(left.id, right.id)),
   )
@@ -242,10 +284,11 @@ function normalizePlanningBuildListEntry(entry: BuildListEntry) {
   return {
     id: entry.id,
     candidateSnapshot: normalizeCandidateSnapshot(entry.candidateSnapshot),
-    // The user's selected intermediate states are a hard Planner
-    // constraint and the improvement preference steers the Plan, so
-    // changing either changes what this Plan had to achieve and must make
-    // an existing Plan a recalculation target (`docs/PLANNER_SPEC.md` 7.5.5).
+    // Calculation schema 11..18 planned the selected intermediate states and
+    // the improvement preference, so changing either made an existing Plan a
+    // recalculation target (`docs/PLANNER_SPEC.md` 7.5.5). Both are gone with
+    // Issue #100; the normalization is kept unchanged so that no hash moves
+    // (20.3 / 20.10).
     intermediateStateSelection: {
       checkpointPin: normalizeCheckpointPinMeaning(entry),
       improvementPreference:
@@ -276,8 +319,8 @@ export function createPlanningBuildListEntriesHash(
  * `PlanningInputSnapshot.dependentBuildListEntriesHash`: the
  * `buildListEntriesHash` normalization of the Plan's selected Entries only
  * (`docs/DATA_MODEL.md` 11.2). Adding an Entry the Plan does not use never
- * moves it; changing a selected Entry's snapshot, checkpoint selection or
- * improvement preference does. A selected Entry missing from the collection
+ * moves it; changing a selected Entry's snapshot (or, on a legacy Entry, its
+ * selection or improvement preference) does. A selected Entry missing from the collection
  * hashes as missing.
  */
 export function createDependentBuildListEntriesHash(
@@ -426,9 +469,10 @@ function rejectedReason(
   if (rejections.some(({ reason }) => reason === 'conflict_not_committed')) {
     return { reason: 'resource_conflict', resourceConflictCause: notCommittedCause(entry.id, runResult) }
   }
-  if (rejections.some(({ reason }) => reason === 'candidate_already_satisfied')) {
-    return { reason: 'already_satisfied', resourceConflictCause: null }
-  }
+  // Calculation schema 11..19 mapped `candidate_already_satisfied` (a release
+  // through cross satisfaction) to `already_satisfied`; no new Plan records it
+  // since Issue #334 PR-3 (`docs/PLANNER_SPEC.md` 21.5). The persisted literal
+  // stays for the Plans that carry it.
   const selectedComparable = input.buildListEntries.some((selected) =>
     selectedEntryIds.has(selected.id) &&
     selected.targetWeaponId === entry.targetWeaponId &&
@@ -724,8 +768,8 @@ export async function createProductionPlanWithSearchRunner(
 /**
  * The one shared Plan-generation tail after a full Planner run: the
  * runtime-unsupported retry (which reruns the same runner), Trace Replay, the
- * execution projection, the `PlanningInputSnapshot`, the checkpoint requirement
- * defence, the rejected Build List record and the required materials.
+ * execution projection, the `PlanningInputSnapshot`, the rejected Build List
+ * record and the required materials.
  *
  * It is generic over the run's termination shape `T` and reads from the
  * termination nothing but its status, so no termination is ever converted:
@@ -865,13 +909,6 @@ export async function generatePlanFromFullRun<T extends PlannerAnyRunTermination
     { ...projection, selectedBuildListEntryIds },
     now,
   )
-  observer?.onPlanGenerationPhase?.('checkpoint_defence')
-  assertCheckpointRequirementsSatisfied(
-    runInputEntries(input, runResult),
-    selectedBuildListEntryIds,
-    steps,
-    runResult.termination.status === 'completed',
-  )
   // The Plan fields below are evaluated in the same order as the object
   // literal lists them; they are only named so the optional observer can see
   // the phase boundaries (`ProductionPlanGenerationPhase`).
@@ -928,59 +965,6 @@ export async function generatePlanFromFullRun<T extends PlannerAnyRunTermination
  * The ordinary Production Plan calculation. Its signature and result semantics
  * are unchanged; it simply runs the shared implementation with no observer.
  */
-function runInputEntries(
-  input: PlannerInput,
-  runResult: PlannerRunOutcome,
-): BuildListEntry[] {
-  const excluded = new Set(
-    runResult.excludedBuildListEntries.map(({ entry }) => entry.id),
-  )
-  return input.buildListEntries.filter(({ id }) => !excluded.has(id))
-}
-
-/**
- * Fail-closed defence behind the full Planner run (PLANNER_SPEC 7.5.6): a Plan that
- * claims completion must secure every required checkpoint Entry, and every
- * secured required Entry's compromise checkpoint must appear as a milestone
- * on the real Step that reached it - unless the checkpoint is the weapon the
- * user already holds (an existing Gogma's selected lane starts), which no
- * Step produces and Trace Replay verified at Plan start instead. The Planner
- * run and Trace Replay already guarantee both; a Plan that violates either
- * is an internal inconsistency, never a Draft.
- */
-function assertCheckpointRequirementsSatisfied(
-  entries: readonly BuildListEntry[],
-  selectedBuildListEntryIds: readonly BuildListEntryId[],
-  steps: readonly PlanStep[],
-  completed: boolean,
-): void {
-  const selected = new Set(selectedBuildListEntryIds)
-  const reached = new Set(
-    steps.flatMap((step) =>
-      (step.checkpointMilestones ?? []).map(({ buildListEntryId }) => buildListEntryId),
-    ),
-  )
-  const entriesById = new Map(entries.map((entry) => [entry.id, entry]))
-  const { requirements } = derivePlannerCheckpointRequirements(entries)
-  requirements.requiredEntryIdByTargetId.forEach((entryId, targetId) => {
-    if (!selected.has(entryId)) {
-      if (completed) {
-        throw new PlannerPlanGenerationError(
-          `Planner reported completion without securing required checkpoint BuildListEntry '${entryId}' of TargetWeapon '${targetId}'.`,
-        )
-      }
-      return
-    }
-    const entry = entriesById.get(entryId)
-    if (entry && isIntermediatePinHeldAtRouteStart(entry)) return
-    if (!reached.has(entryId)) {
-      throw new PlannerPlanGenerationError(
-        `Planner secured BuildListEntry '${entryId}' without a Step reaching its selected compromise checkpoint.`,
-      )
-    }
-  })
-}
-
 export const createProductionPlan: CreateProductionPlanCalculation = async (
   input,
   dependencies,

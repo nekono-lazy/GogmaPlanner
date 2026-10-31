@@ -129,11 +129,16 @@ export function enumerateSkillRequirements(target: TargetReach, source: SourceCa
   return skillRequirements(target, source, table)
 }
 
+export interface ResetThenKeepPlan {
+  finalPositions: number[]
+  resetPositionsByLayout: Map<LayoutKey, number[]>
+}
+
 /**
  * Keep-Ideal positions reachable through a Reset layout, ascending and unique, with the Reset positions
  * that produce each layout (`reset_then_keep`, design 5.2). A Target-level fact: it reads no source.
  */
-export function resetThenKeepPlan(target: TargetReach): { finalPositions: number[]; resetPositionsByLayout: Map<LayoutKey, number[]> } {
+export function resetThenKeepPlan(target: TargetReach): ResetThenKeepPlan {
   const resetPositionsByLayout = new Map<LayoutKey, number[]>()
   const unsupported = new Set(target.bonus.keepUnsupportedLayouts)
   for (const [position, layout] of target.bonus.resetLayoutByPosition) {
@@ -149,9 +154,25 @@ export function resetThenKeepPlan(target: TargetReach): { finalPositions: number
   return { finalPositions: [...finalPositions].sort((left, right) => left - right), resetPositionsByLayout }
 }
 
+/**
+ * One walk's `resetThenKeepPlan(target)`, computed the first time the walk reaches a `reset_then_keep` requirement and then shared by
+ * every Bonus requirement list the walk instantiates - one per Skill requirement of every source - instead of being rebuilt by each
+ * (Issue #351; the plan is a Target-level fact). It lives only as long as the walk holding it: nothing is cached across walks, Targets,
+ * tables or runs, and a walk that never reaches `reset_then_keep` never computes it.
+ */
+export type ResetThenKeepPlanOf = () => ResetThenKeepPlan
+
+export function createResetThenKeepPlanMemo(target: TargetReach): ResetThenKeepPlanOf {
+  let plan: ResetThenKeepPlan | undefined
+  return () => (plan ??= resetThenKeepPlan(target))
+}
+
 /** The `reset_then_keep` requirements of a Target by `(g*, g1)` ascending; the same for every source whose Bonus lane admits operations. */
 export function* enumerateResetThenKeepRequirements(target: TargetReach): Generator<Extract<BonusRequirement, { kind: 'reset_then_keep' }>, void, undefined> {
-  const plan = resetThenKeepPlan(target)
+  yield* resetThenKeepRequirementsOf(target, resetThenKeepPlan(target))
+}
+
+function* resetThenKeepRequirementsOf(target: TargetReach, plan: ResetThenKeepPlan): Generator<Extract<BonusRequirement, { kind: 'reset_then_keep' }>, void, undefined> {
   for (const finalPosition of plan.finalPositions) {
     // g1 ascending over every Reset position whose layout is Keep-Ideal at g*, and strictly before g*.
     const candidates: number[] = []
@@ -266,18 +287,18 @@ export function keepFromSourcePositions(target: TargetReach, source: SourceCandi
   return target.bonus.keepIdealPositionsByLayout.get(source.layout) ?? []
 }
 
-function* bonusRequirements(target: TargetReach, source: SourceCandidate, table: ReachTable): Generator<BonusRequirement, void, undefined> {
+function* bonusRequirements(target: TargetReach, source: SourceCandidate, table: ReachTable, resetThenKeepPlanOf: ResetThenKeepPlanOf): Generator<BonusRequirement, void, undefined> {
   const admission = sourceLaneAdmission(source, table.continuesCurrentIdealLanes).bonus
   if (laneAdmitsNone(admission)) yield { kind: 'none' }
   if (!laneAdmitsOperations(admission)) return
   for (const finalPosition of target.bonus.resetIdealPositions) yield { kind: 'reset', finalPosition }
   for (const finalPosition of keepFromSourcePositions(target, source)) yield { kind: 'keep_from_source', finalPosition }
-  yield* enumerateResetThenKeepRequirements(target)
+  yield* resetThenKeepRequirementsOf(target, resetThenKeepPlanOf())
 }
 
 /** The Bonus requirements of one source in enumeration order (the inner loop of `enumerateReachOptionsOfSource()`). */
 export function enumerateBonusRequirements(target: TargetReach, source: SourceCandidate, table: ReachTable): Generator<BonusRequirement, void, undefined> {
-  return bonusRequirements(target, source, table)
+  return bonusRequirements(target, source, table, () => resetThenKeepPlan(target))
 }
 
 export function reachOptionStreamEnd(target: TargetReach, table: ReachTable, source: SourceCandidate, skill: SkillRequirement, bonus: BonusRequirement): StreamEnd {
@@ -328,10 +349,24 @@ export function reachOptionKey(option: ReachOption): string {
   return `${option.targetWeaponId}|${sourceResourceKey(option.source)}|${skill}|${bonus}`
 }
 
-/** Lazily yields every reach option of `target` from one of its sources, Skill requirements outer and Bonus requirements inner. */
-export function* enumerateReachOptionsOfSource(target: TargetReach, table: ReachTable, source: SourceCandidate): Generator<ReachOption, void, undefined> {
+/**
+ * Lazily yields every reach option of `target` from one of its sources, Skill requirements outer and Bonus requirements inner.
+ *
+ * A source's Bonus requirements do not depend on its Skill requirement, so a source whose Bonus requirement list is empty yields no
+ * option whatever its Skill requirements. The walk then ends at the first Skill requirement instead of instantiating one empty Bonus
+ * list per Skill requirement (Issue #351: such a new Normal source can hold tens of thousands of conversions, Issue #349). The yielded
+ * sequence is unchanged - nothing is yielded for that source either way, and a source with a Bonus requirement is walked exactly as
+ * before - and emptiness is read from the Bonus requirement list itself (`none` included), never from a rule of its own.
+ * `resetThenKeepPlanOf` is the walk's `reset_then_keep` plan (`createResetThenKeepPlanMemo()`); a caller walking several sources of one
+ * Target passes one to all of them.
+ */
+export function* enumerateReachOptionsOfSource(target: TargetReach, table: ReachTable, source: SourceCandidate,
+  resetThenKeepPlanOf: ResetThenKeepPlanOf = createResetThenKeepPlanMemo(target)): Generator<ReachOption, void, undefined> {
+  let bonusEmpty: boolean | undefined
   for (const skillRequired of skillRequirements(target, source, table)) {
-    for (const bonusRequired of bonusRequirements(target, source, table)) {
+    bonusEmpty ??= bonusRequirements(target, source, table, resetThenKeepPlanOf).next().done === true
+    if (bonusEmpty) return
+    for (const bonusRequired of bonusRequirements(target, source, table, resetThenKeepPlanOf)) {
       yield createReachOption(target, table, source, skillRequired, bonusRequired)
     }
   }
@@ -340,10 +375,12 @@ export function* enumerateReachOptionsOfSource(target: TargetReach, table: Reach
 /**
  * Lazily yields every reach option of `target` in the documented deterministic order. A source with no
  * Skill or no Bonus requirement in the window yields nothing; that is a window / support fact, never
- * "unreachable". The caller stops whenever it has enough (`countUpTo(k)`, first match).
+ * "unreachable". The caller stops whenever it has enough (`countUpTo(k)`, first match). One `reset_then_keep`
+ * plan serves the whole walk.
  */
 export function* enumerateReachOptions(target: TargetReach, table: ReachTable): Generator<ReachOption, void, undefined> {
-  for (const source of target.sources) yield* enumerateReachOptionsOfSource(target, table, source)
+  const resetThenKeepPlanOf = createResetThenKeepPlanMemo(target)
+  for (const source of target.sources) yield* enumerateReachOptionsOfSource(target, table, source, resetThenKeepPlanOf)
 }
 
 /** The first `limit` options, without enumerating the rest (MRV domain counting, design 6.4). */

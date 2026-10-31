@@ -1,4 +1,4 @@
-import { useId } from 'react'
+import { useId, type ReactNode } from 'react'
 import { Box, Button, FormControl, InputLabel, MenuItem, Select, Stack, Typography } from '@mui/material'
 import type { ElementMaster, WeaponTypeMaster } from '../domain/master/masterTypes'
 import {
@@ -35,6 +35,9 @@ export function WeaponListFilterBar({
   shownCount,
   unit,
   countLabel,
+  children,
+  additionalFilterActive = false,
+  onClearAll,
 }: {
   /** Accessible name of the filter group, e.g. 「所持武器の絞り込み」. */
   label: string
@@ -48,10 +51,19 @@ export function WeaponListFilterBar({
   unit: string
   /** What is counted when it is not the list's own items, e.g. 「目標武器」. */
   countLabel?: string
+  /**
+   * A screen's own extra display-only filter (Target Weapons: 「完成条件の
+   * 再設定が必要な目標武器だけ表示」), placed on its own row below the Selects.
+   */
+  children?: ReactNode
+  /** Whether that extra filter narrows the list, so the count and 「絞り込みを解除」 cover it too. */
+  additionalFilterActive?: boolean
+  /** Clears every filter of the screen; by default the weapon type / element filter only. */
+  onClearAll?(): void
 }) {
   const weaponTypeLabelId = useId()
   const elementLabelId = useId()
-  const active = isWeaponListFilterActive(filter)
+  const active = isWeaponListFilterActive(filter) || additionalFilterActive
   return (
     <Box
       role="group"
@@ -106,6 +118,9 @@ export function WeaponListFilterBar({
           ))}
         </Select>
       </FormControl>
+      {children !== undefined && (
+        <Box sx={{ gridColumn: '1 / -1', gridRow: { sm: 2 }, minWidth: 0 }}>{children}</Box>
+      )}
       <Stack
         direction="row"
         spacing={1}
@@ -115,7 +130,9 @@ export function WeaponListFilterBar({
           alignItems: 'center',
           justifyContent: { xs: 'space-between', sm: 'flex-end' },
           flexWrap: 'wrap',
-          minHeight: 44,
+          // On a smartphone the row is empty until a filter is set: it stays
+          // mounted for the announcement but leaves no blank band.
+          minHeight: { xs: active ? 44 : 0, sm: 44 },
         }}
       >
         {/* Kept mounted (empty while inactive) so a change is announced. */}
@@ -129,7 +146,7 @@ export function WeaponListFilterBar({
           {active ? `${countLabel ?? ''}${totalCount}${unit}中 ${shownCount}${unit}を表示` : ''}
         </Typography>
         {active && (
-          <Button variant="text" onClick={() => onChange(emptyWeaponListFilter)} sx={{ minHeight: 44 }}>
+          <Button variant="text" onClick={() => (onClearAll ? onClearAll() : onChange(emptyWeaponListFilter))} sx={{ minHeight: 44 }}>
             絞り込みを解除
           </Button>
         )}

@@ -12,9 +12,9 @@ import { stableStringify } from '../models/publicTypes'
 import { bonusOutcomeKey, bonusSolutionRetentionKey, compareStableKeys } from './semanticKeys'
 export { compareStableKeys } from './semanticKeys'
 import {
-  createBonusIdealDifference,
+  closestVariantMatchedCount,
   evaluateSkillCondition,
-  satisfiesIdealBonuses,
+  satisfiesCompletionBonuses,
 } from '../target'
 import { totalMaterialQuantity } from './candidateFactory'
 import type { CandidateSearchInput } from './searchTypes'
@@ -92,14 +92,14 @@ export interface EvaluatedBonusSolution {
 
 /**
  * SEARCH_SPEC 5.5.2 stream-local ideal closeness. A `null` side of
- * `idealSkillCondition` is unconstrained, so it is never counted as a match.
+ * `completionSkillCondition` is unconstrained, so it is never counted as a match.
  */
 function skillIdealCloseness(
   target: TargetWeapon,
   seriesSkillId: SeriesSkillId | null,
   groupSkillId: GroupSkillId | null,
 ): number {
-  const condition = target.idealSkillCondition
+  const condition = target.completionSkillCondition
   return (
     Number(
       condition.seriesSkillId !== null &&
@@ -118,7 +118,7 @@ function evaluateSkillSolution(
   return {
     solution,
     idealMatch: evaluateSkillCondition(
-      target.idealSkillCondition,
+      target.completionSkillCondition,
       solution.seriesSkillId,
       solution.groupSkillId,
     ),
@@ -141,16 +141,19 @@ function evaluateBonusSolution(
 ): Omit<EvaluatedBonusSolution, 'index'> {
   return {
     solution,
-    idealMatch: satisfiesIdealBonuses(
+    idealMatch: satisfiesCompletionBonuses(
       target,
       solution.finalBonuses,
       solution.restorationBonusScope,
       input.master,
     ),
-    matchedIdealBonusCount: createBonusIdealDifference(
-      target.idealBonuses,
+    // SEARCH_SPEC 5.5.3 key 2: the partial match count of the closest Variant,
+    // the one shared value the constrained frontier reads as `idealCloseness`.
+    matchedIdealBonusCount: closestVariantMatchedCount(
+      target,
       solution.finalBonuses,
-    ).matchedBonusCount,
+      input.master,
+    ),
     materialQuantity: totalMaterialQuantity(
       solution.operations,
       target.weaponTypeId,

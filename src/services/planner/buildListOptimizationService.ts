@@ -1,11 +1,5 @@
 import { appDatabase, type AppDatabase } from '../../db/AppDatabase'
-import {
-  BuildListEntryRepository,
-  NormalArtianCounterRepository,
-  OwnedWeaponRepository,
-  ProductionPlanRepository,
-  TargetWeaponRepository,
-} from '../../db/repositories'
+import { ProductionPlanRepository } from '../../db/repositories'
 import { RepositoryError } from '../../db/repositoryError'
 import type { MasterDataRoot } from '../../domain/master/masterTypes'
 import type { CalculationContext, ProductionPlanId } from '../../domain/models/publicTypes'
@@ -23,7 +17,8 @@ import {
   type BuildListOptimizationRunHandle,
   type BuildListOptimizationWorkerClient,
 } from './buildListOptimizationWorkerClient'
-import { createPlannerInput, type PlannerInputRepositories } from './createPlannerInput'
+import { createPlannerInput } from './createPlannerInput'
+import { createReadOnlyPlannerInputRepositories } from './readOnlyPlannerInputRepositories'
 
 /**
  * The Application boundary of the Build List global optimization (`docs/PLANNER_SPEC.md` 17.4 / 17.6 / 17.9 / 17.10 / 17.16, Issue
@@ -60,31 +55,11 @@ export interface BuildListOptimizationStartReader {
   read(): Promise<BuildListOptimizationStartPreparation>
 }
 
-/** The ordinary `createPlannerInput()` repositories inside a read-only transaction; a missing RngState is never created here. */
-function readOnlyPlannerInputRepositories(database: AppDatabase): PlannerInputRepositories {
-  const normalCounters = new NormalArtianCounterRepository(database)
-  const ownedWeapons = new OwnedWeaponRepository(database)
-  const targetWeapons = new TargetWeaponRepository(database)
-  const buildListEntries = new BuildListEntryRepository(database)
-  return {
-    ensureInitialRngState: async () => {
-      const rngState = await database.rngState.get('current')
-      if (!rngState) {
-        throw new RepositoryError('not_found', 'No RngState is stored, so no Build List optimization input can be read.')
-      }
-      return rngState
-    },
-    getAllNormalArtianCounters: () => normalCounters.getAllNormalArtianCounters(),
-    getAllOwnedWeapons: () => ownedWeapons.getAllOwnedWeapons(),
-    getAllTargetWeapons: () => targetWeapons.getAllTargetWeapons(),
-    getAllBuildListEntries: () => buildListEntries.getAllBuildListEntries(),
-  }
-}
-
 /**
  * Reads the running Plan, the current Draft and the fresh PlannerInput in one read-only transaction (one snapshot of the persisted
  * state), through the existing repository authorities (`getRunningProductionPlan()` / `getDraftProductionPlan()`, which fail closed
- * on two running Plans or two Drafts) and the ordinary `createPlannerInput()`.
+ * on two running Plans or two Drafts) and the ordinary `createPlannerInput()` over the shared read-only repositories (a missing
+ * RngState is never created).
  */
 export function createBuildListOptimizationStartReader(
   database: AppDatabase,
@@ -102,7 +77,8 @@ export function createBuildListOptimizationStartReader(
             const running = await plans.getRunningProductionPlan()
             if (running !== undefined) return { status: 'running_plan_exists', runningPlanId: running.id }
             const draft = await plans.getDraftProductionPlan()
-            const plannerInput = await createPlannerInput(master, calculationContext, readOnlyPlannerInputRepositories(database))
+            const plannerInput = await createPlannerInput(master, calculationContext,
+              createReadOnlyPlannerInputRepositories(database, 'No RngState is stored, so no Build List optimization input can be read.'))
             return {
               status: 'ready',
               plannerInput: { ...plannerInput, conflictResolutions: [] },

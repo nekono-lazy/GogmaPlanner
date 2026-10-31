@@ -15,7 +15,7 @@ import { isCalculationContextCompatible } from '../../models/publicTypes'
 import {
   checkPersistableOrdinaryPlannerResultShape, checkPersistablePlannerResultShape, type PlannerResultPersistenceIssue,
 } from '../plannerResultPersistenceValidation'
-import type { BuildListOptimizationArtifact } from './buildListOptimizationResult'
+import type { BuildListOptimizationArtifact, BuildListOptimizationPlanSummary } from './buildListOptimizationResult'
 import { BUILD_LIST_OPTIMIZATION_NON_PHYSICAL_STEP_TYPE, unexplainedBuildListOptimizationWarnings } from './finalVerification'
 
 /** One optimization artifact whose shape the adoption may persist: the final Plan, its generated Entries and their replacements. */
@@ -42,6 +42,30 @@ const compareCodeUnits = (left: string, right: string) => (left < right ? -1 : l
 function sameExpectedPlanState(left: ExpectedPlanState, right: ExpectedPlanState): boolean {
   return left.rngStateHash === right.rngStateHash && left.normalCountersHash === right.normalCountersHash
     && left.ownedWeaponsHash === right.ownedWeaponsHash && left.targetExecutionStateHash === right.targetExecutionStateHash
+}
+
+/**
+ * 17.7 item 6 over a final Plan and the summary its calculation reported: physical operations (steps − `confirm_owned_ideal` Steps) =
+ * Σ stream advances = the structural objective, and the reported Step counts are the Plan's own. Shared by the Build List optimization
+ * adoption and the running Plan replan adoption (`docs/PLANNER_SPEC.md` 18.8 [P1]); the issue, or null.
+ */
+export function checkBuildListOptimizationPhysicalIdentity(
+  plan: Pick<ProductionPlan, 'steps'>,
+  summary: Pick<BuildListOptimizationPlanSummary, 'structuralObjective' | 'physicalOperationCount' | 'nonPhysicalStepCount' | 'planStepCount'>,
+): PlannerResultPersistenceIssue | null {
+  const nonPhysicalStepCount = plan.steps.filter(({ operationType }) => operationType === BUILD_LIST_OPTIMIZATION_NON_PHYSICAL_STEP_TYPE).length
+  const physicalOperationCount = plan.steps.length - nonPhysicalStepCount
+  const streamAdvanceSum = plan.steps.reduce(
+    (sum, { rngAdvance }) => sum + rngAdvance.skillCounterDelta + rngAdvance.gogmaCounterDelta + (rngAdvance.normalCounterDelta ?? 0), 0)
+  if (physicalOperationCount !== streamAdvanceSum || physicalOperationCount !== summary.structuralObjective
+    || physicalOperationCount !== summary.physicalOperationCount || nonPhysicalStepCount !== summary.nonPhysicalStepCount
+    || plan.steps.length !== summary.planStepCount) {
+    return resultInvalid(`The physical identity does not hold: ${JSON.stringify({
+      planSteps: plan.steps.length, nonPhysicalStepCount, physicalOperationCount, streamAdvanceSum,
+      structuralObjective: summary.structuralObjective, summary: { planStepCount: summary.planStepCount, nonPhysicalStepCount: summary.nonPhysicalStepCount, physicalOperationCount: summary.physicalOperationCount },
+    })}.`)
+  }
+  return null
 }
 
 /** The optimization's own conditions over an artifact that already passed the shared shape helpers; the first issue, or null. */
@@ -133,19 +157,8 @@ function optimizationIssue(artifact: BuildListOptimizationArtifact, plan: Produc
     )
   }
 
-  // 17.7 item 6: physical operations (steps − confirm_owned_ideal Steps) = Σ stream advances = the structural objective, as reported.
-  const nonPhysicalStepCount = plan.steps.filter(({ operationType }) => operationType === BUILD_LIST_OPTIMIZATION_NON_PHYSICAL_STEP_TYPE).length
-  const physicalOperationCount = plan.steps.length - nonPhysicalStepCount
-  const streamAdvanceSum = plan.steps.reduce(
-    (sum, { rngAdvance }) => sum + rngAdvance.skillCounterDelta + rngAdvance.gogmaCounterDelta + (rngAdvance.normalCounterDelta ?? 0), 0)
-  if (physicalOperationCount !== streamAdvanceSum || physicalOperationCount !== summary.structuralObjective
-    || physicalOperationCount !== summary.physicalOperationCount || nonPhysicalStepCount !== summary.nonPhysicalStepCount
-    || plan.steps.length !== summary.planStepCount) {
-    return resultInvalid(`The physical identity does not hold: ${JSON.stringify({
-      planSteps: plan.steps.length, nonPhysicalStepCount, physicalOperationCount, streamAdvanceSum,
-      structuralObjective: summary.structuralObjective, summary: { planStepCount: summary.planStepCount, nonPhysicalStepCount: summary.nonPhysicalStepCount, physicalOperationCount: summary.physicalOperationCount },
-    })}.`)
-  }
+  const identity = checkBuildListOptimizationPhysicalIdentity(plan, summary)
+  if (identity !== null) return identity
 
   // The Worker-side input token is the final Plan's own (17.10): its initial execution state, Target hash and CalculationContext.
   if (!sameExpectedPlanState(inputToken.initialExecutionState, plan.baseSnapshot.initialExecutionState)) {

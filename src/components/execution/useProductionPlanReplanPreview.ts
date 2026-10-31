@@ -5,6 +5,7 @@ import {
   type PlanAbandonSavePointDecision,
   type ProductionPlanReplanAdoptionOptions,
   type ProductionPlanReplanPreview,
+  type ProductionPlanReplanPreviewRequest,
 } from '../../domain/execution'
 import type { ProductionPlanId } from '../../domain/models/publicTypes'
 import type { PlannerOptions } from '../../domain/planner'
@@ -40,6 +41,11 @@ export type ReplanAdoptionState =
 
 export type AdoptedReplanResult = Extract<AdoptProductionPlanReplanPreviewResult, { kind: 'adopted' }>
 
+/** What `startWith()`'s preparation produced: the Preview request to run, or why nothing runs (shown as a notice). */
+export type ReplanPreviewRequestPreparation =
+  | { kind: 'ready'; request: ProductionPlanReplanPreviewRequest }
+  | { kind: 'not_started'; message: string }
+
 export interface UseProductionPlanReplanPreviewOptions {
   replan: ProductionPlanReplanDependencies
   /** The Preview's own Planner Worker; created on the first Preview and disposed with the caller. */
@@ -65,6 +71,12 @@ export interface ProductionPlanReplanPreviewController {
    * Planner bounds when the screen offers them, never a Preview-only bound.
    */
   start(runningPlanId: ProductionPlanId, plannerOptions?: PlannerOptions): void
+  /**
+   * The same Preview from a request the caller prepares (Issue #276 PR-6A: the running Plan replan's auxiliary, whose press-time
+   * input is scoped to the replan target set, `docs/PLANNER_SPEC.md` 18.5). `prepare` runs inside this Preview's generation, so a
+   * cancel, a discard or a newer start drops its outcome; a `not_started` preparation ends as a notice without any Planner run.
+   */
+  startWith(runningPlanId: ProductionPlanId, prepare: () => Promise<ReplanPreviewRequestPreparation>): void
   /** Cancels a running Preview calculation. Nothing was written, so nothing is undone. */
   cancel(): void
   /** Drops the current Preview without any runtime call. */
@@ -100,6 +112,7 @@ function previewInvalidatedBy(code: ExecutionRuntimeError['code']): boolean {
     code === 'replan_state_changed' ||
     code === 'replan_result_invalid' ||
     code === 'replan_plan_id_collision' ||
+    code === 'completion_assignment_conflict' ||
     code === 'replan_preview_not_allowed' ||
     code === 'plan_not_found' ||
     code === 'running_plan_conflict' ||
@@ -163,7 +176,7 @@ export function useProductionPlanReplanPreview(
   const isAdoptionBusy = () =>
     adoptionRef.current.status === 'inspecting' || adoptionRef.current.status === 'submitting'
 
-  const start = useCallback((runningPlanId: ProductionPlanId, plannerOptions?: PlannerOptions) => {
+  const startWith = useCallback((runningPlanId: ProductionPlanId, prepare: () => Promise<ReplanPreviewRequestPreparation>) => {
     if (isAdoptionBusy()) return
     const generation = ++generationRef.current
     const isCurrent = () => aliveRef.current && generationRef.current === generation
@@ -173,14 +186,14 @@ export function useProductionPlanReplanPreview(
     const { replan, createWorkerClient } = optionsRef.current
     void (async () => {
       try {
-        // The running Plan token, the current-state PlannerInput and the
-        // CalculationContext come from one read-only runtime transaction;
-        // nothing the screen already holds is reused as Preview input.
-        const request = await replan.prepareProductionPlanReplanPreview({ runningPlanId })
+        const preparation = await prepare()
         if (!isCurrent()) return
-        const input = plannerOptions === undefined
-          ? request.plannerInput
-          : { ...request.plannerInput, options: { ...plannerOptions } }
+        if (preparation.kind === 'not_started') {
+          setPreview({ status: 'notice', message: preparation.message })
+          return
+        }
+        const { request } = preparation
+        const input = request.plannerInput
         const client = clientRef.current ?? createWorkerClient()
         clientRef.current = client
         const requestId = createRequestId()
@@ -215,6 +228,21 @@ export function useProductionPlanReplanPreview(
       }
     })()
   }, [cancelWorkerRequest, setAdoption, setPreview])
+
+  const start = useCallback((runningPlanId: ProductionPlanId, plannerOptions?: PlannerOptions) => {
+    startWith(runningPlanId, async () => {
+      // The running Plan token, the current-state PlannerInput and the
+      // CalculationContext come from one read-only runtime transaction;
+      // nothing the screen already holds is reused as Preview input.
+      const request = await optionsRef.current.replan.prepareProductionPlanReplanPreview({ runningPlanId })
+      return {
+        kind: 'ready',
+        request: plannerOptions === undefined
+          ? request
+          : { ...request, plannerInput: { ...request.plannerInput, options: { ...plannerOptions } } },
+      }
+    })
+  }, [startWith])
 
   const cancel = useCallback(() => {
     if (previewRef.current.status !== 'loading') return
@@ -324,6 +352,7 @@ export function useProductionPlanReplanPreview(
     adoption,
     busy: preview.status === 'loading' || adoption.status === 'inspecting' || adoption.status === 'submitting',
     start,
+    startWith,
     cancel,
     discard,
     requestAdoption,

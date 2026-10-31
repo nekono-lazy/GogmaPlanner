@@ -6,6 +6,7 @@ import type {
   BuildRoute,
   ExecutionHistory,
   ExecutionSavePoint,
+  ExecutionUndoSnapshot,
   ExportRoot,
   NormalArtianCounter,
   OwnedWeapon,
@@ -24,8 +25,9 @@ import {
   type DomainValidationIssue,
   type DomainValidationResult,
 } from '../../domain/models/publicTypes'
+import { validateTargetCompletionAssignments } from '../../domain/target/completionAssignment'
 import { validateTargetPreferredOwnedWeapons } from '../../domain/target/preferredOwnedWeapon'
-import { validateTargetIdealImpliesPractical } from '../../domain/target/targetInvariantValidation'
+import { validateTargetCompletionConditions } from '../../domain/target/targetInvariantValidation'
 import { collectProductionPlanDependentTargetWeaponIds } from '../../domain/planner/productionPlanGeneration'
 import { isRunningProductionPlanStatus } from '../../db/repositories/productionPlanRepository'
 
@@ -566,32 +568,19 @@ function targetWeaponReferences(target: TargetWeapon, path: string): MasterRefer
   const references: MasterReference[] = [
     ...masterReference('weaponTypeId', target.weaponTypeId, `${path}.weaponTypeId`),
     ...masterReference('elementId', target.elementId, `${path}.elementId`),
-    ...bonusReferences(target.idealBonuses, `${path}.idealBonuses`),
-    ...skillReferences(target.idealSkillCondition, `${path}.idealSkillCondition`),
-    ...skillReferences(target.practicalSkillCondition, `${path}.practicalSkillCondition`),
+    ...skillReferences(target.completionSkillCondition, `${path}.completionSkillCondition`),
   ]
-  if (Array.isArray(target.practicalBonusConditions)) {
-    target.practicalBonusConditions.forEach((condition, index) => {
-      if (!isRecord(condition)) return
-      const conditionPath = `${path}.practicalBonusConditions[${index}]`
-      references.push(
-        ...masterReference('bonusTypeId', condition.bonusTypeId, `${conditionPath}.bonusTypeId`),
-        ...masterReference('bonusRankId', condition.minimumRankId, `${conditionPath}.minimumRankId`),
-      )
-    })
-  }
-  if (Array.isArray(target.alternativeBonusRules)) {
-    target.alternativeBonusRules.forEach((rule, ruleIndex) => {
-      if (!isRecord(rule)) return
-      const rulePath = `${path}.alternativeBonusRules[${ruleIndex}]`
-      references.push(...masterReference('bonusTypeId', rule.sourceBonusTypeId, `${rulePath}.sourceBonusTypeId`))
-      if (!Array.isArray(rule.options)) return
-      rule.options.forEach((option, optionIndex) => {
-        if (!isRecord(option)) return
-        const optionPath = `${rulePath}.options[${optionIndex}]`
+  // Existence only (`docs/DATA_MODEL.md` 15.1 schema 15): a slot outside the
+  // Production availability is imported as it is (non-destructive load).
+  if (Array.isArray(target.completionBonusVariants)) {
+    target.completionBonusVariants.forEach((variant, variantIndex) => {
+      if (!isRecord(variant) || !Array.isArray(variant.slots)) return
+      variant.slots.forEach((slot, slotIndex) => {
+        if (!isRecord(slot)) return
+        const slotPath = `${path}.completionBonusVariants[${variantIndex}].slots[${slotIndex}]`
         references.push(
-          ...masterReference('bonusTypeId', option.alternativeBonusTypeId, `${optionPath}.alternativeBonusTypeId`),
-          ...masterReference('bonusRankId', option.minimumRankId, `${optionPath}.minimumRankId`),
+          ...masterReference('bonusTypeId', slot.bonusTypeId, `${slotPath}.bonusTypeId`),
+          ...masterReference('bonusRankId', slot.minimumRankId, `${slotPath}.minimumRankId`),
         )
       })
     })
@@ -701,6 +690,29 @@ function productionPlanReferences(plan: ProductionPlan, path: string): MasterRef
   return references
 }
 
+/** Every TargetWeapon body of a root with its path: the collection, save points, Undo bodies and their deleted save points. */
+function targetWeaponBodies(root: ExportRoot): { target: TargetWeapon; path: string }[] {
+  const bodies: { target: TargetWeapon; path: string }[] = []
+  const collect = (value: unknown, path: string) => {
+    if (!Array.isArray(value)) return
+    value.forEach((target: unknown, index) => {
+      if (isRecord(target)) bodies.push({ target: target as unknown as TargetWeapon, path: `${path}[${index}]` })
+    })
+  }
+  collect(root.targetWeapons, 'targetWeapons')
+  root.executionSavePoints.forEach((savePoint, index) => {
+    if (isRecord(savePoint)) collect(savePoint.targetWeapons, `executionSavePoints[${index}].targetWeapons`)
+  })
+  root.executionUndoSnapshots.forEach((snapshot, index) => {
+    if (!isRecord(snapshot)) return
+    const path = `executionUndoSnapshots[${index}]`
+    collect(snapshot.affectedTargetWeaponsBefore, `${path}.affectedTargetWeaponsBefore`)
+    const deleted: unknown = snapshot.deletedExecutionSavePoint
+    if (isRecord(deleted)) collect(deleted.targetWeapons, `${path}.deletedExecutionSavePoint.targetWeapons`)
+  })
+  return bodies
+}
+
 function executionSavePointReferences(savePoint: ExecutionSavePoint, path: string): MasterReference[] {
   const references: MasterReference[] = []
   if (Array.isArray(savePoint.normalCounters)) {
@@ -733,9 +745,18 @@ function executionHistoryReferences(history: ExecutionHistory, path: string): Ma
       ...skillReferences(actual, `${path}.actualResult`),
     )
   }
-  const snapshot = history.undoSnapshot
-  if (!isRecord(snapshot)) return references
-  const snapshotPath = `${path}.undoSnapshot`
+  return references
+}
+
+/**
+ * The Master IDs one Undo body holds (`docs/DATA_MODEL.md` 12.2 / 15.2): its
+ * past entity bodies and the save point its terminal transition deleted, Plan
+ * body included - the same range the former Undo snapshot's
+ * `executionSavePointBefore` was checked in. None of them is a current foreign
+ * key.
+ */
+function executionUndoSnapshotReferences(snapshot: ExecutionUndoSnapshot, snapshotPath: string): MasterReference[] {
+  const references: MasterReference[] = []
   if (Array.isArray(snapshot.normalCountersBefore)) {
     snapshot.normalCountersBefore.forEach((counter, index) => {
       if (isRecord(counter)) references.push(...normalCounterReferences(counter as NormalArtianCounter, `${snapshotPath}.normalCountersBefore[${index}]`))
@@ -753,11 +774,8 @@ function executionHistoryReferences(history: ExecutionHistory, path: string): Ma
       if (isRecord(target)) references.push(...targetWeaponReferences(target as TargetWeapon, `${snapshotPath}.affectedTargetWeaponsBefore[${index}]`))
     })
   }
-  if (isRecord(snapshot.productionPlanBefore)) {
-    references.push(...productionPlanReferences(snapshot.productionPlanBefore as ProductionPlan, `${snapshotPath}.productionPlanBefore`))
-  }
-  if (isRecord(snapshot.executionSavePointBefore)) {
-    references.push(...executionSavePointReferences(snapshot.executionSavePointBefore as ExecutionSavePoint, `${snapshotPath}.executionSavePointBefore`))
+  if (isRecord(snapshot.deletedExecutionSavePoint)) {
+    references.push(...executionSavePointReferences(snapshot.deletedExecutionSavePoint as ExecutionSavePoint, `${snapshotPath}.deletedExecutionSavePoint`))
   }
   return references
 }
@@ -821,6 +839,7 @@ export function validateExportRootMasterReferences(
       : [])
   collect('productionPlans', root.productionPlans, productionPlanReferences)
   collect('executionHistory', root.executionHistory, executionHistoryReferences)
+  collect('executionUndoSnapshots', root.executionUndoSnapshots, executionUndoSnapshotReferences)
   collect('executionSavePoints', root.executionSavePoints, executionSavePointReferences)
 
   const issues = references.flatMap(({ kind, id, path }) =>
@@ -859,7 +878,12 @@ export function validateExportRootForFullReplacement(
     return { isValid: false, issues: [issue('', 'invalid_structure', 'Export root must be an object.')] }
   }
   const record = root as unknown as Record<string, unknown>
-  const shapeIssues = ENTITY_COLLECTIONS.flatMap((field) => collectionShapeIssues(record, field))
+  const shapeIssues = [
+    ...ENTITY_COLLECTIONS.flatMap((field) => collectionShapeIssues(record, field)),
+    // Keyed by `executionHistoryId`; its 1:1 with `executionHistory` is checked
+    // by the current-root validation.
+    ...collectionShapeIssues(record, 'executionUndoSnapshots'),
+  ]
   if (record.appName !== EXPORT_APP_NAME) {
     shapeIssues.push(issue('appName', 'invalid_literal', 'Export appName is not supported.'))
   }
@@ -891,10 +915,18 @@ export function validateExportRootForFullReplacement(
     ...guarded('productionPlans', () => draftPlanIssues(root)),
     ...guarded('', () => referenceIssues(root)),
     ...guarded('targetWeapons', () => validateTargetPreferredOwnedWeapons(root.targetWeapons, root.ownedWeapons).issues),
+    // The completion assignments of the top-level Targets name existing weapons,
+    // one weapon per Target (Issue #334, `docs/DATA_MODEL.md` 8.7 / 15.1). The
+    // Target bodies inside game save points and Undo bodies are history: their
+    // assignments are never current foreign keys (the restore re-validates).
+    ...guarded('targetWeapons', () => validateTargetCompletionAssignments(root.targetWeapons, root.ownedWeapons).issues),
   )
-  root.targetWeapons.forEach((target, index) => {
-    const path = `targetWeapons[${index}]`
-    issues.push(...guarded(path, () => prefixed(path, validateTargetIdealImpliesPractical(target, master))))
+  // Every Target body - top-level, in a game save point, in an Undo body and in
+  // the save point an Undo body holds - meets the completion condition
+  // invariants that need the Master rank order (no included Variant;
+  // `docs/DATA_MODEL.md` 15.1 schema 15). Their structure was already validated.
+  targetWeaponBodies(root).forEach(({ target, path }) => {
+    issues.push(...guarded(path, () => prefixed(path, validateTargetCompletionConditions(target, master))))
   })
   issues.push(...guarded('', () => validateExportRootMasterReferences(root, master).issues))
   return { isValid: issues.length === 0, issues }

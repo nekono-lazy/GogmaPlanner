@@ -1,7 +1,6 @@
 import type {
   BuildListEntryId,
   DomainValidationIssue,
-  PlanConflictCheckpointParticipant,
 } from '../domain/models/publicTypes'
 import type {
   PlannerInput,
@@ -72,13 +71,6 @@ export interface PlannerInteractionExcludedEntry {
 export interface PlannerInteractionConflict {
   id: string
   buildListEntryIds: BuildListEntryId[]
-  /**
-   * The selected compromise checkpoints taking part in this *current*
-   * conflict. Typed Domain metadata, projected unchanged: the Application uses
-   * it to refuse the winner-picking controls on such a conflict
-   * (`docs/PLANNER_SPEC.md` 9.5, `docs/UI_FLOW.md` 11.1).
-   */
-  checkpointParticipants: PlanConflictCheckpointParticipant[]
 }
 
 /** Minimal B10 wire projection; no PlannerInitialContext or internal state. */

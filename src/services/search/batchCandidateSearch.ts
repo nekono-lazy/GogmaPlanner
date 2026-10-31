@@ -3,7 +3,6 @@ import type {
   BuildCandidate,
   BuildListEntry,
   CalculationContext,
-  IntermediateStateSelection,
   OwnedWeaponId,
   TargetWeapon,
 } from '../../domain/models/publicTypes'
@@ -13,7 +12,7 @@ import type {
   CandidateSearchProgress,
   CandidateSearchSettings,
 } from '../../domain/search'
-import { defaultIntermediateStateSelection, findBuildListRegisteredTargetIds } from '../../domain/buildList'
+import { findBuildListRegisteredTargetIds } from '../../domain/buildList'
 import type { AddBuildListCandidateResult } from '../buildList/buildListService'
 import {
   preparedCandidateSearchInputIssue,
@@ -42,27 +41,30 @@ export function selectBatchCandidateSearchTargets(
 }
 
 /**
- * The existing single Candidate Search authorities a batch reuses unchanged:
- * one `prepareInput()` + `client.startSearch()` per Target, the ordinary
- * `saveCandidates()` of that Target's result, and the ordinary
- * `BuildListService.addCandidate()`.
+ * The existing single Candidate Search authorities every batch reuses
+ * unchanged: one `prepareInput()` + `client.startSearch()` per Target and the
+ * ordinary `saveCandidates()` of that Target's result. What a batch then does
+ * with a found Candidate is its own commit (`BatchCandidateSearchCommit`).
  */
-export interface BatchCandidateSearchDependencies {
+export interface BatchCandidateSearchLoopDependencies {
   client: SearchWorkerClient
   createSearchRunId(): string
   /**
    * One Target's input, read from the persisted state right before its search
    * (`prepareCandidateSearchInput()`). With the exclusion on, the excluded set
    * is derived from that read, so an Entry an earlier Target of this batch
-   * added is already counted (`docs/SEARCH_SPEC.md` 3.3「一括検索・追加」).
+   * added or replaced is already counted (`docs/SEARCH_SPEC.md` 3.3「一括検索・追加」).
    */
   prepareInput(options: PrepareCandidateSearchInputOptions): Promise<PreparedCandidateSearchInput>
   saveCandidates(targetId: TargetWeapon['id'], candidates: BuildCandidate[]): Promise<unknown>
-  addCandidate(
-    candidate: BuildCandidate,
-    target: TargetWeapon,
-    intermediateStateSelection: IntermediateStateSelection,
-  ): Promise<AddBuildListCandidateResult>
+}
+
+/**
+ * 「未登録を一括検索・追加」's dependencies: the shared search loop plus the
+ * ordinary `BuildListService.addCandidate()`.
+ */
+export interface BatchCandidateSearchDependencies extends BatchCandidateSearchLoopDependencies {
+  addCandidate(candidate: BuildCandidate, target: TargetWeapon): Promise<AddBuildListCandidateResult>
 }
 
 /**
@@ -86,18 +88,22 @@ export interface BatchCandidateSearchRequest {
 /**
  * Where a `failed` Target stopped: reading its input (`prepare_input`, which
  * includes deriving the exclusion), the Search itself, saving its Candidate, or
- * adding it to the Build List. None of them added an Entry.
+ * the batch's own commit - adding it to the Build List (`add_candidate`,
+ * 9.1) or replacing the stale Entry (`replace_entry`, 9.3). None of them
+ * changed the Build List.
  */
-export type BatchCandidateSearchFailureStage = 'prepare_input' | 'search' | 'save_candidates' | 'add_candidate'
+export type BatchCandidateSearchFailureStage =
+  | 'prepare_input'
+  | 'search'
+  | 'save_candidates'
+  | 'add_candidate'
+  | 'replace_entry'
 
 /**
- * The outcome of one Target. `not_added` carries the `addCandidate()` result
- * status as it came from the Service: the batch never replaces an Entry, never
- * opens the replacement confirmation, and never picks an Entry of a legacy
- * duplicate.
+ * The outcomes every batch records before its own commit runs: the search
+ * found no Candidate, or a stage failed.
  */
-export type BatchCandidateSearchTargetOutcome =
-  | { status: 'added'; target: TargetWeapon; entry: BuildListEntry }
+export type BatchCandidateSearchCommonOutcome =
   | {
       status: 'no_candidate'
       target: TargetWeapon
@@ -109,6 +115,16 @@ export type BatchCandidateSearchTargetOutcome =
       excludedSourceOwnedWeaponIds: OwnedWeaponId[]
     }
   | { status: 'failed'; target: TargetWeapon; failedAt: BatchCandidateSearchFailureStage; message: string }
+
+/**
+ * The outcome of one Target of 「未登録を一括検索・追加」. `not_added` carries the
+ * `addCandidate()` result status as it came from the Service: the batch never
+ * replaces an Entry, never opens the replacement confirmation, and never picks
+ * an Entry of a legacy duplicate.
+ */
+export type BatchCandidateSearchTargetOutcome =
+  | BatchCandidateSearchCommonOutcome
+  | { status: 'added'; target: TargetWeapon; entry: BuildListEntry }
   | {
       status: 'not_added'
       target: TargetWeapon
@@ -116,7 +132,7 @@ export type BatchCandidateSearchTargetOutcome =
     }
 
 /**
- * How the batch ended. `cancelled` and `aborted` keep every outcome recorded
+ * How a batch ended. `cancelled` and `aborted` keep every outcome recorded
  * before the stop, and nothing is rolled back. `aborted` is a broken Search
  * Worker (`SearchWorkerRuntimeError`): every later request would fail the same
  * way, so no further Target is started.
@@ -126,15 +142,18 @@ export type BatchCandidateSearchTermination =
   | { status: 'cancelled' }
   | { status: 'aborted'; message: string }
 
-export interface BatchCandidateSearchSummary {
+/** A finished batch over its own outcome type. */
+export interface BatchCandidateSearchSummaryOf<TOutcome> {
   total: number
   /** The exclusion condition the whole batch ran with (`BatchCandidateSearchRequest`). */
   excludeOtherTargetSources: boolean
-  outcomes: BatchCandidateSearchTargetOutcome[]
+  outcomes: TOutcome[]
   /** The Targets never started because the batch stopped first. */
   notStarted: TargetWeapon[]
   termination: BatchCandidateSearchTermination
 }
+
+export type BatchCandidateSearchSummary = BatchCandidateSearchSummaryOf<BatchCandidateSearchTargetOutcome>
 
 /**
  * Progress of the Target being searched. `index` is 0-based; `completed` is how
@@ -151,8 +170,8 @@ export interface BatchCandidateSearchProgress {
   search: CandidateSearchProgress
 }
 
-export interface BatchCandidateSearchRun {
-  readonly promise: Promise<BatchCandidateSearchSummary>
+export interface BatchCandidateSearchRunOf<TSummary> {
+  readonly promise: Promise<TSummary>
   /**
    * Cancels the running Search through the Worker cancel contract and starts no
    * further Target. A Build List write already in flight completes and is kept.
@@ -160,36 +179,57 @@ export interface BatchCandidateSearchRun {
   cancel(): void
 }
 
+export type BatchCandidateSearchRun = BatchCandidateSearchRunOf<BatchCandidateSearchSummary>
+
+/**
+ * What one batch does with a found Candidate, once its search result was saved
+ * (`docs/UI_FLOW.md` 9.1 / 9.3). `run` returns the Target's outcome; a refusal
+ * it means to record as an outcome of its own (a Service result, a typed
+ * refusal) is returned, and an exception it lets through is recorded by the
+ * loop as `failed` at `stage` with `failureMessage` when the error carries no
+ * message of its own. Once started, a commit completes and is kept even when
+ * the batch is cancelled meanwhile.
+ */
+export interface BatchCandidateSearchCommit<TCommit> {
+  stage: BatchCandidateSearchFailureStage
+  failureMessage: string
+  /** `searchedTarget` is the Target the search ran with (its definition describes the Candidate); `target` the batch's own record of it. */
+  run(candidate: BuildCandidate, searchedTarget: TargetWeapon, target: TargetWeapon): Promise<TCommit>
+}
+
 function errorMessage(caught: unknown, fallback: string): string {
   return caught instanceof Error ? caught.message : fallback
 }
 
 /**
- * Runs the ordinary single Candidate Search once per Target, in order, and adds
- * each found canonical Ideal to the Build List with
- * `defaultIntermediateStateSelection()` (no intermediate state, improvement
- * preference `planner`). This is a UI / Application orchestration only: every
- * request still covers exactly one Target with its own `searchRunId`, and no
- * Search, Candidate or Build List semantics are re-implemented here.
+ * The one search loop every batch of this screen runs (`docs/UI_FLOW.md` 9.1 /
+ * 9.3): the ordinary single Candidate Search once per Target, in order, each
+ * request covering exactly one Target with its own `searchRunId`, the result
+ * saved through the ordinary `saveCandidates()`, and the batch's own commit
+ * for a found Candidate. No Search, Candidate or Build List semantics are
+ * re-implemented here.
  *
- * A Target with no Candidate, and a Target whose search, save or addition
- * fails, is recorded and the next Target runs. A cancel stops the current
- * Search and starts no other; a broken Worker stops the batch the same way.
+ * A Target with no Candidate, and a Target whose search, save or commit fails,
+ * is recorded and the next Target runs. A cancel stops the current Search and
+ * starts no other; a broken Worker stops the batch the same way.
  */
-export function runBatchCandidateSearch(
+export function runBatchCandidateSearchLoop<TCommit>(
   request: BatchCandidateSearchRequest,
-  dependencies: BatchCandidateSearchDependencies,
+  dependencies: BatchCandidateSearchLoopDependencies,
+  commit: BatchCandidateSearchCommit<TCommit>,
   onProgress?: (progress: BatchCandidateSearchProgress) => void,
-): BatchCandidateSearchRun {
+): BatchCandidateSearchRunOf<BatchCandidateSearchSummaryOf<BatchCandidateSearchCommonOutcome | TCommit>> {
+  type Outcome = BatchCandidateSearchCommonOutcome | TCommit
+  type Summary = BatchCandidateSearchSummaryOf<Outcome>
   let cancelled = false
   let activeRequestId: string | null = null
 
-  const run = async (): Promise<BatchCandidateSearchSummary> => {
+  const run = async (): Promise<Summary> => {
     const targets = [...request.targets]
     // Fixed at the start: a later change on the screen never reaches this batch.
     const excludeOtherTargetSources = request.excludeOtherTargetSources
-    const outcomes: BatchCandidateSearchTargetOutcome[] = []
-    const stop = (termination: BatchCandidateSearchTermination): BatchCandidateSearchSummary => ({
+    const outcomes: Outcome[] = []
+    const stop = (termination: BatchCandidateSearchTermination): Summary => ({
       total: targets.length,
       excludeOtherTargetSources,
       outcomes,
@@ -215,8 +255,8 @@ export function runBatchCandidateSearch(
       let stage: BatchCandidateSearchFailureStage = 'prepare_input'
       try {
         // Read from the persisted state now, never from an in-memory record of
-        // what earlier Targets of this batch used: only an Entry `addCandidate()`
-        // really added is counted by the exclusion (`docs/SEARCH_SPEC.md` 3.3).
+        // what earlier Targets of this batch used: only an Entry the commit
+        // really persisted is counted by the exclusion (`docs/SEARCH_SPEC.md` 3.3).
         const prepared = await dependencies.prepareInput({
           searchRunId,
           targetWeaponId: target.id,
@@ -262,26 +302,17 @@ export function runBatchCandidateSearch(
         outcomes.push({ status: 'no_candidate', target, excludedSourceOwnedWeaponIds })
         continue
       }
-      // A cancel during the Candidate save adds nothing further to the Build List.
+      // A cancel during the Candidate save changes nothing further in the Build List.
       if (cancelled) return stop({ status: 'cancelled' })
       try {
         // Once started, the write completes and is kept even when cancelled.
-        const added = await dependencies.addCandidate(
-          candidate,
-          searchedTarget,
-          defaultIntermediateStateSelection(),
-        )
-        outcomes.push(
-          added.status === 'added'
-            ? { status: 'added', target, entry: added.entry }
-            : { status: 'not_added', target, reason: added.status },
-        )
+        outcomes.push(await commit.run(candidate, searchedTarget, target))
       } catch (caught: unknown) {
         outcomes.push({
           status: 'failed',
           target,
-          failedAt: 'add_candidate',
-          message: errorMessage(caught, '作成リストへの追加に失敗しました。'),
+          failedAt: commit.stage,
+          message: errorMessage(caught, commit.failureMessage),
         })
       }
     }
@@ -297,4 +328,38 @@ export function runBatchCandidateSearch(
       if (requestId !== null) dependencies.client.cancelSearch(requestId)
     },
   }
+}
+
+/**
+ * Runs the ordinary single Candidate Search once per Target, in order, and adds
+ * each found Candidate to the Build List through the ordinary addition (a new
+ * Entry carries no intermediate state selection, Issue #100). This is a UI /
+ * Application orchestration only: every
+ * request still covers exactly one Target with its own `searchRunId`, and no
+ * Search, Candidate or Build List semantics are re-implemented here.
+ *
+ * A Target with no Candidate, and a Target whose search, save or addition
+ * fails, is recorded and the next Target runs. A cancel stops the current
+ * Search and starts no other; a broken Worker stops the batch the same way.
+ */
+export function runBatchCandidateSearch(
+  request: BatchCandidateSearchRequest,
+  dependencies: BatchCandidateSearchDependencies,
+  onProgress?: (progress: BatchCandidateSearchProgress) => void,
+): BatchCandidateSearchRun {
+  return runBatchCandidateSearchLoop<Exclude<BatchCandidateSearchTargetOutcome, BatchCandidateSearchCommonOutcome>>(
+    request,
+    dependencies,
+    {
+      stage: 'add_candidate',
+      failureMessage: '作成リストへの追加に失敗しました。',
+      run: async (candidate, searchedTarget, target) => {
+        const added = await dependencies.addCandidate(candidate, searchedTarget)
+        return added.status === 'added'
+          ? { status: 'added', target, entry: added.entry }
+          : { status: 'not_added', target, reason: added.status }
+      },
+    },
+    onProgress,
+  )
 }

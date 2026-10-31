@@ -9,6 +9,7 @@ import {
   type PlanBreakingChangeApproval,
   type PlanBreakingChangeInspection,
   type PlanGuardedMutation,
+  type PlanGuardedMutationBase,
 } from '../../domain/execution'
 import {
   createOwnedWeapon,
@@ -23,9 +24,11 @@ import {
   type TargetWeaponId,
 } from '../../domain/models/publicTypes'
 import {
+  findTargetCompletionOverlapConfirmations,
   findTargetsInvalidatedByOwnedWeaponChange,
-  validateTargetIdealImpliesPractical,
-  validateTargetPreferredOwnedWeapons,
+  validateTargetCompletionConditions,
+  validateTargetOwnedWeaponCollections,
+  type TargetCompletionOverlapConfirmation,
 } from '../../domain/target'
 import { ownedWeaponRepository, targetWeaponRepository } from '../../db/repositories'
 import {
@@ -197,16 +200,24 @@ export function ownedWeaponSaveMutation(
   }
 }
 
-/** One OwnedWeapon delete as a guarded mutation, under the existing reference protection. */
+/**
+ * One OwnedWeapon delete as a guarded mutation, under the existing reference
+ * protection. The ExecutionHistory references sit in the metadata and the Undo
+ * bodies, so it reads every body (`docs/DATA_MODEL.md` 14.6).
+ */
 export function ownedWeaponDeleteMutation(id: OwnedWeaponId): PlanGuardedMutation<void> {
-  return (base) => {
-    const references = findOwnedWeaponReferencesIn(base, id)
+  const mutation = (base: PlanGuardedMutationBase) => {
+    if (base.executionUndoSnapshots === null) {
+      throw new Error('The OwnedWeapon delete reference check needs every ExecutionHistory Undo body.')
+    }
+    const references = findOwnedWeaponReferencesIn({ ...base, executionUndoSnapshots: base.executionUndoSnapshots }, id)
     if (references.length) throw new ReferencedEntityDeleteError(references)
     return {
       result: undefined,
       state: { ...unchangedMutableState(base), ownedWeapons: base.ownedWeapons.filter((weapon) => weapon.id !== id) },
     }
   }
+  return Object.assign(mutation, { readsExecutionUndoSnapshots: true as const })
 }
 
 export interface OwnedWeaponCrudDependencies {
@@ -290,13 +301,96 @@ export class OwnedWeaponCrudService {
   }
 }
 
+/** What one TargetWeapon save writes, before any Plan decision. */
+export interface PreparedTargetWeaponSave {
+  /** The Target exactly as the save writes it. */
+  saved: TargetWeapon
+  /** The stored Target the edit replaces, read from the given state; `null` for a new Target. */
+  stored: TargetWeapon | null
+  /** Every Target after the save: the saved one and any Target that released the same preferred weapon. */
+  targetWeapons: TargetWeapon[]
+}
+
 /**
- * One TargetWeapon save as a guarded mutation (`docs/PLANNER_SPEC.md` 16.6).
- * The user's intent is what they changed in the draft from `basis`, the Target
- * the screen showed, applied to the Target as it is in the state the mutation
- * runs on (`applyUserChanges()`): a preferred owned weapon the user left alone
- * follows the stored Target - after a save point restore, the restored one -
- * and the lifecycle always comes from the stored Target.
+ * The one save preparation of a TargetWeapon, shared by the guarded save
+ * mutation and the read-only completion overlap inspection (Issue #338), so the
+ * confirmation judges exactly the definition the save writes. The user's intent
+ * is what they changed in the draft from `basis`, the Target the screen showed,
+ * applied to the Target as it is in the given state (`applyUserChanges()`): a
+ * preferred owned weapon the user left alone follows the stored Target - after
+ * a save point restore, the restored one - and the lifecycle always comes from
+ * the stored Target. Every input validation runs here (structure, Master
+ * references, Production availability, duplicate / included Variants, the
+ * preferred-origin collection) and throws `EntityFormValidationError`.
+ */
+export function prepareTargetWeaponSave(
+  master: MasterDataRoot,
+  draft: TargetWeaponDraft,
+  basis: TargetWeapon | null,
+  newId: TargetWeaponId,
+  now: string,
+  base: Pick<PlanGuardedMutationBase, 'targetWeapons' | 'ownedWeapons'>,
+): PreparedTargetWeaponSave {
+  let value: TargetWeapon
+  let stored: TargetWeapon | null = null
+  if (basis === null) {
+    value = createTargetWeapon({ ...draft, id: newId }, now)
+  } else {
+    const current = base.targetWeapons.find(({ id }) => id === basis.id)
+    if (current === undefined) {
+      throw new EntityFormValidationError(['この目標武器はすでに存在しません。一覧を更新してください。'])
+    }
+    stored = current
+    // The lifecycle is changed only by Execution and the explicit complete /
+    // reopen actions, never by an ordinary edit: an edit keeps the stored
+    // values, and a new Target is always active.
+    value = {
+      ...applyUserChanges<TargetWeapon>(current, basis, draft),
+      id: current.id,
+      lifecycleStatus: current.lifecycleStatus,
+      completedAt: current.completedAt,
+      completedByProductionPlanId: current.completedByProductionPlanId,
+      // The completion assignment is written only by Execution and the
+      // direct completion, never by an edit (`docs/DATA_MODEL.md` 8.7).
+      completedWithOwnedWeaponId: current.completedWithOwnedWeaponId,
+      createdAt: current.createdAt,
+      updatedAt: now,
+    }
+  }
+  const issues = [
+    ...(value.name.trim() ? [] : ['name: 名前を入力してください。']),
+    ...domainMessages(validateTargetWeapon(value)),
+    ...validateTargetWeaponMasterReferences(value, master),
+    ...domainMessages(validateTargetCompletionConditions(value, master)),
+  ]
+  if (issues.length) throw new EntityFormValidationError(issues)
+  // The user's explicit save of the Target Weapons form is the only thing
+  // that clears the completion condition review (`docs/DATA_MODEL.md` 8.6):
+  // the saved condition has just passed the current validation.
+  const saved: TargetWeapon = { ...value, completionConditionReview: [] }
+  // Taking the weapon over from another Target and releasing that Target is
+  // one change, so both writes share one transaction: a partial failure must
+  // never leave two Targets preferring one weapon, nor both preferring none
+  // (`docs/UI_FLOW.md` 8.1). The Target Weapons screen confirms the takeover
+  // with the user before reaching this point.
+  const released = new Map(
+    saved.preferredOwnedWeaponId === null
+      ? []
+      : base.targetWeapons
+          .filter((target) => target.id !== saved.id && target.preferredOwnedWeaponId === saved.preferredOwnedWeaponId)
+          .map((target) => [target.id, releasePreferredOwnedWeapon(target, now)] as const),
+  )
+  const targetWeapons = withRecord(base.targetWeapons.map((target) => released.get(target.id) ?? target), saved)
+  const preferred = validateTargetOwnedWeaponCollections(targetWeapons, [...base.ownedWeapons])
+  if (!preferred.isValid) {
+    throw new EntityFormValidationError(domainMessages(preferred))
+  }
+  return { saved, stored, targetWeapons }
+}
+
+/**
+ * One TargetWeapon save as a guarded mutation (`docs/PLANNER_SPEC.md` 16.6),
+ * through `prepareTargetWeaponSave()` on the state the mutation runs on.
  */
 export function targetWeaponSaveMutation(
   master: MasterDataRoot,
@@ -306,52 +400,7 @@ export function targetWeaponSaveMutation(
   now: string,
 ): PlanGuardedMutation<TargetWeapon> {
   return (base) => {
-    let value: TargetWeapon
-    if (basis === null) {
-      value = createTargetWeapon({ ...draft, id: newId }, now)
-    } else {
-      const current = base.targetWeapons.find(({ id }) => id === basis.id)
-      if (current === undefined) {
-        throw new EntityFormValidationError(['この目標武器はすでに存在しません。一覧を更新してください。'])
-      }
-      // The lifecycle is changed only by Execution and the explicit complete /
-      // reopen actions, never by an ordinary edit: an edit keeps the stored
-      // values, and a new Target is always active.
-      value = {
-        ...applyUserChanges<TargetWeapon>(current, basis, draft),
-        id: current.id,
-        lifecycleStatus: current.lifecycleStatus,
-        completedAt: current.completedAt,
-        completedByProductionPlanId: current.completedByProductionPlanId,
-        createdAt: current.createdAt,
-        updatedAt: now,
-      }
-    }
-    const issues = [
-      ...(value.name.trim() ? [] : ['name: 名前を入力してください。']),
-      ...domainMessages(validateTargetWeapon(value)),
-      ...validateTargetWeaponMasterReferences(value, master),
-      ...domainMessages(validateTargetIdealImpliesPractical(value, master)),
-    ]
-    if (issues.length) throw new EntityFormValidationError(issues)
-    const saved = { ...value, compromiseNeedsReview: false }
-    // Taking the weapon over from another Target and releasing that Target is
-    // one change, so both writes share one transaction: a partial failure must
-    // never leave two Targets preferring one weapon, nor both preferring none
-    // (`docs/UI_FLOW.md` 8.1). The Target Weapons screen confirms the takeover
-    // with the user before reaching this point.
-    const released = new Map(
-      saved.preferredOwnedWeaponId === null
-        ? []
-        : base.targetWeapons
-            .filter((target) => target.id !== saved.id && target.preferredOwnedWeaponId === saved.preferredOwnedWeaponId)
-            .map((target) => [target.id, releasePreferredOwnedWeapon(target, now)] as const),
-    )
-    const targetWeapons = withRecord(base.targetWeapons.map((target) => released.get(target.id) ?? target), saved)
-    const preferred = validateTargetPreferredOwnedWeapons(targetWeapons, [...base.ownedWeapons])
-    if (!preferred.isValid) {
-      throw new EntityFormValidationError(domainMessages(preferred))
-    }
+    const { saved, targetWeapons } = prepareTargetWeaponSave(master, draft, basis, newId, now, base)
     return { result: saved, state: { ...unchangedMutableState(base), targetWeapons } }
   }
 }
@@ -423,6 +472,31 @@ export class TargetWeaponCrudService {
     return this.dependencies.persistence.inspect(
       targetWeaponSaveMutation(this.master, draft, existing, createTargetWeaponId(), now),
     )
+  }
+
+  /**
+   * The other Targets whose completion condition the save would newly overlap
+   * (Issue #338, `docs/UI_FLOW.md` 8.5). Read-only and advisory: it reads the
+   * latest stored Targets and owned weapons, runs the save's own preparation -
+   * so an invalid input throws `EntityFormValidationError` before any overlap
+   * is judged - and classifies the definition the save would write with the
+   * one Domain authority. Nothing is written, and the save itself re-validates
+   * everything inside its own transaction.
+   */
+  async inspectSaveCompletionOverlap(
+    draft: TargetWeaponDraft,
+    existing: TargetWeapon | null,
+    now = new Date().toISOString(),
+  ): Promise<TargetCompletionOverlapConfirmation[]> {
+    const [targetWeapons, ownedWeapons] = await Promise.all([
+      this.dependencies.getAll(),
+      this.dependencies.getOwnedWeapons(),
+    ])
+    const { saved, stored } = prepareTargetWeaponSave(this.master, draft, existing, createTargetWeaponId(), now, {
+      targetWeapons,
+      ownedWeapons,
+    })
+    return findTargetCompletionOverlapConfirmations({ saved, before: stored, targets: targetWeapons, master: this.master })
   }
 
   /** The Target that currently prefers this owned weapon, if any. */

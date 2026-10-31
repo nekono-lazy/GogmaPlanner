@@ -14,6 +14,10 @@
  * candidate was rejected outright is `not_found(candidates_rejected)`, and one that delivered none is
  * `not_found(no_structural_candidate)`. A cancellation is `{ kind: 'cancelled' }`; a broken contract throws.
  *
+ * Stage A - D' are one calculation core (`runBuildListOptimizationStages()`) over the scope a Stage 0 fixed. The Build List global
+ * optimization's Stage 0 is here; the running Plan replan re-optimization (`docs/PLANNER_SPEC.md` 18.6, Issue #276) has its own Stage 0R
+ * (the replan target set, its scope and Entry rule) and runs the very same core, so the two never drift apart.
+ *
  * The calculation is pure apart from the Engine and the Planner's Production ID factory and Clock: it reads no persisted state,
  * writes nothing, holds no default bound and reads neither the Candidate Search defaults nor a saved setting. Minimality is never
  * claimed.
@@ -23,13 +27,19 @@ import type { PlannerDependencies, PlannerInput } from '../plannerTypes'
 import type { createProductionPlanWithObserver } from '../productionPlanGeneration'
 import type {
   BuildListOptimizationBound, BuildListOptimizationBounds, BuildListOptimizationCandidateDiagnostics, BuildListOptimizationDiagnostics,
-  BuildListOptimizationResult, BuildListOptimizationRun, BuildListOptimizationStage,
+  BuildListOptimizationInputExclusion, BuildListOptimizationPlanSummary, BuildListOptimizationResult, BuildListOptimizationRun,
+  BuildListOptimizationStage,
 } from './buildListOptimizationResult'
-import { BUILD_LIST_OPTIMIZATION_REACH_OPTION_SET, BuildListOptimizationInvariantError, type ReachTable } from './buildListOptimizationTypes'
+import {
+  BUILD_LIST_OPTIMIZATION_REACH_OPTION_SET, BuildListOptimizationInvariantError, type BuildListOptimizationContext, type ReachTable,
+} from './buildListOptimizationTypes'
 import { noCandidateReason } from './coverageSearch'
 import type { CoverageSearch, NoStructuralCandidateReason, StructuralSearchDiagnostics } from './coverageSearchTypes'
 import type { StructuralCandidate } from './coverageTypes'
-import { buildListOptimizationInputExclusionsOf, verifyBuildListOptimizationCandidate } from './finalVerification'
+import {
+  buildListOptimizationInputExclusionsOf, verifyBuildListOptimizationCandidate, type BuildListOptimizationEntryChangeRule,
+  type FinalVerificationOutcome,
+} from './finalVerification'
 import { countBuildListOptimizationOutOfScopeTargets, deriveBuildListOptimizationInputToken } from './optimizationInputScope'
 import { createBuildListOptimizationContext } from './planningContext'
 import { assertReachWindow, buildReachTable, deriveBuildListOptimizationUnsupportedReasons } from './reachTable'
@@ -102,56 +112,84 @@ function structuralDiagnostics(search: CoverageSearch<StructuralCandidate, Struc
 }
 
 /**
- * Runs one Build List global optimization over `plannerInput` (a fresh `createPlannerInput()` value with `conflictResolutions = []`).
- * `dependencies` are the Production Planner's (Engine, Production ID factory, Production Clock); `bounds` are the caller's. Throws a
- * `RangeError` for invalid bounds or an input carrying conflict resolutions, and `BuildListOptimizationInvariantError` /
- * `BuildListOptimizationMaterializationError` / a Planner error for a broken contract (never a result).
+ * The stage bookkeeping of one calculation, from its Stage 0 to its end: the diagnostics, the stage notifications and (with the
+ * caller's monotonic clock) the stage timings. One tracker serves one calculation; Stage 0 enters `input_check` on it before the core
+ * continues on the same tracker.
  */
-export async function runBuildListOptimization(plannerInput: PlannerInput, dependencies: PlannerDependencies, bounds: BuildListOptimizationBounds,
-  execution: BuildListOptimizationExecution = {}): Promise<BuildListOptimizationRun> {
-  assertBuildListOptimizationBounds(bounds)
-  if (plannerInput.conflictResolutions.length > 0) {
-    throw new RangeError('The Build List global optimization reads no conflict resolution: its input carries conflictResolutions = [].')
-  }
-  const engine = dependencies.rngEngine
-  const { shouldCancel, yieldControl, now } = execution
+export interface BuildListOptimizationStageTracker {
+  readonly diagnostics: BuildListOptimizationDiagnostics
+  /** Closes the open stage (recording its time) and opens `stage`, notifying the caller. */
+  enter(stage: BuildListOptimizationStage): void
+  /** Closes the open stage, if any. */
+  close(): void
+}
+
+export function createBuildListOptimizationStageTracker(execution: Pick<BuildListOptimizationExecution, 'onStage' | 'now'>): BuildListOptimizationStageTracker {
+  const { now } = execution
   const diagnostics: BuildListOptimizationDiagnostics = { reachTable: null, structuralSearch: null, candidates: [], plannerVerifications: 0, elapsedMs: now ? {} : null }
   let open: { stage: BuildListOptimizationStage; at: number } | null = null
   const close = () => {
     if (open !== null && now && diagnostics.elapsedMs) diagnostics.elapsedMs[open.stage] = (diagnostics.elapsedMs[open.stage] ?? 0) + (now() - open.at)
     open = null
   }
-  const enter = (stage: BuildListOptimizationStage) => {
-    close()
-    execution.onStage?.(stage)
-    if (now) open = { stage, at: now() }
+  return {
+    diagnostics,
+    enter: (stage) => {
+      close()
+      execution.onStage?.(stage)
+      if (now) open = { stage, at: now() }
+    },
+    close,
   }
-  const finish = (result: BuildListOptimizationResult): BuildListOptimizationRun => {
-    close()
-    return { kind: 'result', result }
-  }
-  const cancelled = (): BuildListOptimizationRun => {
-    close()
+}
+
+/**
+ * What a Stage 0 fixed for Stage A - D' of one calculation: the planning Targets and the input every later Stage reads (the context),
+ * the Entries the input validation excluded with their warnings (the final input must exclude exactly these, 17.7 item 3) and how a
+ * generated Entry enters the final input.
+ *
+ * - the Build List global optimization (17.3): the valid Entries' planning Targets over the whole Build List, Stage 0's exclusions,
+ *   `replace_only`
+ * - the running Plan replan re-optimization (18.6): the replan target set over the replan Targets' current Entries only, no exclusion
+ *   (every replan Target's Entry is replaced, reused or added), `replace_or_add`
+ */
+export interface BuildListOptimizationScope {
+  context: BuildListOptimizationContext
+  inputExclusions: readonly BuildListOptimizationInputExclusion[]
+  entryChanges: BuildListOptimizationEntryChangeRule
+}
+
+/** Stage A - D' of one calculation over a fixed scope. */
+export type BuildListOptimizationStagesOutcome =
+  | { kind: 'cancelled' }
+  /** Stage D' accepted a candidate: the verdict and the candidate's structural objective. The tracker's diagnostics are final. */
+  | { kind: 'optimized'; verdict: Extract<FinalVerificationOutcome, { kind: 'optimized' }>; structuralObjective: number }
+  /** No candidate was accepted: the 17.8 class with its diagnostics, independent of the scope's Stage 0. */
+  | { kind: 'concluded'; result: Extract<BuildListOptimizationResult, { status: 'not_found' | 'search_bound_reached' }> }
+
+/**
+ * Stage A - D' over the scope a Stage 0 fixed (`docs/PLANNER_SPEC.md` 17.6; 18.6 runs the same core): the ReachTable, the structural
+ * candidate search, the route generation and the final verification, under the caller's bounds, with the result classes of 17.8. It
+ * reads the scope alone - never a Stage 0 rule, the Build List outside the scope's input, or a persisted state - and closes the
+ * tracker before it returns. The bounds must have been asserted by the caller.
+ */
+export async function runBuildListOptimizationStages(scope: BuildListOptimizationScope, dependencies: PlannerDependencies, bounds: BuildListOptimizationBounds,
+  execution: BuildListOptimizationExecution, tracker: BuildListOptimizationStageTracker): Promise<BuildListOptimizationStagesOutcome> {
+  const { context, inputExclusions, entryChanges } = scope
+  const engine = dependencies.rngEngine
+  const { shouldCancel, yieldControl } = execution
+  const { diagnostics } = tracker
+  const cancelled = (): BuildListOptimizationStagesOutcome => {
+    tracker.close()
     return { kind: 'cancelled' }
   }
-
-  // Stage 0: the planning Targets, every unsupported reason the Domain decides, the exclusions and the out-of-scope Targets.
-  enter('input_check')
-  const created = createBuildListOptimizationContext(plannerInput, dependencies)
-  if (created.kind === 'unsupported_input') {
-    return finish({ status: 'unsupported', reasons: [created.reason === 'invalid_planner_input'
-      ? { kind: 'invalid_planner_input', issues: created.validation.issues.map(({ path, code, message }) => ({ path, code, message })) }
-      : { kind: 'no_planning_target' }] })
+  const concluded = (result: Extract<BuildListOptimizationResult, { status: 'not_found' | 'search_bound_reached' }>): BuildListOptimizationStagesOutcome => {
+    tracker.close()
+    return { kind: 'concluded', result }
   }
-  const { context } = created
-  const unsupportedReasons = deriveBuildListOptimizationUnsupportedReasons(context, engine)
-  if (unsupportedReasons.length > 0) return finish({ status: 'unsupported', reasons: unsupportedReasons })
-  const inputExclusions = buildListOptimizationInputExclusionsOf(context.validation)
-  const outOfScopeTargetCounts = countBuildListOptimizationOutOfScopeTargets(plannerInput, context.planningTargetIds)
-  if (shouldCancel?.()) return cancelled()
 
   // Stage A.
-  enter('reach_table')
+  tracker.enter('reach_table')
   const built = await buildReachTable(context, engine, bounds.window, BUILD_LIST_OPTIMIZATION_REACH_OPTION_SET, { shouldCancel, yieldControl })
   if (built.kind === 'cancelled') return cancelled()
   if (built.kind === 'unsupported_input') {
@@ -161,7 +199,7 @@ export async function runBuildListOptimization(plannerInput: PlannerInput, depen
   diagnostics.reachTable = reachTableDiagnostics(table)
 
   // Stage B / C.
-  enter('assignment_search')
+  tracker.enter('assignment_search')
   const createdSearch = createStructuralCandidateSearch({ table, context, engine }, {
     nodeBudget: bounds.nodeBudget, mrvLookahead: bounds.mrvLookahead, coverageDrivenOrdering: true, shouldCancel,
   })
@@ -193,7 +231,7 @@ export async function runBuildListOptimization(plannerInput: PlannerInput, depen
     candidatesTried += 1
 
     // Stage D.
-    enter('route_generation')
+    tracker.enter('route_generation')
     const generation = await generateStructuralCandidateRoutes(candidate, routeInputs)
     const record: BuildListOptimizationCandidateDiagnostics = {
       ordinal: candidate.ordinal, objective: candidate.assignment.objective,
@@ -210,10 +248,10 @@ export async function runBuildListOptimization(plannerInput: PlannerInput, depen
         : { kind: 'shape_search_budget', targetWeaponId: generation.outcome.targetWeaponId, exceeded: [...outcome.budgetExceeded] })
     } else if (generation.outcome.kind === 'all_generated') {
       // Stage D'.
-      enter('plan_verification')
+      tracker.enter('plan_verification')
       diagnostics.plannerVerifications += 1
       const verdict = await verifyBuildListOptimizationCandidate({
-        context, inputExclusions, generation, dependencies, shouldCancel, yieldControl, planner: execution.planner,
+        context, inputExclusions, generation, entryChanges, dependencies, shouldCancel, yieldControl, planner: execution.planner,
       })
       if (verdict.kind === 'cancelled') return cancelled()
       record.verification = {
@@ -221,33 +259,9 @@ export async function runBuildListOptimization(plannerInput: PlannerInput, depen
         rejections: verdict.kind === 'rejected' ? structuredClone(verdict.rejections) : [],
       }
       if (verdict.kind === 'optimized') {
-        const plan = verdict.plannerResult.plan!
-        const { termination } = verdict.plannerResult
-        close()
+        tracker.close()
         diagnostics.structuralSearch = structuralDiagnostics(search, null)
-        return finish({
-          status: 'optimized',
-          artifact: {
-            plannerResult: verdict.plannerResult,
-            generatedBuildListEntries: verdict.finalInput.generatedBuildListEntries,
-            replacements: verdict.finalInput.replacements,
-            unchangedTargetWeaponIds: verdict.finalInput.unchangedTargetWeaponIds,
-            planningTargetWeaponIds: context.planningTargets.map(target => target.id),
-            inputExclusions,
-            inputToken: deriveBuildListOptimizationInputToken(plannerInput, plan),
-            summary: {
-              physicalOperationCount: verdict.physical.physicalOperations,
-              planStepCount: verdict.physical.planSteps,
-              nonPhysicalStepCount: verdict.nonPhysicalStepCount,
-              structuralObjective: generation.objective,
-              completedTargetCount: termination.completedTargetCount,
-              totalTargetCount: termination.totalTargetCount,
-              maxPlanSteps: verdict.maxPlanSteps,
-              outOfScopeTargetCounts,
-            },
-            diagnostics,
-          },
-        })
+        return { kind: 'optimized', verdict, structuralObjective: generation.objective }
       }
     }
     // A generation_unsupported candidate needs a prediction the Engine does not offer: rejected outright, like a rejected verification.
@@ -259,16 +273,91 @@ export async function runBuildListOptimization(plannerInput: PlannerInput, depen
       stop = { kind: 'planner_verification_budget', maxPlannerVerifications: bounds.maxPlannerVerifications }
       break
     }
-    enter('assignment_search')
+    tracker.enter('assignment_search')
   }
-  close()
+  tracker.close()
   if (completeness === 'cancelled') return cancelled()
   diagnostics.structuralSearch = structuralDiagnostics(search, completeness === 'exhausted' && candidatesTried === 0 ? noCandidateReason(search) : null)
-  if (stop !== null) return finish({ status: 'search_bound_reached', bounds: [...reached, stop], diagnostics })
+  if (stop !== null) return concluded({ status: 'search_bound_reached', bounds: [...reached, stop], diagnostics })
   if (completeness === 'node_budget_reached') {
-    return finish({ status: 'search_bound_reached', bounds: [...reached, { kind: 'structural_search_node_budget', nodeBudget: bounds.nodeBudget }], diagnostics })
+    return concluded({ status: 'search_bound_reached', bounds: [...reached, { kind: 'structural_search_node_budget', nodeBudget: bounds.nodeBudget }], diagnostics })
   }
-  if (candidatesTried === 0) return finish({ status: 'not_found', reason: 'no_structural_candidate', diagnostics })
-  if (unconfirmed) return finish({ status: 'search_bound_reached', bounds: reached, diagnostics })
-  return finish({ status: 'not_found', reason: 'candidates_rejected', diagnostics })
+  if (candidatesTried === 0) return concluded({ status: 'not_found', reason: 'no_structural_candidate', diagnostics })
+  if (unconfirmed) return concluded({ status: 'search_bound_reached', bounds: reached, diagnostics })
+  return concluded({ status: 'not_found', reason: 'candidates_rejected', diagnostics })
+}
+
+/** The final Plan's figures of an accepted Stage D' verdict (`docs/PLANNER_SPEC.md` 17.9 / 17.13; 18.7 reads the same). */
+export function buildListOptimizationPlanSummaryOf(verdict: Extract<FinalVerificationOutcome, { kind: 'optimized' }>, structuralObjective: number): BuildListOptimizationPlanSummary {
+  const { termination } = verdict.plannerResult
+  return {
+    physicalOperationCount: verdict.physical.physicalOperations,
+    planStepCount: verdict.physical.planSteps,
+    nonPhysicalStepCount: verdict.nonPhysicalStepCount,
+    structuralObjective,
+    completedTargetCount: termination.completedTargetCount,
+    totalTargetCount: termination.totalTargetCount,
+    maxPlanSteps: verdict.maxPlanSteps,
+  }
+}
+
+/**
+ * Runs one Build List global optimization over `plannerInput` (a fresh `createPlannerInput()` value with `conflictResolutions = []`).
+ * `dependencies` are the Production Planner's (Engine, Production ID factory, Production Clock); `bounds` are the caller's. Throws a
+ * `RangeError` for invalid bounds or an input carrying conflict resolutions, and `BuildListOptimizationInvariantError` /
+ * `BuildListOptimizationMaterializationError` / a Planner error for a broken contract (never a result).
+ */
+export async function runBuildListOptimization(plannerInput: PlannerInput, dependencies: PlannerDependencies, bounds: BuildListOptimizationBounds,
+  execution: BuildListOptimizationExecution = {}): Promise<BuildListOptimizationRun> {
+  assertBuildListOptimizationBounds(bounds)
+  if (plannerInput.conflictResolutions.length > 0) {
+    throw new RangeError('The Build List global optimization reads no conflict resolution: its input carries conflictResolutions = [].')
+  }
+  const engine = dependencies.rngEngine
+  const tracker = createBuildListOptimizationStageTracker(execution)
+  const finish = (result: BuildListOptimizationResult): BuildListOptimizationRun => {
+    tracker.close()
+    return { kind: 'result', result }
+  }
+
+  // Stage 0: the planning Targets, every unsupported reason the Domain decides, the exclusions and the out-of-scope Targets.
+  tracker.enter('input_check')
+  const created = createBuildListOptimizationContext(plannerInput, dependencies)
+  if (created.kind === 'unsupported_input') {
+    return finish({ status: 'unsupported', reasons: [created.reason === 'invalid_planner_input'
+      ? { kind: 'invalid_planner_input', issues: created.validation.issues.map(({ path, code, message }) => ({ path, code, message })) }
+      : { kind: 'no_planning_target' }] })
+  }
+  const { context } = created
+  const unsupportedReasons = deriveBuildListOptimizationUnsupportedReasons(context, engine)
+  if (unsupportedReasons.length > 0) return finish({ status: 'unsupported', reasons: unsupportedReasons })
+  const inputExclusions = buildListOptimizationInputExclusionsOf(context.validation)
+  const outOfScopeTargetCounts = countBuildListOptimizationOutOfScopeTargets(plannerInput, context.planningTargetIds)
+  if (execution.shouldCancel?.()) {
+    tracker.close()
+    return { kind: 'cancelled' }
+  }
+
+  // Stage A - D'.
+  const outcome = await runBuildListOptimizationStages({ context, inputExclusions, entryChanges: 'replace_only' }, dependencies, bounds, execution, tracker)
+  if (outcome.kind === 'cancelled') return { kind: 'cancelled' }
+  if (outcome.kind === 'concluded') return { kind: 'result', result: outcome.result }
+  const { verdict } = outcome
+  return {
+    kind: 'result',
+    result: {
+      status: 'optimized',
+      artifact: {
+        plannerResult: verdict.plannerResult,
+        generatedBuildListEntries: verdict.finalInput.generatedBuildListEntries,
+        replacements: verdict.finalInput.replacements,
+        unchangedTargetWeaponIds: verdict.finalInput.unchangedTargetWeaponIds,
+        planningTargetWeaponIds: context.planningTargets.map(target => target.id),
+        inputExclusions,
+        inputToken: deriveBuildListOptimizationInputToken(plannerInput, verdict.plannerResult.plan!),
+        summary: { ...buildListOptimizationPlanSummaryOf(verdict, outcome.structuralObjective), outOfScopeTargetCounts },
+        diagnostics: tracker.diagnostics,
+      },
+    },
+  }
 }

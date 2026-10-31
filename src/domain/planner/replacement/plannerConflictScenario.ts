@@ -306,11 +306,7 @@ export function preparePlannerConflictScenario(
       scenarioConstraint,
       // Scenario-only: `createPlannerConflictWorks(fixedConstraints, ...)`
       // would turn every other explicit resolution into a scenario subject.
-      works: createPlannerConflictWorks(
-        [scenarioConstraint],
-        conflictContexts,
-        context.checkpointRequirements,
-      ),
+      works: createPlannerConflictWorks([scenarioConstraint], conflictContexts),
     },
   }
 }

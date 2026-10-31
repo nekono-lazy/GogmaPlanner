@@ -21,6 +21,7 @@ import {
 } from './expectedStepConfirmation'
 import {
   assertExecutableProductionPlan,
+  assertProductionPlanCompletionAssignmentSafe,
   assertPlanDependenciesUnchanged,
   collectPlanObservationBindings,
   createActualExecutionState,
@@ -30,12 +31,11 @@ import {
   type ExecutionPersistedState,
 } from './planExecutionState'
 import {
-  assertExecutionHistoryValid,
+  createExecutionRecord,
   assertStepResultValid,
   changedEntity,
   changedNormalCounters,
   collectEntityChanges,
-  createExecutionUndoSnapshot,
   createMutableExecutionState,
   stepsWithCompleted,
   type ExecutionCounterAuthority,
@@ -465,6 +465,9 @@ export function prepareOperationCountRecovery(input: OperationCountRecoveryInput
     notApplicable(`ProductionPlan '${plan.id}' has another recalculation reason, so it cannot become active again.`)
   }
   assertExecutableProductionPlan(plan, input.currentCalculationContext)
+  // Following the position advances the Plan, so an unsafe Plan is refused
+  // first (Issue #334, `docs/PLANNER_SPEC.md` 21.4.1).
+  assertProductionPlanCompletionAssignmentSafe(plan, state.targetWeapons)
   const history = orderedPlanHistory(plan, state.planExecutionHistory)
   const latest = history.at(-1)
   if (
@@ -573,18 +576,24 @@ export function prepareOperationCountRecovery(input: OperationCountRecoveryInput
   const changes = collectEntityChanges(state, mutable)
   assertStepResultValid(changes, nextPlan)
 
-  const record: ExecutionHistory = {
-    id: input.executionHistoryId,
-    planId: plan.id,
-    planStepId: match.position > 0 ? window.steps[match.position - 1].id : current.id,
-    action: 'operation_count_recovered',
-    actualResult: toActualResult(lastObservation),
-    wasExpected: true,
-    recalculationReason: null,
-    undoSnapshot: createExecutionUndoSnapshot(plan, state, changes),
-    createdAt: now,
-  }
-  assertExecutionHistoryValid(record)
+  const deletesExecutionSavePoint = nextPlan.status === 'completed' && state.executionSavePoint !== null
+  const record = createExecutionRecord({
+    metadata: {
+      id: input.executionHistoryId,
+      planId: plan.id,
+      planStepId: match.position > 0 ? window.steps[match.position - 1].id : current.id,
+      action: 'operation_count_recovered',
+      actualResult: toActualResult(lastObservation),
+      wasExpected: true,
+      recalculationReason: null,
+      createdAt: now,
+    },
+    planBefore: plan,
+    planAfter: nextPlan,
+    state,
+    changes,
+    deletesExecutionSavePoint,
+  })
 
   return {
     rngState: changedEntity(state.rngState, rngState) ? rngState : null,
@@ -592,7 +601,8 @@ export function prepareOperationCountRecovery(input: OperationCountRecoveryInput
     ownedWeapons: changes.changedWeapons,
     targetWeapons: changes.changedTargets,
     plan: nextPlan,
-    history: record,
-    deletesExecutionSavePoint: nextPlan.status === 'completed' && state.executionSavePoint !== null,
+    history: record.history,
+    undoSnapshot: record.undoSnapshot,
+    deletesExecutionSavePoint,
   }
 }

@@ -12,23 +12,27 @@ import type {
   ProductionPlan,
   RecalculationReason,
   RestorationBonusSet,
+  ProductionPlanUndoState,
   RngState,
   TargetWeapon,
   TargetWeaponId,
 } from '../models/publicTypes'
 import {
+  deriveProductionPlanUndoState,
+  ProductionPlanUndoStateError,
   stableStringify,
   V1_NORMAL_ARTIAN_RARITY,
-  validateExecutionHistory,
+  validateExecutionRecord,
   validateOwnedWeapon,
   validateProductionPlan,
   validateTargetWeapon,
 } from '../models/publicTypes'
 import type { RngEngine } from '../rng/rngEngine'
-import { validateTargetPreferredOwnedWeapons } from '../target/preferredOwnedWeapon'
+import { validateTargetOwnedWeaponCollections } from '../target/preferredOwnedWeapon'
 import { executionFailure } from './executionRuntimeError'
 import {
   assertExecutableProductionPlan,
+  assertProductionPlanCompletionAssignmentSafe,
   assertPlanDependenciesUnchanged,
   collectPlanObservationBindings,
   createActualExecutionState,
@@ -67,7 +71,9 @@ export interface ExecutionStepWrite {
   targetWeapons: TargetWeapon[]
   plan: ProductionPlan
   history: ExecutionHistory
-  /** Whether the Plan's game save point is deleted (the Plan completed). */
+  /** The record's Undo body, added in the same transaction as `history`. */
+  undoSnapshot: ExecutionUndoSnapshot
+  /** Whether the Plan's game save point is deleted (the Plan completed or was finished). */
   deletesExecutionSavePoint: boolean
 }
 
@@ -105,13 +111,23 @@ export function inconsistent(message: string): never {
  * executable current Plan, the requested Step being its current incomplete
  * Step, unchanged Plan-dependent Targets and Entries, and the persisted state
  * equal to that Step's `expectedStateBefore`.
+ *
+ * `advancesPlan` (default `true`) adds the completion assignment premise
+ * (Issue #334, 21.4.1) right after the execution contract: every Step
+ * confirmation advances the Plan. The game save point record shares these
+ * premises without advancing anything, so it passes `false` and stays usable
+ * for an unsafe Plan.
  */
-export function requireExecutableCurrentStep(input: CurrentStepExecutionInput): ExecutableCurrentStep {
+export function requireExecutableCurrentStep(
+  input: CurrentStepExecutionInput,
+  options: { advancesPlan: boolean } = { advancesPlan: true },
+): ExecutableCurrentStep {
   const { plan, state } = input
   if (plan.status !== 'active') {
     executionFailure('plan_not_active', `ProductionPlan '${plan.id}' is '${plan.status}'; only an active Plan accepts Step confirmation.`)
   }
   assertExecutableProductionPlan(plan, input.currentCalculationContext)
+  if (options.advancesPlan) assertProductionPlanCompletionAssignmentSafe(plan, state.targetWeapons)
   const step = requireCurrentPlanStep(plan, input.planStepId)
   assertPlanDependenciesUnchanged(plan, state.targetWeapons, state.buildListEntries)
   const bindings = collectPlanObservationBindings(plan, state.planExecutionHistory)
@@ -453,44 +469,92 @@ export function assertStepResultValid(changes: ExecutionEntityChanges, plan: Pro
   if (!planValidation.isValid) {
     executionFailure('entity_validation_failed', `ProductionPlan '${plan.id}' fails Domain validation after the Step.`, planValidation.issues)
   }
-  const preferences = validateTargetPreferredOwnedWeapons(changes.nextTargets, changes.nextWeapons)
+  const preferences = validateTargetOwnedWeaponCollections(changes.nextTargets, changes.nextWeapons)
   if (!preferences.isValid) {
-    executionFailure('collection_validation_failed', 'The Target preferred owned weapon collection is invalid after the Step.', preferences.issues)
+    executionFailure('collection_validation_failed', 'The Target preferred owned weapon or completion assignment collection is invalid after the Step.', preferences.issues)
   }
 }
 
+/** The metadata of a record before its added OwnedWeapons are derived from the Step's changes. */
+export type ExecutionRecordMetadata = Omit<ExecutionHistory, 'addedOwnedWeaponIds'>
+
+export interface ExecutionRecordInput {
+  metadata: ExecutionRecordMetadata
+  /** The Plan just before the record, exactly as the transaction read it. */
+  planBefore: ProductionPlan
+  /** The Plan the record leaves. */
+  planAfter: ProductionPlan
+  /** The untouched persisted state the transaction read. */
+  state: ExecutionPersistedState
+  changes: Pick<ExecutionEntityChanges, 'changedWeapons' | 'changedTargets'>
+  /** Whether the record's transaction deletes the Plan's game save point with its terminal transition. */
+  deletesExecutionSavePoint: boolean
+}
+
+/** One ExecutionHistory record: its metadata and its Undo body, added together. */
+export interface ExecutionRecord {
+  history: ExecutionHistory
+  undoSnapshot: ExecutionUndoSnapshot
+}
+
 /**
- * The Undo snapshot of one Step (`docs/DATA_MODEL.md` 12), taken from the
- * untouched persisted state: the whole RngState, every Normal Counter, the
- * Plan and its save point before the Step, and exactly the OwnedWeapons and
- * TargetWeapons the Step changed, split into updated and added weapons.
+ * The record of one Execution transaction (`docs/DATA_MODEL.md` 12.2,
+ * `docs/PLANNER_SPEC.md` 19.4), taken from the untouched persisted state: the
+ * metadata with the OwnedWeapons the Step added, and the Undo body with the
+ * whole RngState, every Normal Counter, exactly the OwnedWeapons and
+ * TargetWeapons the Step changed (split into updated and added weapons), and
+ * the Plan just before the record as its execution fields, the before values of
+ * the Steps whose completion changed and the two hashes
+ * (`deriveProductionPlanUndoState()`). The Undo body never holds the Plan body;
+ * only the game save point the record's own terminal transition deletes is kept
+ * as `deletedExecutionSavePoint`.
+ *
+ * An Execution transition rewrites the Plan's execution fields only, so a Plan
+ * after the record whose content differs from the Plan before it is refused
+ * (`execution_effect_inconsistent`), and a record failing the 12.2 validation is
+ * refused too (`entity_validation_failed`): nothing is written either way.
  */
-export function createExecutionUndoSnapshot(
-  plan: ProductionPlan,
-  state: ExecutionPersistedState,
-  changes: Pick<ExecutionEntityChanges, 'changedWeapons' | 'changedTargets'>,
-): ExecutionUndoSnapshot {
+export function createExecutionRecord(input: ExecutionRecordInput): ExecutionRecord {
+  const { metadata, planBefore, planAfter, state, changes } = input
+  if (input.deletesExecutionSavePoint && planAfter.status !== 'completed' && planAfter.status !== 'abandoned') {
+    inconsistent(`ExecutionHistory '${metadata.id}' deletes the game save point without ending ProductionPlan '${planAfter.id}'.`)
+  }
+  let productionPlanStateBefore: ProductionPlanUndoState
+  try {
+    productionPlanStateBefore = deriveProductionPlanUndoState(planBefore, planAfter)
+  } catch (error: unknown) {
+    if (error instanceof ProductionPlanUndoStateError) {
+      executionFailure(
+        error.code === 'plan_content_changed' ? 'execution_effect_inconsistent' : 'entity_validation_failed',
+        `The Undo state of ExecutionHistory '${metadata.id}' cannot be derived: ${error.message}`,
+        error.issues,
+      )
+    }
+    throw error
+  }
   const weaponsBefore = new Map(state.ownedWeapons.map((weapon) => [weapon.id, weapon]))
   const targetsBefore = new Map(state.targetWeapons.map((target) => [target.id, target]))
-  return {
+  const history: ExecutionHistory = {
+    ...metadata,
+    addedOwnedWeaponIds: changes.changedWeapons.filter(({ id }) => !weaponsBefore.has(id)).map(({ id }) => id),
+  }
+  const undoSnapshot: ExecutionUndoSnapshot = {
+    executionHistoryId: metadata.id,
     rngStateBefore: structuredClone(state.rngState),
     normalCountersBefore: structuredClone([...state.normalCounters]),
     affectedOwnedWeaponsBefore: changes.changedWeapons
       .filter(({ id }) => weaponsBefore.has(id))
       .map(({ id }) => structuredClone(weaponsBefore.get(id) as OwnedWeapon)),
-    addedOwnedWeaponIds: changes.changedWeapons.filter(({ id }) => !weaponsBefore.has(id)).map(({ id }) => id),
     removedOwnedWeaponsBefore: [],
     affectedTargetWeaponsBefore: changes.changedTargets.map(({ id }) => structuredClone(targetsBefore.get(id) as TargetWeapon)),
-    productionPlanBefore: structuredClone(plan),
-    executionSavePointBefore: structuredClone(state.executionSavePoint),
+    productionPlanStateBefore,
+    deletedExecutionSavePoint: input.deletesExecutionSavePoint ? structuredClone(state.executionSavePoint) : null,
   }
-}
-
-export function assertExecutionHistoryValid(history: ExecutionHistory): void {
-  const validation = validateExecutionHistory(history)
+  const validation = validateExecutionRecord(history, undoSnapshot)
   if (!validation.isValid) {
     executionFailure('entity_validation_failed', 'The ExecutionHistory of the Step fails Domain validation.', validation.issues)
   }
+  return { history, undoSnapshot }
 }
 
 /** The Counter records whose persisted contents the Step changed. */

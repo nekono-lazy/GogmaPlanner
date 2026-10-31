@@ -4,6 +4,7 @@ import type {
   ExecutionHistory,
   ExecutionHistoryId,
   ExecutionSavePoint,
+  ExecutionUndoSnapshot,
   NormalArtianCounter,
   OwnedWeapon,
   OwnedWeaponId,
@@ -13,9 +14,10 @@ import type {
 } from '../models/publicTypes'
 import {
   compareExecutionHistoryOrder,
-  currentExecutionActions,
+  deriveExecutionUndoEligibility,
   isExecutionContractProductionPlan,
-  validateExecutionHistory,
+  overlayProductionPlanUndoState,
+  validateExecutionRecord,
   validateExecutionSavePoint,
   validateExecutionSavePointReferences,
   validateNormalArtianCounter,
@@ -24,8 +26,9 @@ import {
   validateRngState,
   validateTargetWeapon,
 } from '../models/publicTypes'
-import { validateTargetPreferredOwnedWeapons } from '../target/preferredOwnedWeapon'
+import { validateTargetOwnedWeaponCollections } from '../target/preferredOwnedWeapon'
 import { executionFailure } from './executionRuntimeError'
+import { reconstructExecutionUndoPlan } from './executionUndoReconstruction'
 import type { ExecutionPersistedState } from './planExecutionState'
 
 export interface ExecutionUndoInput {
@@ -36,7 +39,13 @@ export interface ExecutionUndoInput {
   state: Pick<
     ExecutionPersistedState,
     'normalCounters' | 'ownedWeapons' | 'targetWeapons' | 'planExecutionHistory' | 'executionSavePoint'
-  >
+  > & {
+    /**
+     * The Undo body stored for `executionHistoryId` - the one body an Undo reads
+     * (`docs/DATA_MODEL.md` 14.6) - or `null` when none is stored.
+     */
+    undoSnapshot: ExecutionUndoSnapshot | null
+  }
 }
 
 /** What happens to the Plan's game save point on Undo (`docs/PLANNER_SPEC.md` 16.9 / 16.16). */
@@ -47,8 +56,8 @@ export type ExecutionUndoSavePointWrite =
 
 /**
  * Everything one Undo transaction writes, decided and validated before a single
- * write happens (`docs/DATA_MODEL.md` 12 / 14.4). Every value is the exact
- * snapshot body; nothing is recomputed, re-predicted or re-timestamped.
+ * write happens (`docs/DATA_MODEL.md` 12.2 / 14.4). Every value is the exact
+ * body before the record; nothing is recomputed, re-predicted or re-timestamped.
  */
 export interface ExecutionUndoWrite {
   rngState: RngState
@@ -60,9 +69,13 @@ export interface ExecutionUndoWrite {
   restoredOwnedWeapons: OwnedWeapon[]
   /** The TargetWeapons the undone Step changed, as they were before it. */
   restoredTargetWeapons: TargetWeapon[]
+  /** The Plan just before the record, rebuilt and verified (`docs/PLANNER_SPEC.md` 19.5). */
   plan: ProductionPlan
   executionSavePoint: ExecutionUndoSavePointWrite
-  /** The undone ExecutionHistory; no Undo record is added in its place. */
+  /**
+   * The undone ExecutionHistory: its metadata and its Undo body are both
+   * deleted, and no Undo record is added in their place.
+   */
   deletedExecutionHistoryId: ExecutionHistoryId
 }
 
@@ -102,16 +115,15 @@ function requireLatestHistory(input: ExecutionUndoInput): { history: ExecutionHi
 
 /**
  * Every current Execution record starts from the `active` Plan whose current
- * Step is the recorded Step, so a snapshot Plan that is not exactly that cannot
- * be the state before this record.
+ * Step is the recorded Step, so a Plan before the record that is not exactly
+ * that cannot be the state before this record.
  *
  * `operation_count_recovered` starts from the `stale` Plan an
  * `operation_uncertain` record left (16.15): its current Step is incomplete and
  * the recorded Step - the last Step the recovery reached, or the current Step
  * itself for a position 0 recovery - is incomplete at or after it.
  */
-function assertSnapshotPlanIsStepStart(history: ExecutionHistory): void {
-  const before = history.undoSnapshot.productionPlanBefore
+function assertPlanBeforeIsStepStart(history: ExecutionHistory, before: ProductionPlan): void {
   if (history.action === 'operation_count_recovered') {
     const currentIndex = before.steps.findIndex(({ id }) => id === before.currentStepId)
     const recordedIndex = before.steps.findIndex(({ id }) => id === history.planStepId)
@@ -124,126 +136,42 @@ function assertSnapshotPlanIsStepStart(history: ExecutionHistory): void {
       before.steps[recordedIndex].isCompleted
     ) {
       snapshotInvalid(
-        `The snapshot Plan of ExecutionHistory '${history.id}' is not the stale Plan an uncertain operation left before PlanStep '${history.planStepId}'.`,
+        `The Plan before ExecutionHistory '${history.id}' is not the stale Plan an uncertain operation left before PlanStep '${history.planStepId}'.`,
       )
     }
     return
   }
   if (before.status !== 'active' || before.currentStepId !== history.planStepId) {
     snapshotInvalid(
-      `The snapshot Plan of ExecutionHistory '${history.id}' is not the active Plan at PlanStep '${history.planStepId}'.`,
+      `The Plan before ExecutionHistory '${history.id}' is not the active Plan at PlanStep '${history.planStepId}'.`,
     )
   }
   const step = before.steps.find(({ id }) => id === history.planStepId)
   if (!step || step.isCompleted) {
-    snapshotInvalid(`The snapshot Plan of ExecutionHistory '${history.id}' has no incomplete PlanStep '${history.planStepId}'.`)
+    snapshotInvalid(`The Plan before ExecutionHistory '${history.id}' has no incomplete PlanStep '${history.planStepId}'.`)
   }
 }
 
 /**
- * Whether the latest ExecutionHistory itself moved the Plan from `active` to
- * `completed`: the last incomplete Step of the snapshot Plan was confirmed as
- * expected, at the moment the Plan and that Step record as their completion.
+ * Undo eligibility through the one authority, `deriveExecutionUndoEligibility()`,
+ * shared by the Undo runtime, the Navigator's display (`inspectExecutionUndo()`)
+ * and the conversion of an existing record. `before` is the Plan just before
+ * the record.
  */
-function causedCompletion(plan: ProductionPlan, history: ExecutionHistory): boolean {
-  const before = history.undoSnapshot.productionPlanBefore
-  const step = plan.steps.find(({ id }) => id === history.planStepId)
-  return (
-    history.action === 'confirmed_expected' &&
-    plan.status === 'completed' &&
-    plan.currentStepId === null &&
-    plan.completedAt === history.createdAt &&
-    step !== undefined &&
-    step.isCompleted &&
-    step.completedAt === history.createdAt &&
-    before.steps.filter(({ isCompleted }) => !isCompleted).map(({ id }) => id).join('\n') === history.planStepId
-  )
-}
-
-/**
- * Whether the latest `operation_count_recovered` itself completed the Plan
- * (16.15): every Step incomplete in the snapshot Plan was completed by it.
- */
-function causedRecoveryCompletion(plan: ProductionPlan, history: ExecutionHistory): boolean {
-  const before = history.undoSnapshot.productionPlanBefore
-  const replayed = before.steps.filter(({ isCompleted }) => !isCompleted).map(({ id }) => id)
-  return (
-    history.action === 'operation_count_recovered' &&
-    plan.status === 'completed' &&
-    plan.currentStepId === null &&
-    plan.completedAt === history.createdAt &&
-    replayed.length > 0 &&
-    replayed.at(-1) === history.planStepId &&
-    replayed.every((id) => {
-      const step = plan.steps.find((candidate) => candidate.id === id)
-      return step !== undefined && step.isCompleted && step.completedAt === history.createdAt
-    })
-  )
-}
-
-/** Whether the latest ExecutionHistory itself finished the Plan as a compromise (16.12). */
-function causedCompromiseFinish(plan: ProductionPlan, history: ExecutionHistory): boolean {
-  return (
-    history.action === 'finished_as_compromise' &&
-    plan.status === 'abandoned' &&
-    plan.abandonmentReason === 'finished_as_compromise' &&
-    plan.abandonedAt === history.createdAt
-  )
-}
-
-/**
- * Undo eligibility (`docs/PLANNER_SPEC.md` 16.16): an `active` or `stale` Plan,
- * or a `completed` / `abandoned` Plan whose terminal transition this very
- * ExecutionHistory caused. `terminal` tells whether the Undo reverses a
- * terminal transition. The one eligibility authority of both the Undo runtime
- * and the Navigator's display (`inspectExecutionUndo()`).
- */
-type ExecutionUndoEligibility =
-  | { allowed: true; terminal: boolean }
-  | { allowed: false; message: string }
-
-function deriveExecutionUndoEligibility(plan: ProductionPlan, history: ExecutionHistory): ExecutionUndoEligibility {
-  const action: string = history.action
-  if (!(currentExecutionActions as readonly string[]).includes(action)) {
-    return { allowed: false, message: `ExecutionHistory '${history.id}' is a legacy '${action}' record and is never undone as a current Execution.` }
-  }
-  switch (plan.status) {
-    case 'active':
-    case 'stale':
-      if (history.action === 'finished_as_compromise') {
-        return { allowed: false, message: `ExecutionHistory '${history.id}' finished a Plan that is now '${plan.status}'.` }
-      }
-      return { allowed: true, terminal: false }
-    case 'completed':
-      if (!causedCompletion(plan, history) && !causedRecoveryCompletion(plan, history)) {
-        return { allowed: false, message: `ExecutionHistory '${history.id}' did not complete ProductionPlan '${plan.id}'.` }
-      }
-      return { allowed: true, terminal: true }
-    case 'abandoned':
-      if (!causedCompromiseFinish(plan, history)) {
-        return {
-          allowed: false,
-          message: `ProductionPlan '${plan.id}' was abandoned by '${plan.abandonmentReason}', not by ExecutionHistory '${history.id}'.`,
-        }
-      }
-      return { allowed: true, terminal: true }
-    case 'draft':
-      return { allowed: false, message: `ProductionPlan '${plan.id}' has not started.` }
-  }
-}
-
-function assertUndoAllowed(plan: ProductionPlan, history: ExecutionHistory): { terminal: boolean } {
-  const eligibility = deriveExecutionUndoEligibility(plan, history)
+function assertUndoAllowed(plan: ProductionPlan, history: ExecutionHistory, before: ProductionPlan): { terminal: boolean } {
+  const eligibility = deriveExecutionUndoEligibility(plan, history, before)
   if (!eligibility.allowed) executionFailure('undo_not_allowed', eligibility.message)
   return { terminal: eligibility.terminal }
 }
 
 /**
  * Whether the Navigator offers Undo of the Plan's latest ExecutionHistory
- * (`docs/PLANNER_SPEC.md` 16.16, `docs/UI_FLOW.md` 12.7). Read-only and display
- * only: it applies the same Plan / snapshot contract checks and the same
- * eligibility as `prepareExecutionUndo()`, which stays the write authority and
- * re-derives everything inside its transaction (the latest record, the snapshot
+ * (`docs/PLANNER_SPEC.md` 16.16 / 19.5, `docs/UI_FLOW.md` 12.7). Read-only and
+ * display only: it lays the latest record's Undo state over the current Plan
+ * without the hash check (`overlayProductionPlanUndoState()`) and applies the
+ * same Plan contract checks and the same eligibility as
+ * `prepareExecutionUndo()`, which stays the write authority and re-derives
+ * everything inside its transaction (the latest record, the hashes, the body
  * validation and the resulting state included).
  */
 export type ExecutionUndoAvailability =
@@ -261,15 +189,18 @@ export type ExecutionUndoAvailability =
 export function inspectExecutionUndo(
   plan: ProductionPlan,
   latestExecutionHistory: ExecutionHistory | null,
+  latestUndoSnapshot: ExecutionUndoSnapshot | null,
   executionSavePoint: Pick<ExecutionSavePoint, 'lastExecutionHistoryId'> | null,
 ): ExecutionUndoAvailability {
   const history = latestExecutionHistory
   if (history === null || history.planId !== plan.id) return { kind: 'unavailable' }
-  if (history.undoSnapshot.productionPlanBefore.id !== plan.id) return { kind: 'unavailable' }
-  if (!isExecutionContractProductionPlan(plan) || !isExecutionContractProductionPlan(history.undoSnapshot.productionPlanBefore)) {
+  if (latestUndoSnapshot === null || latestUndoSnapshot.executionHistoryId !== history.id) return { kind: 'unavailable' }
+  const before = overlayProductionPlanUndoState(plan, latestUndoSnapshot.productionPlanStateBefore)
+  if (before === null) return { kind: 'unavailable' }
+  if (!isExecutionContractProductionPlan(plan) || !isExecutionContractProductionPlan(before)) {
     return { kind: 'unavailable' }
   }
-  const eligibility = deriveExecutionUndoEligibility(plan, history)
+  const eligibility = deriveExecutionUndoEligibility(plan, history, before)
   if (!eligibility.allowed) return { kind: 'unavailable' }
   return {
     kind: 'available',
@@ -280,70 +211,81 @@ export function inspectExecutionUndo(
 }
 
 /**
- * The save point after Undo (`docs/PLANNER_SPEC.md` 16.9 / 16.16):
+ * The save point after Undo (`docs/PLANNER_SPEC.md` 16.9 / 16.16 / 19.5):
  * - the undone record is the save point's boundary: delete it, and never bring
- *   back an older save point from the snapshot in its place
+ *   back an older save point in its place
  * - the undone record's terminal transition deleted the save point: restore the
- *   snapshot body
+ *   `deletedExecutionSavePoint` body
  * - otherwise the save point (or its absence) is left as it is
  */
 function decideSavePoint(
   history: ExecutionHistory,
+  snapshot: ExecutionUndoSnapshot,
   current: ExecutionSavePoint | null,
   terminal: boolean,
 ): ExecutionUndoSavePointWrite {
   if (current !== null && current.lastExecutionHistoryId === history.id) return { kind: 'delete' }
-  const before = history.undoSnapshot.executionSavePointBefore
-  if (terminal && current === null && before !== null) {
-    return { kind: 'restore', savePoint: structuredClone(before) }
+  const deleted = snapshot.deletedExecutionSavePoint
+  if (terminal && current === null && deleted !== null) {
+    return { kind: 'restore', savePoint: structuredClone(deleted) }
   }
   return { kind: 'keep' }
 }
 
 /**
- * Decides one Execution Undo (`docs/PLANNER_SPEC.md` 16.16, `docs/DATA_MODEL.md`
- * 12) purely from the persisted state and the latest ExecutionHistory's
- * `ExecutionUndoSnapshot`.
+ * Decides one Execution Undo (`docs/PLANNER_SPEC.md` 16.16 / 19.5,
+ * `docs/DATA_MODEL.md` 12.2) purely from the persisted state, the latest
+ * ExecutionHistory and its Undo body:
  *
- * The snapshot is the only authority: the RngState, the whole NormalArtianCounter
- * collection, the updated and removed OwnedWeapons, the changed TargetWeapons and
- * the Plan are restored to their exact snapshot bodies (timestamps included),
- * the added OwnedWeapons are deleted, and the undone ExecutionHistory is
- * deleted. No RNG prediction is re-run, no before value is derived from the
- * current state, and the restored Plan's status and recalculation reasons are
- * used as stored. The in-game operation itself is not reversed.
+ * 1. the requested record is the Plan's latest (`compareExecutionHistoryOrder()`)
+ * 2. its Undo body exists and belongs to it, and both pass the 12.2 validation
+ * 3. the Plan just before the record is rebuilt from the current Plan and the
+ *    body's Plan undo state, its content hash and execution state hash verified
+ *    (`reconstructExecutionUndoPlan()`)
+ * 4. the rebuilt Plan is the `productionPlanBefore` of the 16.16 contract, the
+ *    eligibility, the Step start, the restored values and the write
+ *
+ * Any mismatch of 2 or 3 refuses with `undo_snapshot_invalid` before anything is
+ * written. The body is the only authority: the RngState, the whole
+ * NormalArtianCounter collection, the updated and removed OwnedWeapons and the
+ * changed TargetWeapons are restored to their exact bodies (timestamps
+ * included), the added OwnedWeapons are deleted, and the undone record's
+ * metadata and body are deleted. No RNG prediction is re-run, no Counter is
+ * derived backwards, no Plan transition is replayed, and the rebuilt Plan's
+ * status and recalculation reasons are used as stored. The in-game operation
+ * itself is not reversed.
  */
 export function prepareExecutionUndo(input: ExecutionUndoInput): ExecutionUndoWrite {
   const { plan, state } = input
   const { history, remaining } = requireLatestHistory(input)
 
-  const historyValidation = validateExecutionHistory(history)
-  if (!historyValidation.isValid) {
-    snapshotInvalid(`ExecutionHistory '${history.id}' fails Domain validation, so its Step cannot be restored exactly.`, historyValidation.issues)
+  const snapshot = state.undoSnapshot
+  if (snapshot === null || snapshot.executionHistoryId !== history.id) {
+    snapshotInvalid(`ExecutionHistory '${history.id}' has no Undo body of its own, so its Step cannot be restored exactly.`)
   }
-  const snapshot = history.undoSnapshot
-  if (snapshot.productionPlanBefore.id !== plan.id) {
-    snapshotInvalid(`The snapshot Plan of ExecutionHistory '${history.id}' is not ProductionPlan '${plan.id}'.`)
+  const recordValidation = validateExecutionRecord(history, snapshot)
+  if (!recordValidation.isValid) {
+    snapshotInvalid(`ExecutionHistory '${history.id}' fails Domain validation, so its Step cannot be restored exactly.`, recordValidation.issues)
   }
-  if (!isExecutionContractProductionPlan(plan) || !isExecutionContractProductionPlan(snapshot.productionPlanBefore)) {
+  const planBefore = reconstructExecutionUndoPlan(plan, snapshot.productionPlanStateBefore)
+  if (!isExecutionContractProductionPlan(plan) || !isExecutionContractProductionPlan(planBefore)) {
     executionFailure('plan_not_executable', `ProductionPlan '${plan.id}' predates the Execution Plan contract and is never undone as a current Execution.`)
   }
-  const { terminal } = assertUndoAllowed(plan, history)
-  assertSnapshotPlanIsStepStart(history)
+  const { terminal } = assertUndoAllowed(plan, history, planBefore)
+  assertPlanBeforeIsStepStart(history, planBefore)
   if (hasDuplicateIds(snapshot.normalCountersBefore)) {
     snapshotInvalid(`The Normal Counter snapshot of ExecutionHistory '${history.id}' holds a duplicate Counter ID.`)
   }
 
   const rngState = structuredClone(snapshot.rngStateBefore)
   const normalCounters = structuredClone(snapshot.normalCountersBefore)
-  const deletedOwnedWeaponIds = [...snapshot.addedOwnedWeaponIds]
+  const deletedOwnedWeaponIds = [...history.addedOwnedWeaponIds]
   const restoredOwnedWeapons = structuredClone([
     ...snapshot.affectedOwnedWeaponsBefore,
     ...snapshot.removedOwnedWeaponsBefore,
   ])
   const restoredTargetWeapons = structuredClone(snapshot.affectedTargetWeaponsBefore)
-  const restoredPlan = structuredClone(snapshot.productionPlanBefore)
-  const savePoint = decideSavePoint(history, state.executionSavePoint, terminal)
+  const savePoint = decideSavePoint(history, snapshot, state.executionSavePoint, terminal)
 
   // The resulting collections, as they will be persisted.
   const weapons = new Map(state.ownedWeapons.map((weapon) => [weapon.id, weapon]))
@@ -359,10 +301,10 @@ export function prepareExecutionUndo(input: ExecutionUndoInput): ExecutionUndoWr
     assertResultValid(`OwnedWeapon '${weapon.id}'`, validateOwnedWeapon(weapon)))
   restoredTargetWeapons.forEach((target) =>
     assertResultValid(`TargetWeapon '${target.id}'`, validateTargetWeapon(target)))
-  assertResultValid(`ProductionPlan '${restoredPlan.id}'`, validateProductionPlan(restoredPlan))
+  assertResultValid(`ProductionPlan '${planBefore.id}'`, validateProductionPlan(planBefore))
   assertResultValid(
-    'The Target preferred owned weapon collection',
-    validateTargetPreferredOwnedWeapons([...targets.values()], [...weapons.values()]),
+    'The Target preferred owned weapon and completion assignment collections',
+    validateTargetOwnedWeaponCollections([...targets.values()], [...weapons.values()]),
   )
   const remainingSavePoint = savePoint.kind === 'restore'
     ? savePoint.savePoint
@@ -371,7 +313,7 @@ export function prepareExecutionUndo(input: ExecutionUndoInput): ExecutionUndoWr
     assertResultValid('ExecutionSavePoint', validateExecutionSavePoint(remainingSavePoint))
     assertResultValid(
       'ExecutionSavePoint references',
-      validateExecutionSavePointReferences([remainingSavePoint], [restoredPlan], remaining),
+      validateExecutionSavePointReferences([remainingSavePoint], [planBefore], remaining),
     )
   }
 
@@ -381,7 +323,7 @@ export function prepareExecutionUndo(input: ExecutionUndoInput): ExecutionUndoWr
     deletedOwnedWeaponIds,
     restoredOwnedWeapons,
     restoredTargetWeapons,
-    plan: restoredPlan,
+    plan: planBefore,
     executionSavePoint: savePoint,
     deletedExecutionHistoryId: history.id,
   }

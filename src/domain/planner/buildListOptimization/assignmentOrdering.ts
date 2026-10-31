@@ -29,7 +29,8 @@
  * (exact: every option of a used source violates C1). No option is dropped or reordered for cost.
  *
  * The MRV count walks Phase A's per-source generator and stops at the lookahead `k`; it reads no lower
- * bound (design 6.4, review R1).
+ * bound (design 6.4, review R1). The generator ends a Bonus-empty source at its first Skill requirement
+ * (Issue #351), so an option-free source costs the count O(1) Skill requirements, not all of them.
  *
  * Phase C-2 adds the coverage-driven value ordering (design 6.3) as a separate, opt-in enumerator
  * (`createPrioritizedOptionEnumerator()`): the base frontier above is reused unchanged and a priority
@@ -39,8 +40,8 @@
 import { findResourceViolation, streamEndDelta } from './assignmentFeasibility'
 import type { PartialResourceAssignment, ResourceViolationKind } from './assignmentTypes'
 import {
-  createReachOption, createResetThenKeepIndex, enumerateReachOptionsOfSource, keepFromSourcePositions, laneAdmitsNone, laneAdmitsOperations, reachOptionKey,
-  skillRequirementBlocks, sourceLaneAdmission, sourceResourceKey,
+  createReachOption, createResetThenKeepIndex, createResetThenKeepPlanMemo, enumerateReachOptionsOfSource, keepFromSourcePositions, laneAdmitsNone, laneAdmitsOperations,
+  reachOptionKey, skillRequirementBlocks, sourceLaneAdmission, sourceResourceKey,
 } from './reachOptions'
 import type { BonusRequirement, ReachOption, ReachTable, SkillRequirement, SourceCandidate, TargetReach } from './buildListOptimizationTypes'
 
@@ -375,16 +376,19 @@ export interface FeasibleOptionCount {
  * `countUpTo(k)` of design 6.4: the resource-feasible options of `target` under `partial`, counted in
  * Phase A's order until `limit` is reached. A used source is skipped whole; no lower bound is read.
  * `onOptionWalked` is called once per option examined (feasible or not), so a long walk can poll the
- * cancel seam; it never changes the count.
+ * cancel seam; it never changes the count. A Bonus-empty source ends at its first Skill requirement and
+ * one `reset_then_keep` plan serves the whole count (Issue #351); neither yields, examines or rejects an
+ * option differently, so the count, the rejections and the polls are unchanged.
  */
 export function countFeasibleOptionsUpTo(target: TargetReach, table: ReachTable, partial: PartialResourceAssignment, limit: number,
   onOptionWalked?: () => void): FeasibleOptionCount {
   if (!Number.isSafeInteger(limit) || limit < 1) throw new RangeError(`countFeasibleOptionsUpTo limit must be a positive integer (got ${String(limit)}).`)
   const rejections: Record<ResourceViolationKind, number> = { source: 0, skill_position: 0, gogma_position: 0, normal_position: 0 }
   let count = 0
+  const resetThenKeepPlanOf = createResetThenKeepPlanMemo(target)
   for (const source of target.sources) {
     if (partial.usedSources.has(sourceResourceKey(source))) { rejections.source += 1; continue }
-    for (const option of enumerateReachOptionsOfSource(target, table, source)) {
+    for (const option of enumerateReachOptionsOfSource(target, table, source, resetThenKeepPlanOf)) {
       onOptionWalked?.()
       const violation = findResourceViolation(option, partial)
       if (violation !== null) { rejections[violation] += 1; continue }

@@ -138,7 +138,7 @@ export function conversionSkillContinuationShapeOf(option: ReachOption, table: P
 /**
  * The owned-Gogma current-Ideal lane continuation of one option, or null. The source's current Skills / Bonuses (its Route base's
  * lane start) are Ideal for the Target - the ReachTable's `currentSkillIdeal` / `currentBonusIdeal`, judged by the same
- * `evaluateSkillCondition()` / `satisfiesIdealBonuses()` the Search's lane-start check reads - and the option still operates that
+ * `evaluateSkillCondition()` / `satisfiesCompletionBonuses()` the Search's lane-start check reads - and the option still operates that
  * lane (`reset_skills`; `reset`, `keep_from_source` or `reset_then_keep`). Decided from the option and its row alone.
  */
 export function ownedGogmaContinuationShapeOf(option: ReachOption, table: Pick<ReachTable, 'targets'>): OwnedGogmaContinuationShape | null {

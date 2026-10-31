@@ -26,11 +26,21 @@ export function BuildListOptimizationRunningPanel({
   runKey,
   stage,
   onCancel,
+  title = BUILD_LIST_OPTIMIZATION_RUNNING_TITLE,
+  note = BUILD_LIST_OPTIMIZATION_RUNNING_NOTE,
+  progressLabel = '生産計画の計算中',
 }: {
   runKey: BuildListOptimizationRunKey
   /** The latest stage the Worker reported, or null before the first one arrives. */
   stage: BuildListOptimizationStage | null
   onCancel(): void
+  /**
+   * The heading, the note and the progress bar's name of the calculation this running state belongs to. The running Plan replan
+   * re-optimization (Issue #276 PR-6A) shares this running state on the same dedicated Worker and names its own calculation.
+   */
+  title?: string
+  note?: string
+  progressLabel?: string
 }) {
   const headingId = useId()
   const longRunNotice = useBuildListOptimizationLongRunNotice(runKey)
@@ -45,10 +55,10 @@ export function BuildListOptimizationRunningPanel({
     >
       <Stack spacing={1.5}>
         <Typography id={headingId} component="h3" variant="h3">
-          {BUILD_LIST_OPTIMIZATION_RUNNING_TITLE}
+          {title}
         </Typography>
         <LinearProgress
-          aria-label="生産計画の計算中"
+          aria-label={progressLabel}
           variant="indeterminate"
           sx={{
             // UI_FLOW 10.4: the indeterminate bar does not move when the user asks for reduced motion; the heading and
@@ -62,7 +72,7 @@ export function BuildListOptimizationRunningPanel({
           {buildListOptimizationStageStatusText(stage)}
         </Typography>
         <Typography variant="body2" color="text.secondary" sx={{ overflowWrap: 'anywhere' }}>
-          {BUILD_LIST_OPTIMIZATION_RUNNING_NOTE}
+          {note}
         </Typography>
         <Typography variant="body2" color="text.secondary" sx={{ overflowWrap: 'anywhere' }}>
           {BUILD_LIST_OPTIMIZATION_KEEP_SCREEN_NOTE}

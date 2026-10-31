@@ -11,17 +11,20 @@ import { BuildListOptimizationInvariantError } from './buildListOptimizationType
 
 /**
  * Every registered Target that is not a planning Target, in exactly one class, by the precedence completed -> disabled -> its
- * Entries were all excluded (stale and the like) -> it has no Entry. The planning Targets are never counted, so the classes never
+ * completion condition awaits review -> its Entries were all excluded (stale and the like) -> it has no Entry. The planning Targets are never counted, so the classes never
  * add to the planning denominator (`termination.totalTargetCount`).
  */
 export function countBuildListOptimizationOutOfScopeTargets(input: Pick<PlannerInput, 'targetWeapons' | 'buildListEntries'>,
   planningTargetIds: ReadonlySet<TargetWeaponId>): BuildListOptimizationOutOfScopeTargetCounts {
-  const counts: BuildListOptimizationOutOfScopeTargetCounts = { noEntry: 0, excludedEntryOnly: 0, disabled: 0, completed: 0 }
+  const counts: BuildListOptimizationOutOfScopeTargetCounts = {
+    noEntry: 0, excludedEntryOnly: 0, disabled: 0, completionConditionReview: 0, completed: 0,
+  }
   const listed = new Set<string>(input.buildListEntries.map(entry => entry.targetWeaponId))
   for (const target of input.targetWeapons) {
     if (planningTargetIds.has(target.id)) continue
     if (target.lifecycleStatus === 'completed') counts.completed += 1
     else if (!target.isEnabled) counts.disabled += 1
+    else if (target.completionConditionReview.length > 0) counts.completionConditionReview += 1
     else if (listed.has(target.id)) counts.excludedEntryOnly += 1
     else counts.noEntry += 1
   }

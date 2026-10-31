@@ -6,7 +6,6 @@ import type {
   TargetWeaponId,
 } from '../models/publicTypes'
 import { stableStringify } from '../models/publicTypes'
-import type { PlannerCheckpointRequirements } from './plannerCheckpoints'
 import { entryIsRelevantForState } from './plannerEntryRelevance'
 import { totalPlannerLaneProgress } from './plannerRouteLanes'
 import type {
@@ -24,18 +23,13 @@ export function scoreCandidate(
   entry: BuildListEntry,
   conflictCount = 0,
 ): CandidateScore {
-  const satisfaction = state.targetSatisfaction[target.id] ?? {
-    hasPractical: false,
-    hasIdeal: false,
-  }
+  const satisfaction = state.targetSatisfaction[target.id] ?? { completedInRun: false }
   const candidate = entry.candidateSnapshot
   const targetPriorityScore = target.priority * 10_000
-  // The only satisfaction the Planner pursues is the Ideal: a Target that lacks
-  // its Ideal is urgent, one that holds it is not. `hasPractical` is never read
-  // here - whether the Target already holds a compromise weapon changes no
-  // Planner priority (`docs/PLANNER_SPEC.md` 7), and a selected checkpoint is a
-  // hard constraint outside the score (7.5).
-  const satisfactionScore = satisfaction.hasIdeal ? 0 : 50_000
+  // The only satisfaction the Planner pursues is the run's own completion of
+  // the Target (Issue #334 PR-3, `docs/PLANNER_SPEC.md` 21.5): a Target whose
+  // Entry has not secured its weapon is urgent, one that has is not.
+  const satisfactionScore = satisfaction.completedInRun ? 0 : 50_000
   const distancePenalty = candidate.estimatedOperationCount * 100
   const conflictPenalty = conflictCount * 5_000
   return {
@@ -52,10 +46,10 @@ export function scoreCandidate(
 }
 
 /**
- * The achieved-goal term of a state: one weight per Target that holds its
- * Ideal, scaled by Target priority. There is no Practical tier - a Target that
- * only holds a compromise weapon scores exactly like one that holds nothing,
- * because the Planner's goal is the Ideal alone (`docs/PLANNER_SPEC.md` 7).
+ * The achieved-goal term of a state: one weight per Target its own Entry
+ * completed in the run, scaled by Target priority. There is no Practical tier:
+ * the Planner's goal is the Ideal alone (`docs/PLANNER_SPEC.md` 7), and an
+ * owned weapon's performance counts for nothing (21.5).
  */
 function achievedSatisfactionScore(
   state: PlannerSearchState,
@@ -63,7 +57,7 @@ function achievedSatisfactionScore(
 ): number {
   return targets.reduce((total, target) => {
     const satisfaction = state.targetSatisfaction[target.id]
-    if (!satisfaction?.hasIdeal) return total
+    if (!satisfaction?.completedInRun) return total
     return total + 1_200_000 + target.priority * 120_000
   }, 0)
 }
@@ -74,17 +68,13 @@ function progressPotentialScore(
   targetsById: ReadonlyMap<TargetWeaponId, TargetWeapon>,
   routeUnitCountByEntryId: ReadonlyMap<BuildListEntryId, number>,
   conflictCountByEntryId: ReadonlyMap<BuildListEntryId, number>,
-  checkpointRequirements: PlannerCheckpointRequirements,
 ): number {
   const bestByTarget = new Map<TargetWeaponId, number>()
   entries.forEach((entry) => {
     if (state.selectedBuildListEntryIds.includes(entry.id)) return
     const target = targetsById.get(entry.targetWeaponId)
     if (!target) return
-    // Relevance, not `hasIdeal`: a required checkpoint Entry keeps its
-    // progress potential after another weapon made its Target Ideal, and an
-    // Entry the requirement excludes never had any.
-    if (!entryIsRelevantForState(state, entry, checkpointRequirements)) return
+    if (!entryIsRelevantForState(state, entry)) return
     const unitCount = routeUnitCountByEntryId.get(entry.id) ?? 0
     const laneProgress = state.routeProgressByEntryId[entry.id]
     const progress = laneProgress === undefined ? 0 : totalPlannerLaneProgress(laneProgress)
@@ -114,7 +104,6 @@ export interface StateScoreContext {
   targetsById: ReadonlyMap<TargetWeaponId, TargetWeapon>
   routeUnitCountByEntryId: ReadonlyMap<BuildListEntryId, number>
   conflictCountByEntryId: ReadonlyMap<BuildListEntryId, number>
-  checkpointRequirements: PlannerCheckpointRequirements
 }
 
 export function evaluatePlannerSearchState(
@@ -131,7 +120,6 @@ export function evaluatePlannerSearchState(
     context.targetsById,
     context.routeUnitCountByEntryId,
     context.conflictCountByEntryId,
-    context.checkpointRequirements,
   )
   const actionPenalty = state.trace.length * 100
   return achieved + progress - actionPenalty
@@ -172,17 +160,26 @@ function normalizedOwnedWeapons(state: PlannerSearchState) {
 /**
  * IDs reserved during search and timestamps are deliberately excluded.
  *
- * `weaponSwitchCount`, `lastWeaponOperationSubjectKey`,
- * `preferredSourceProgressCount`, and `improvementPreferenceViolationCount`
- * are deliberately excluded too, and their exclusion loses nothing. All four
- * are pure functions of the trace projection
- * already keyed below: each action's `primaryBuildListEntryId` and
+ * `weaponSwitchCount`, `lastWeaponOperationSubjectKey` and
+ * `preferredSourceProgressCount` are deliberately excluded too, and their
+ * exclusion loses nothing. All three are pure functions of the trace
+ * projection already keyed below: each action's `primaryBuildListEntryId` and
  * `progressedBuildListEntryIds` plus its `progressedRoutePositions` pin the
  * exact saved `RouteOperation`, and therefore its weapon subject and which
  * Entries it progressed. Two states sharing this key therefore always share all
- * four values, so deduplication identity, future switch accounting, the two
- * user preferences, and the deterministic tie-break stay consistent without
- * restating them (`docs/PLANNER_SPEC.md` 7.3 / 7.4 / 7.6).
+ * three values, so deduplication identity, future switch accounting, the
+ * preferred-source preference, and the deterministic tie-break stay consistent
+ * without restating them (`docs/PLANNER_SPEC.md` 7.3 / 7.4).
+ *
+ * Issue #100 stage 2 (`docs/PLANNER_SPEC.md` 20.10) removed
+ * `reachedCheckpointByEntryId` (always empty without a selection) and the
+ * `hasPractical` of `targetSatisfaction` (always equal to `hasIdeal`) from this
+ * key. Both were the same value in every pair of compared keys, so the key
+ * equality and the order between any two keys are unchanged. Issue #334 PR-3
+ * (`docs/PLANNER_SPEC.md` 21.5) replaced `hasIdeal` with the run's own
+ * completion `completedInRun` and removed `inFlightExistingSourceByOwnedWeaponId`
+ * (a pure function of the trace projection keyed below) with the
+ * inventory-derived satisfaction.
  */
 export function createPlannerSearchStateSemanticKey(
   state: PlannerSearchState,
@@ -206,9 +203,6 @@ export function createPlannerSearchStateSemanticKey(
     candidateReadySourceVersionByEntryId:
       state.candidateReadySourceVersionByEntryId,
     routeSourceVersionByEntryId: state.routeSourceVersionByEntryId,
-    inFlightExistingSourceByOwnedWeaponId:
-      state.inFlightExistingSourceByOwnedWeaponId,
-    reachedCheckpointByEntryId: state.reachedCheckpointByEntryId,
     selectedBuildListEntryIds: [...state.selectedBuildListEntryIds].sort(
       compareStableStrings,
     ),
@@ -249,20 +243,9 @@ export function comparePlannerSearchStates(
   if (left.preferredSourceProgressCount !== right.preferredSourceProgressCount) {
     return right.preferredSourceProgressCount - left.preferredSourceProgressCount
   }
-  // The user's improvement preference, below every existing evaluation term
-  // and the preferred-source preference, above the automatic weapon-switch
-  // heuristic: among equally rated branches, prefer the one that improved the
-  // lane the user asked for first. Soft by construction - it can never beat a
-  // cheaper or more complete Plan (docs/PLANNER_SPEC.md 7.6).
-  if (
-    left.improvementPreferenceViolationCount !==
-    right.improvementPreferenceViolationCount
-  ) {
-    return (
-      left.improvementPreferenceViolationCount -
-      right.improvementPreferenceViolationCount
-    )
-  }
+  // The improvement preference term of calculation schema 11..18 sat here; it
+  // was 0 for every branch without a selection and was removed with it (Issue
+  // #100, docs/PLANNER_SPEC.md 7.6 / 20.10).
   // Plan quality, below the preferred-source preference and above the two
   // stable string tie-breaks: among Plans the existing evaluation already rates
   // equally, prefer the one that makes the player swap the weapon in hand fewer

@@ -6,6 +6,7 @@ import {
   hasConfirmedGogmaInputs,
   hasConfirmedSkillInputs,
   isAvailableRouteSource,
+  partitionCompletionAssignedRouteSources,
   partitionExcludedRouteSources,
   type RouteSearchContext,
   type RouteSearchResult,
@@ -34,9 +35,12 @@ export async function searchOwnedNormalArtianRoutes(
     .filter((weapon) => isAvailableRouteSource(context, weapon.id) && shapeSource(weapon))
   const admitted = selectConvertibleOwnedNormalArtianWeapons(target, input.ownedWeapons)
     .filter((weapon) => isAvailableRouteSource(context, weapon.id) && shapeSource(weapon))
-  // The request's source exclusion (SEARCH_SPEC 3.3) applies on top of every
-  // source rule above, before any base or prediction exists for the weapon.
-  const { kept: sources, excluded } = partitionExcludedRouteSources(context, admitted)
+  // A weapon another Target was completed with is never a Route base (SEARCH_SPEC
+  // 5.5.1, Issue #334), whatever its kind and protection; then the request's
+  // source exclusion (3.3) applies on top of every source rule above, before
+  // any base or prediction exists for the weapon.
+  const { kept: unassigned, assigned } = partitionCompletionAssignedRouteSources(context, admitted)
+  const { kept: sources, excluded } = partitionExcludedRouteSources(context, unassigned)
   if (excluded.length > 0) result.excludedSourceOwnedWeaponIds = excluded.map(({ id }) => id)
 
   if (sources.length === 0) {
@@ -46,11 +50,17 @@ export async function searchOwnedNormalArtianRoutes(
           reason: 'source_excluded_for_other_targets',
           detail: 'Every convertible owned Normal Artian source is excluded for use by other Target weapons.',
         }
-      : {
-          route: 'owned_normal_artian_to_gogma',
-          reason: compatible.length > 0 ? 'no_unprotected_source_weapon' : 'no_owned_weapon_available',
-          detail: compatible.length > 0 ? 'Only protected owned Normal Artian sources are available.' : 'No compatible owned Normal Artian weapon is available.',
-        })
+      : assigned.length > 0
+        ? {
+            route: 'owned_normal_artian_to_gogma',
+            reason: 'source_completion_assigned',
+            detail: 'Every convertible owned Normal Artian source is the completion of another Target weapon.',
+          }
+        : {
+            route: 'owned_normal_artian_to_gogma',
+            reason: compatible.length > 0 ? 'no_unprotected_source_weapon' : 'no_owned_weapon_available',
+            detail: compatible.length > 0 ? 'Only protected owned Normal Artian sources are available.' : 'No compatible owned Normal Artian weapon is available.',
+          })
     return result
   }
   if (!hasConfirmedSkillInputs(input)) {

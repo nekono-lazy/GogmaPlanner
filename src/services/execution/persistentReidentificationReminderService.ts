@@ -1,4 +1,5 @@
 import { appDatabase, type AppDatabase } from '../../db/AppDatabase'
+import { ExecutionHistoryRepository } from '../../db/repositories/executionHistoryRepository'
 import {
   deriveExecutionReidentificationReminder,
   type UnresolvedActualResultDivergence,
@@ -113,15 +114,18 @@ export function aggregatePersistentReidentificationReminder(
  * Reads the current persisted state the reminder is derived from - every
  * ProductionPlan, every ExecutionHistory record, the current RngState and every
  * NormalArtianCounter - and aggregates it. Read-only: nothing is written, and no
- * flag is stored anywhere. A failed read rejects; the caller must never show a
- * failure as "no re-identification needed".
+ * flag is stored anywhere. Only the ExecutionHistory metadata is read, never an
+ * Undo body (`docs/DATA_MODEL.md` 14.6). A failed read rejects - a record the
+ * Dexie version 11 upgrade could not convert included
+ * (`execution_history_unconvertible`); the caller must never show a failure as
+ * "no re-identification needed".
  */
 export async function loadPersistentReidentificationReminder(
   database: AppDatabase = appDatabase,
 ): Promise<PersistentReidentificationReminder> {
   const [plans, executionHistory, rngState, normalCounters] = await Promise.all([
     database.productionPlans.toArray(),
-    database.executionHistory.toArray(),
+    new ExecutionHistoryRepository(database).getAllExecutionHistory({ kind: 'all' }),
     database.rngState.get('current'),
     database.normalArtianCounters.toArray(),
   ])

@@ -60,7 +60,25 @@ export type RouteKind =
   | 'existing_gogma_keep_bonuses'
   | 'existing_gogma_reset_skills'
   | 'existing_gogma_mixed'
-export type SkillMatchMode = 'all' | 'any'
+/**
+ * How a completion Skill condition combines its specified Series / Group
+ * Skills. Only `all` exists (`docs/DATA_MODEL.md` 8.4, Issue #100): the former
+ * `any` appears only as a legacy migration input and is normalized to `all`.
+ */
+export type SkillMatchMode = 'all'
+export const skillMatchModes = ['all'] as const
+/**
+ * Why a Target's completion condition needs the user's review
+ * (`docs/DATA_MODEL.md` 8.6). A non-empty list keeps the Target out of every
+ * calculation until the user explicitly saves it.
+ */
+export type CompletionConditionReviewReason =
+  | 'compromise_conditions_removed'
+  | 'skill_condition_normalized'
+export const completionConditionReviewReasons = [
+  'compromise_conditions_removed',
+  'skill_condition_normalized',
+] as const
 export type ProductionPlanStatus =
   | 'draft'
   | 'active'
@@ -102,11 +120,16 @@ export type PlanStepOperationType =
 /**
  * What the user confirmed happened at one Step (`docs/PLANNER_SPEC.md` 16.4).
  *
- * Current Execution records only `confirmed_expected`,
- * `actual_result_different`, `operation_uncertain`,
- * `operation_count_recovered` and `finished_as_compromise`. `secured_weapon` and `skipped_candidate` belong to
- * legacy Plans with an independent secure Step; they stay in the type so a
- * historical record can be displayed, and current Execution never writes them.
+ * Current Execution records `confirmed_expected`, `actual_result_different`,
+ * `operation_uncertain` and `operation_count_recovered`. `finished_as_compromise`
+ * was written by the calculation schema 11..18 「この武器を妥協品として確定して
+ * 終了」, which Issue #100 removed (20.4 / 20.7); it stays in
+ * `currentExecutionActions` only so a persisted record keeps validating, is
+ * displayed and stays undoable through the ordinary Undo eligibility, and
+ * current Execution never writes it. `secured_weapon` and `skipped_candidate`
+ * belong to legacy Plans with an independent secure Step; they stay in the type
+ * so a historical record can be displayed, and current Execution never writes
+ * them.
  */
 export type ExecutionAction =
   | 'confirmed_expected'
@@ -375,7 +398,43 @@ export interface KnownValue<T> {
 // `DATABASE_SCHEMA_VERSION` stays 10, `ExportRoot.schemaVersion` stays 13, and
 // `AppSettings.schemaVersion`, `RngState.schemaVersion`,
 // `PRODUCTION_RNG_ENGINE_VERSION` and the Master `dataVersion` are unchanged.
-export const CURRENT_CALCULATION_APP_SCHEMA_VERSION = 18
+//
+// Version 19 redesigns the Target completion condition (Issue #100,
+// `docs/PLANNER_SPEC.md` 20): a Target holds one or more completion Variants
+// (five slots of bonus type plus minimum rank) and a completion Skill
+// condition, and the former Practical / Alternative / Practical Skill
+// conditions and the intermediate states are gone. Candidate Search's
+// acceptance predicate and canonical selection, the #104 Normal base reduction,
+// the Candidate output shape (no `intermediateStateGroups`), the
+// `createTargetDefinitionHash()` normalization, the Planner's satisfaction and
+// the Build List optimization's reach table all change, so every version
+// 1..18 BuildCandidate, BuildListEntry and ProductionPlan fails closed with
+// `calculation_context_changed`: no build-result exception and no Plan
+// exception is added for 19. The Target body moves to the new shape, so
+// `DATABASE_SCHEMA_VERSION` moves to 12 and `ExportRoot.schemaVersion` to 15;
+// `AppSettings.schemaVersion`, `RngState.schemaVersion`,
+// `PRODUCTION_RNG_ENGINE_VERSION` and the Master `dataVersion` are unchanged.
+//
+// Version 20 switches the Planner's completion of a planning Target to "one
+// Target, one physically distinct completed weapon" (Issue #334 PR-3,
+// `docs/PLANNER_SPEC.md` 21.5): a Target is complete in a run only when its own
+// BuildListEntry secured a weapon (its reserve, or its own zero-operation
+// confirmation), a weapon secured for one Target never satisfies another, no
+// Entry is released by another Entry's reserve, no Target is complete at Planner
+// start because an owned weapon performs, and two Entries whose completed
+// weapon is the same owned weapon always collide (`same_owned_weapon_consumed`,
+// zero-operation Candidates and the degenerate shareable pair included). For
+// the same PlannerInput the selected Entries, Steps, Conflicts and completion
+// can differ and a persisted Plan records none of it, so every version 1..19
+// ProductionPlan fails closed with `calculation_context_changed`, with no Plan
+// exception. Candidate Search, BuildCandidate and BuildListEntry snapshot
+// semantics and staleness do not change, so the explicit build-result
+// exception `20 -> [19]` keeps version 19 Candidates and Build List Entries
+// usable; version 1..18 stay incompatible. No persisted shape changes:
+// `DATABASE_SCHEMA_VERSION` stays 13, `ExportRoot.schemaVersion` stays 16, and
+// `AppSettings.schemaVersion`, `RngState.schemaVersion`,
+// `PRODUCTION_RNG_ENGINE_VERSION` and the Master `dataVersion` are unchanged.
+export const CURRENT_CALCULATION_APP_SCHEMA_VERSION = 20
 
 export interface CalculationContext {
   gameVersion: string

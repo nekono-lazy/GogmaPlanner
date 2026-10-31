@@ -16,6 +16,7 @@ import {
 import {
   matchOperationCountRecovery,
   recoveryResumeStep,
+  type ExecutionSavePointRestoreAvailability,
   type OperationCountRecoveryAvailability,
   type OperationCountRecoveryMatch,
   type OperationCountRecoveryObservation,
@@ -28,6 +29,11 @@ import { actualResultFromDraft, emptyActualResultDraft, type ActualResultDraft }
 import { ExecutionSavePointRestoreDialog } from './ExecutionSavePointRestoreDialog'
 import { planStepPositionLabel, savePointPositionLabel } from './executionStepPresentation'
 import { GameResultFields } from './GameResultFields'
+import {
+  SAVE_POINT_RESTORE_INVALID_MESSAGE,
+  SAVE_POINT_RESTORE_UNAVAILABLE_RECOVERY_GUIDANCE,
+  savePointRestoreUnavailableMessage,
+} from './savePointRestoreUnavailablePresentation'
 
 const buttonSx = { minHeight: 44, width: { xs: '100%', sm: 'auto' } } as const
 const primarySx = { minHeight: 48, width: { xs: '100%', sm: 'auto' }, alignSelf: { sm: 'flex-start' } } as const
@@ -101,12 +107,16 @@ function AbandonPlanDialog({
  * Recovery Window) or another operation / weapon was used (the game save
  * point, or abandoning the Plan when there is none). The match shown here is
  * display only: the recovery transaction derives the Window and the position
- * again and refuses any difference.
+ * again and refuses any difference. Only a save point the Navigator's read
+ * marks `available` is offered for the restore (Issue #335): a `blocked` one -
+ * a Plan a calculation version boundary made incompatible - says why and points
+ * to the abandonment, and an `invalid` one says its record is invalid.
  */
 export function OperationUncertainRecovery({
   plan,
   availability,
   savePoint,
+  savePointRestore,
   undoAvailable,
   master,
   weaponTypeId,
@@ -119,6 +129,8 @@ export function OperationUncertainRecovery({
   plan: ProductionPlan
   availability: OperationCountRecoveryAvailability
   savePoint: Pick<ExecutionSavePoint, 'recordedAt' | 'productionPlan'> | null
+  /** The Navigator's read-only restore availability; `blocked` withholds the restore. */
+  savePointRestore: ExecutionSavePointRestoreAvailability
   /**
    * The 「操作内容不明」 record can still be undone, so 「実行状態の管理」 below
    * shows the control that takes it back. Display only: this panel never undoes
@@ -143,6 +155,16 @@ export function OperationUncertainRecovery({
   const match = recoveryWindow === null ? null : safeMatch(recoveryWindow, observations)
   const operationLabel = recoveryWindow === null ? '' : planStepOperationLabels[recoveryWindow.steps[0].operationType]
   const observation = recoveryWindow === null ? null : actualResultFromDraft(recoveryWindow.resultKind, draft)
+  const offersRestore = savePoint !== null && savePointRestore.kind === 'available'
+  // Why a recorded save point is not offered; `null` when it is, or when none applies.
+  const restoreUnavailableText =
+    savePoint === null || offersRestore
+      ? null
+      : savePointRestore.kind === 'blocked'
+        ? `${savePointRestoreUnavailableMessage(savePointRestore.reason)}${SAVE_POINT_RESTORE_UNAVAILABLE_RECOVERY_GUIDANCE}`
+        : savePointRestore.kind === 'invalid'
+          ? SAVE_POINT_RESTORE_INVALID_MESSAGE
+          : null
   const restart = () => {
     setObservations([])
     setDraft(emptyActualResultDraft())
@@ -150,14 +172,18 @@ export function OperationUncertainRecovery({
 
   const fallback = (
     <Stack spacing={1}>
-      {savePoint !== null ? (
+      {offersRestore ? (
         <Button variant="contained" color="warning" disabled={submitting} onClick={() => setRestoreOpen(true)} sx={primarySx}>
           最後のゲーム内セーブ地点へ戻す
         </Button>
+      ) : restoreUnavailableText !== null ? (
+        <Typography variant="body2">{restoreUnavailableText}</Typography>
       ) : (
         <>
           <Typography variant="body2">
-            ゲーム内セーブ地点が記録されていないため、この作成プランは破棄して、現在のゲーム状態から計画し直してください。
+            {savePoint === null
+              ? 'ゲーム内セーブ地点が記録されていないため、この作成プランは破棄して、現在のゲーム状態から計画し直してください。'
+              : '戻せるゲーム内セーブ地点がないため、この作成プランは破棄して、現在のゲーム状態から計画し直してください。'}
           </Typography>
           <Button variant="outlined" color="error" disabled={submitting} onClick={() => setAbandonOpen(true)} sx={buttonSx}>
             作成プランを破棄する
@@ -335,7 +361,7 @@ export function OperationUncertainRecovery({
             >
               別の操作・別の武器を操作してしまった
             </Button>
-            {savePoint !== null && (
+            {offersRestore && (
               <>
                 <Divider />
                 <Box>
@@ -349,6 +375,12 @@ export function OperationUncertainRecovery({
                     最後のゲーム内セーブ地点へ戻す
                   </Button>
                 </Box>
+              </>
+            )}
+            {restoreUnavailableText !== null && (
+              <>
+                <Divider />
+                <Typography variant="body2">{restoreUnavailableText}</Typography>
               </>
             )}
             {undoAvailable && (
@@ -365,7 +397,7 @@ export function OperationUncertainRecovery({
         {mode === 'same_operation' && (
           <>
             {renderSameOperation()}
-            {savePoint !== null && match?.kind !== 'unrecoverable' && recoveryWindow !== null && (
+            {offersRestore && match?.kind !== 'unrecoverable' && recoveryWindow !== null && (
               <>
                 <Divider />
                 <Box>
@@ -387,7 +419,7 @@ export function OperationUncertainRecovery({
           <Stack spacing={1.5}>
             <Typography variant="body2">
               作成プランにない操作が行われたため、Counterだけを合わせても現在の状態を説明できません。
-              {savePoint !== null ? '最後のゲーム内セーブ地点へ戻すことを推奨します。' : ''}
+              {offersRestore ? '最後のゲーム内セーブ地点へ戻すことを推奨します。' : ''}
             </Typography>
             {fallback}
           </Stack>
@@ -408,14 +440,14 @@ export function OperationUncertainRecovery({
         )}
       </Stack>
       <ExecutionSavePointRestoreDialog
-        open={restoreOpen}
+        open={restoreOpen && offersRestore}
         submitting={submitting}
         positionLabel={savePoint === null ? null : savePointPositionLabel(plan, savePoint.productionPlan.currentStepId)}
         note="セーブ地点より後の記録（操作内容不明の記録を含む）は削除されます。"
         onCancel={() => setRestoreOpen(false)}
         onConfirm={() => {
           setRestoreOpen(false)
-          if (savePoint !== null) onRestoreSavePoint(savePoint.recordedAt)
+          if (offersRestore && savePoint !== null) onRestoreSavePoint(savePoint.recordedAt)
         }}
       />
       <AbandonPlanDialog

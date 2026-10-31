@@ -29,7 +29,9 @@ import {
   createBuildListOptimizationTargetResolver,
   presentBuildListOptimizationFailure,
   presentBuildListOptimizationUnsupportedReason,
+  unsupportedReasonDebugText,
   type BuildListOptimizationOutcome,
+  type BuildListOptimizationUnsupportedReasonPresentation,
   type BuildListOptimizationPreviewStartContext,
 } from './buildListOptimizationPresentation'
 
@@ -88,33 +90,34 @@ export function OrdinaryPlannerAuxiliaryBlock({ action }: { action: OrdinaryPlan
   )
 }
 
+/** One unsupported reason as the screen shows it: a presentation plus its Debug Mode line (the raw kind and issues). */
+export interface UnsupportedReasonView {
+  key: string
+  presentation: Omit<BuildListOptimizationUnsupportedReasonPresentation, 'kind'>
+  debugText: string
+}
+
 /**
- * The typed unsupported reasons (`docs/PLANNER_SPEC.md` 17.4): each with what it means, the Targets it names (by name, weapon type
- * and element - never by ID), what is missing and where to resolve it. Shared by a calculated `unsupported` result and the pre-start
- * judgement body (`selectPlanCreationMethod()`'s reasons). Nothing is judged here: the reasons are the Domain's, as they are.
+ * Typed unsupported reasons as cards: what each means, the Targets it names (by name, weapon type and element - never by ID), what is
+ * missing and where to resolve it, and the raw reason in Debug Mode only. Nothing is judged here. Shared by the Build List
+ * optimization and the running Plan replan re-optimization (Issue #276 PR-6A), which present their own reasons.
  */
-export function BuildListOptimizationUnsupportedReasonList({
-  reasons,
-  targetWeapons,
-  master,
+export function UnsupportedReasonViewList({
+  views,
+  label,
   debugMode = false,
 }: {
-  reasons: readonly BuildListOptimizationUnsupportedReason[]
-  /** The Targets of the input the reasons were judged on; null when they are unknown (the Targets are then not named). */
-  targetWeapons: readonly TargetWeapon[] | null
-  master: MasterDataRoot
+  views: readonly UnsupportedReasonView[]
+  /** The list's accessible name. */
+  label: string
   debugMode?: boolean
 }) {
-  const presentations = useMemo(() => {
-    const resolve = createBuildListOptimizationTargetResolver(targetWeapons, master)
-    return reasons.map((reason) => ({ reason, presentation: presentBuildListOptimizationUnsupportedReason(reason, resolve) }))
-  }, [reasons, targetWeapons, master])
   return (
-    <Stack component="ul" spacing={1} aria-label="全体最適化を使えない理由" sx={{ m: 0, p: 0, listStyle: 'none' }}>
-      {presentations.map(({ reason, presentation }, index) => (
+    <Stack component="ul" spacing={1} aria-label={label} sx={{ m: 0, p: 0, listStyle: 'none' }}>
+      {views.map(({ key, presentation, debugText }) => (
         <Box
           component="li"
-          key={`${presentation.kind}:${index}`}
+          key={key}
           sx={{ border: 1, borderColor: 'divider', borderRadius: 1, p: { xs: 1.5, md: 2 }, minWidth: 0 }}
         >
           <Stack spacing={0.75}>
@@ -158,9 +161,7 @@ export function BuildListOptimizationUnsupportedReasonList({
             )}
             {debugMode && (
               <Typography variant="caption" color="text.secondary" sx={{ overflowWrap: 'anywhere' }}>
-                {reason.kind === 'invalid_planner_input'
-                  ? `${reason.kind}: ${reason.issues.map(({ path, code }) => `${path} ${code}`).join(', ')}`
-                  : reason.kind}
+                {debugText}
               </Typography>
             )}
           </Stack>
@@ -168,6 +169,33 @@ export function BuildListOptimizationUnsupportedReasonList({
       ))}
     </Stack>
   )
+}
+
+/**
+ * The typed unsupported reasons (`docs/PLANNER_SPEC.md` 17.4): each with what it means, the Targets it names (by name, weapon type
+ * and element - never by ID), what is missing and where to resolve it. Shared by a calculated `unsupported` result and the pre-start
+ * judgement body (`selectPlanCreationMethod()`'s reasons). Nothing is judged here: the reasons are the Domain's, as they are.
+ */
+export function BuildListOptimizationUnsupportedReasonList({
+  reasons,
+  targetWeapons,
+  master,
+  debugMode = false,
+}: {
+  reasons: readonly BuildListOptimizationUnsupportedReason[]
+  /** The Targets of the input the reasons were judged on; null when they are unknown (the Targets are then not named). */
+  targetWeapons: readonly TargetWeapon[] | null
+  master: MasterDataRoot
+  debugMode?: boolean
+}) {
+  const views = useMemo(() => {
+    const resolve = createBuildListOptimizationTargetResolver(targetWeapons, master)
+    return reasons.map((reason, index): UnsupportedReasonView => {
+      const presentation = presentBuildListOptimizationUnsupportedReason(reason, resolve)
+      return { key: `${presentation.kind}:${index}`, presentation, debugText: unsupportedReasonDebugText(reason) }
+    })
+  }, [reasons, targetWeapons, master])
+  return <UnsupportedReasonViewList views={views} label="全体最適化を使えない理由" debugMode={debugMode} />
 }
 
 /** Debug Mode only: the failure exactly as the session typed it (the Worker's message is shown here and nowhere else). */
@@ -236,6 +264,7 @@ export function BuildListOptimizationResultPanel({
   onRetry,
   onAdopt,
   actionsDisabled = false,
+  adoptionInspecting = false,
   focusHeadingOnMount = false,
   adoptButtonRef,
 }: {
@@ -251,6 +280,8 @@ export function BuildListOptimizationResultPanel({
   onRetry?: () => void
   onAdopt?: () => void
   actionsDisabled?: boolean
+  /** True while the caller checks the Preview's adoption before its confirmation (shown in the Preview's adoption operations). */
+  adoptionInspecting?: boolean
   focusHeadingOnMount?: boolean
   /** The Preview's 「この計画を採用」, for the caller's focus return after its confirmation. */
   adoptButtonRef?: Ref<HTMLButtonElement>
@@ -276,6 +307,7 @@ export function BuildListOptimizationResultPanel({
         onDiscard={onDiscard}
         onAdopt={onAdopt}
         actionsDisabled={actionsDisabled}
+        adoptionInspecting={adoptionInspecting}
         focusHeadingOnMount={focusHeadingOnMount}
         adoptButtonRef={adoptButtonRef}
       />

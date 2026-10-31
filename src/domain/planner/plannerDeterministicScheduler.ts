@@ -20,7 +20,6 @@ import {
   type PlannerInitialContext,
 } from './plannerInitialContext'
 import {
-  canCommitPlannerRoute,
   comparePlannerCommitmentPriority,
   createPlannerRouteCommitment,
   explicitlyPreferredBuildListEntryIds,
@@ -61,6 +60,7 @@ import {
   applyPlannerZeroOperationConfirms,
   createPlannerInitialFailureResult,
   detectCurrentPlannerConflicts,
+  isPlannerZeroOperationEntry,
   pendingPlannerReserveEntries,
   plannerConflictCountByEntryId,
   plannerRejectionKey,
@@ -70,7 +70,6 @@ import {
   applyPlannerReserveAction,
   applyPlannerRouteAction,
   createPlannerSearchRejection,
-  isPlannerImprovementPreferenceViolation,
   mergedPlannerProgressedEntries,
   plannerRouteUnitPreconditionRejection,
   plannerRouteUnitSourceRejection,
@@ -103,6 +102,13 @@ import { PERSISTED_PLANNER_BUILD_LIST_CONTEXT } from './plannerTypes'
  * committed Entry that action completed. It builds no successor array, keeps
  * no beam, deduplicates nothing, and reads neither `evaluationScore` nor the
  * preferred source to decide anything.
+ *
+ * A planning Target completes only through its own Entry's reserve or its own
+ * zero-operation confirmation (Issue #334 PR-3, `docs/PLANNER_SPEC.md` 21.5):
+ * a committed Entry stays committed until it is secured or dropped, a weapon
+ * secured for one Target satisfies no other, nothing is complete at Planner
+ * start through an owned weapon's performance, and two Entries whose completed
+ * weapon is the same owned weapon collide at the Route commitment.
  *
  * Every state transition goes through the shared authority
  * (`plannerStateTransitions.ts`), so its trace is an ordinary Planner trace
@@ -143,7 +149,7 @@ interface FrontierUnit {
   readonly unit: PlannerRouteUnit
   /**
    * `isPlannerLaneUnitHolding()`: never skippable, so another Entry may not
-   * consume this position (5). A pin-blocked skippable unit is not holding.
+   * consume this position (5).
    */
   readonly holding: boolean
   /** Runnable now: next lane unit, preconditions met, not resolution-blocked. */
@@ -232,10 +238,9 @@ export class PlannerDeterministicScheduleRun {
     const preferredSourceEntryIds = new Set<BuildListEntryId>()
     this.reserveActionContext = {
       dependencies,
-      targets: context.planningTargets,
       master: input.master,
+      completionAssignments: context.completionAssignments,
       preferredSourceEntryIds,
-      requirements: context.checkpointRequirements,
     }
     const detection = context.initialConflictDetection
     this.routeActionContext = {
@@ -244,11 +249,8 @@ export class PlannerDeterministicScheduleRun {
       conflictsById: new Map(detection.conflicts.map((conflict) => [conflict.id, conflict])),
       conflictIdsByUnitKey: detection.conflictIdsByUnitKey,
       selectedPhysicalActionKeysByConflictId: detection.selectedPhysicalActionKeysByConflictId,
-      targets: context.planningTargets,
-      master: input.master,
       engine: dependencies.rngEngine,
       preferredSourceEntryIds,
-      requirements: context.checkpointRequirements,
       // Only committed Routes are executed, so only they share an action (7.5).
       canShareWithEntry: (entryId) => this.statusOf(entryId) === 'committed',
     }
@@ -258,7 +260,6 @@ export class PlannerDeterministicScheduleRun {
       entriesById: context.entriesById,
       planningTargets: context.planningTargets,
       planningTargetsById: context.planningTargetsById,
-      checkpointRequirements: context.checkpointRequirements,
       initialConflictDetection: context.initialConflictDetection,
       initialRelevantEntries: context.initialRelevantEntries,
     }
@@ -275,26 +276,11 @@ export class PlannerDeterministicScheduleRun {
    */
   initialize(): string | null {
     const context = this.context
-    applyPlannerZeroOperationConfirms(
-      this.state,
-      {
-        allSearchEntries: context.allSearchEntries,
-        allLanePlans: context.allLanePlans,
-        planningTargetsById: context.planningTargetsById,
-        checkpointRequirements: context.checkpointRequirements,
-        reserveContext: this.reserveActionContext,
-      },
-      'in_place',
-      (rejection) => this.recordRejection(rejection),
-      {
-        canApply: () => this.canApplyAction(),
-        onWithheld: (targetId) => this.unconfirmedTargetIds.add(targetId),
-      },
-    )
-    // Exact bound, as `actionApplied()` records it for an ordinary action.
-    if (this.state.trace.length >= this.input.options.maxPlanSteps) {
-      this.reachedStepLimit = true
-    }
+    // Route commitment first (Issue #334 PR-3, `docs/PLANNER_SPEC.md` 21.5): a
+    // zero-operation Candidate is a commitment candidate like any other Entry,
+    // so one on a weapon another Entry's Route starts from is decided by the
+    // `same_owned_weapon_consumed` collision - the ranking `R` or an explicit
+    // decision - and never confirmed ahead of that Route.
     const commitment = createPlannerRouteCommitment(
       this.state,
       this.commitmentContext,
@@ -313,6 +299,38 @@ export class PlannerDeterministicScheduleRun {
       }))
     commitment.rejections.forEach((rejection) => this.recordRejection(rejection))
     this.metrics?.initialCommitment([...commitment.records.values()])
+    // Then the zero-operation confirmations of the committed Entries only. A
+    // refused confirmation (the weapon no longer satisfies its Target, is the
+    // completion of another Target, or was secured already) drops the Entry
+    // with the reserve's own rejection; a confirmed one is secured.
+    applyPlannerZeroOperationConfirms(
+      this.state,
+      {
+        allSearchEntries: context.allSearchEntries,
+        allLanePlans: context.allLanePlans,
+        planningTargetsById: context.planningTargetsById,
+        reserveContext: this.reserveActionContext,
+        canConfirm: (entry) => this.statusOf(entry.id) === 'committed',
+      },
+      'in_place',
+      (rejection) => {
+        this.metrics?.expectDrop('reserve_rejected')
+        this.setStatus(rejection.buildListEntryId, 'dropped', rejection)
+      },
+      {
+        canApply: () => this.canApplyAction(),
+        onWithheld: (targetId) => this.unconfirmedTargetIds.add(targetId),
+      },
+    )
+    for (const entry of context.allSearchEntries) {
+      if (this.statusOf(entry.id) === 'committed' && this.state.selectedBuildListEntryIds.includes(entry.id)) {
+        this.setStatus(entry.id, 'secured')
+      }
+    }
+    // Exact bound, as `actionApplied()` records it for an ordinary action.
+    if (this.state.trace.length >= this.input.options.maxPlanSteps) {
+      this.reachedStepLimit = true
+    }
     return null
   }
 
@@ -329,11 +347,7 @@ export class PlannerDeterministicScheduleRun {
 
   isComplete(): boolean {
     if (this.unconfirmedTargetIds.size > 0) return false
-    return isPlannerSearchStateComplete(
-      this.state,
-      this.context.planningTargetIds,
-      this.context.checkpointRequirements,
-    )
+    return isPlannerSearchStateComplete(this.state, this.context.planningTargetIds)
   }
 
   private recordRejection(rejection: PlannerSearchRejection) {
@@ -384,7 +398,6 @@ export class PlannerDeterministicScheduleRun {
       this.context.allLanePlans,
       this.context.planningTargets,
       [],
-      this.context.checkpointRequirements,
     ).conflicts.forEach((conflict) => {
       if (!this.conflictsById.has(conflict.id)) this.conflictsById.set(conflict.id, conflict)
     })
@@ -394,14 +407,15 @@ export class PlannerDeterministicScheduleRun {
    * The dynamic commitment events of 6.8, judged in the current state.
    *
    * - a committed Entry that was reserved becomes `secured`
-   * - a committed Entry whose Target another Entry satisfied is released and
-   *   holds no position any more
    * - a committed Entry whose lane head cannot run any more - its source is
    *   gone, protected or superseded, or its holding position was passed - is
    *   dropped with that rejection
-   * - an Entry that was not needed (or released) whose Target lost its Ideal
-   *   in flight is committed again when it is executable and collides with
-   *   no committed Entry; a committed Entry is never pushed out
+   *
+   * A committed Entry is never released by another Entry's reserve and no
+   * Entry is committed again after the start (Issue #334 PR-3,
+   * `docs/PLANNER_SPEC.md` 21.5): a weapon secured for one Target satisfies no
+   * other Target, and no Target is complete at Planner start through an owned
+   * weapon's performance, so there is no satisfaction to lose in flight.
    */
   refreshCommitment(): void {
     let changed = false
@@ -410,32 +424,9 @@ export class PlannerDeterministicScheduleRun {
         this.setStatus(entry.id, 'secured')
         continue
       }
-      if (!entryIsRelevantForState(this.state, entry, this.context.checkpointRequirements)) {
-        this.setStatus(entry.id, 'released')
-        changed = true
-        continue
-      }
       const broken = this.laneHeadRejection(entry)
       if (broken !== null) {
         this.setStatus(entry.id, 'dropped', broken)
-        changed = true
-      }
-    }
-    for (const entry of this.context.allSearchEntries) {
-      const status = this.statusOf(entry.id)
-      if (status !== 'not_needed' && status !== 'released') continue
-      if (!entryIsRelevantForState(this.state, entry, this.context.checkpointRequirements)) continue
-      const committed = this.committedEntries()
-      if (committed.some(({ targetWeaponId }) => targetWeaponId === entry.targetWeaponId)) continue
-      if (
-        canCommitPlannerRoute(
-          this.state,
-          entry,
-          committed,
-          this.commitmentContext,
-        )
-      ) {
-        this.setStatus(entry.id, 'committed')
         changed = true
       }
     }
@@ -448,13 +439,12 @@ export class PlannerDeterministicScheduleRun {
    * another Entry already consumed - the first unit the Counter has not
    * passed yet (or a passed holding unit, which is lost).
    *
-   * They differ only while the checkpoint pin blocks a skippable head: its
-   * position may be consumed (5 "holding"), but its progress waits at the pin
-   * and `fastForwardPlannerRouteProgress()` passes it only once the pin is
-   * released (`docs/PLANNER_SPEC.md` 7.5.2). Every other passed skippable head
-   * was already fast-forwarded. The units behind such a head keep their own
-   * holding: a holding unit here still makes its position wait, and a passed
-   * one still fails the Route closed.
+   * Every passed skippable head is already fast-forwarded
+   * (`fastForwardPlannerRouteProgress()` runs after every route action and on
+   * the initial state), so this is the lane head itself; calculation schema
+   * 11..18 also kept a skippable head behind a checkpoint pin, which Issue #100
+   * removed (`docs/PLANNER_SPEC.md` 20.10). A holding unit still makes its
+   * position wait, and a passed one still fails the Route closed.
    */
   private laneFrontierUnit(
     lanes: PlannerEntryLanes,
@@ -478,8 +468,7 @@ export class PlannerDeterministicScheduleRun {
    * the Counter already passed, or a lane head whose source weapon is gone,
    * protected, or superseded (`plannerRouteUnitSourceRejection()`, the
    * precondition the unit meets when it actually runs). A passed skippable
-   * unit is never a reason, pin-blocked or not: it is fast-forwarded once its
-   * progress may move.
+   * unit is never a reason: it is fast-forwarded.
    */
   private laneHeadRejection(entry: BuildListEntry): PlannerSearchRejection | null {
     const lanes = this.lanesOf(entry)
@@ -522,10 +511,7 @@ export class PlannerDeterministicScheduleRun {
       context.selectedPhysicalActionKeysByConflictId,
       (entryId) => {
         const selected = this.context.entriesById.get(entryId)
-        return (
-          selected !== undefined &&
-          entryIsRelevantForState(this.state, selected, this.context.checkpointRequirements)
-        )
+        return selected !== undefined && entryIsRelevantForState(this.state, selected)
       },
     )
   }
@@ -557,9 +543,7 @@ export class PlannerDeterministicScheduleRun {
           pendingNormalCounterIds.add(unit.counterId)
         }
       })
-      // Each lane's unit at or ahead of the current Counter: a pin-blocked
-      // skippable head the Counter passed does not hide the holding unit
-      // behind it (`laneFrontierUnit()`).
+      // Each lane's unit at or ahead of the current Counter (`laneFrontierUnit()`).
       const heads = (['base', 'bonus', 'skill'] as const).flatMap((lane) => {
         const unit = this.laneFrontierUnit(lanes, progress, lane)
         return unit === undefined ? [] : [unit]
@@ -572,9 +556,6 @@ export class PlannerDeterministicScheduleRun {
           continue
         }
         if (currentPlannerCounterValue(this.state, unit) !== unit.counterBefore) continue
-        // A pin-blocked skippable unit is neither holding nor ready: another
-        // Entry's ready unit may consume this position, and the Entry's own
-        // progress waits at the pin (5, 7.3).
         const holding = isPlannerLaneUnitHolding(unit)
         const frontier = frontiers.get(streamKey) ?? []
         frontier.push({ entry, unit, holding, ready: this.isReady(entry, unit, next) })
@@ -646,25 +627,11 @@ export class PlannerDeterministicScheduleRun {
     const maxTargetPriority = Math.max(
       ...progressedEntries.map(({ entry }) => targetsById.get(entry.targetWeaponId)?.priority ?? 0),
     )
-    const addsImprovementPreferenceViolation = progressedEntries.some(({ entry, unit }) => {
-      const lanes = this.lanesOf(entry)
-      return (
-        lanes !== undefined &&
-        isPlannerImprovementPreferenceViolation(
-          this.state,
-          entry,
-          lanes,
-          this.progressOf(entry),
-          unit,
-        )
-      )
-    })
     const subject = plannerWeaponOperationSubjectKey(primary.unit.entryId, primary.unit.operation)
     const last = this.state.lastWeaponOperationSubjectKey
     const addsWeaponSwitch = subject !== null && last !== null && last !== subject
     const current = currentPlannerCounterValue(this.state, primary.unit)
-    // The executor Entry's next holding unit on this stream; whether a pin
-    // blocks it now is not part of the distance (7.7 key 4).
+    // The executor Entry's next holding unit on this stream (7.7 key 4).
     const nextHolding =
       kind === 'executor'
         ? this.remainingUnitsOf(primary.entry).find(
@@ -690,7 +657,6 @@ export class PlannerDeterministicScheduleRun {
       progressedUnits,
       orderKey: {
         maxTargetPriority,
-        addsImprovementPreferenceViolation,
         addsWeaponSwitch,
         executorHoldingDistance,
         minRemainingPendingUnits: Math.min(
@@ -752,7 +718,6 @@ export class PlannerDeterministicScheduleRun {
         this.state,
         this.context.entriesById,
         this.context.allLanePlans,
-        this.context.checkpointRequirements,
       ).find(({ id }) => this.statusOf(id) === 'committed')
       if (entry === undefined) return true
       if (!this.reserve(entry)) return false
@@ -764,7 +729,7 @@ export class PlannerDeterministicScheduleRun {
     for (const entry of this.committedEntries()) {
       const lanes = this.lanesOf(entry)
       if (lanes === undefined || lanes.unitCount !== 0) continue
-      if (!entryIsRelevantForState(this.state, entry, this.context.checkpointRequirements)) continue
+      if (!entryIsRelevantForState(this.state, entry)) continue
       if (!this.reserve(entry)) return false
     }
     return true
@@ -788,7 +753,9 @@ export class PlannerDeterministicScheduleRun {
       entry,
       target,
       this.reserveActionContext,
-      { mode: 'in_place' },
+      // A unitless Entry is a zero-operation Candidate (one `initialize()` could
+      // not confirm within the bound): its reserve is the confirmation.
+      { mode: 'in_place', zeroOperationConfirm: isPlannerZeroOperationEntry(entry, this.lanesOf(entry)) },
     )
     if (applied.rejection !== null) {
       this.metrics?.expectDrop('reserve_rejected')
@@ -927,30 +894,13 @@ export class PlannerDeterministicScheduleRun {
   }
 
   /**
-   * The rejections this schedule reports: every recorded one, plus
-   * `candidate_already_satisfied` for each Entry that is still `released`
-   * now - its Target was satisfied by another Entry (8.4). The released state
-   * is projected only here, from the final commitment, so an Entry that was
-   * released and later committed again carries no stale rejection.
+   * The rejections this schedule reports: every recorded one, in stable order.
+   * Calculation schema 11..19 also projected `candidate_already_satisfied` for
+   * each Entry still `released` here; there is no release any more (Issue #334
+   * PR-3, `docs/PLANNER_SPEC.md` 21.5).
    */
   private finalRejections(): PlannerSearchRejection[] {
-    const rejections = [...this.rejections]
-    const keys = new Set(this.rejectionKeys)
-    this.commitmentRecords()
-      .filter(({ status }) => status === 'released')
-      .forEach(({ buildListEntryId }) =>
-        appendUniquePlannerRejection(
-          rejections,
-          keys,
-          createPlannerSearchRejection(
-            buildListEntryId,
-            'reserve_weapon',
-            'candidate_already_satisfied',
-            'The Target already holds an Ideal weapon.',
-          ),
-        ),
-      )
-    return sortPlannerRejections(rejections)
+    return sortPlannerRejections([...this.rejections])
   }
 
   /**
@@ -960,8 +910,8 @@ export class PlannerDeterministicScheduleRun {
    * or none. "Excluded" is route commitment's own record - an Entry dropped
    * with `conflict_resolution_not_selected` because an applied resolution
    * selected another participant - never re-derived from participant lists.
-   * Such a conflict no longer needs a decision, checkpoint participants or not:
-   * an excluded Entry runs no unit, its checkpoint endpoint included. A decided
+   * Such a conflict no longer needs a decision: an excluded Entry runs no
+   * unit. A decided
    * conflict stays as the record of the decision. Without resolutions nothing is
    * excluded and every conflict is reported.
    */
@@ -1016,7 +966,6 @@ export class PlannerDeterministicScheduleRun {
       targetsById: this.context.planningTargetsById,
       routeUnitCountByEntryId: this.context.routeUnitCountByEntryId,
       conflictCountByEntryId: plannerConflictCountByEntryId(conflicts),
-      checkpointRequirements: this.context.checkpointRequirements,
     })
     return {
       bestState: this.state,
@@ -1032,7 +981,6 @@ export class PlannerDeterministicScheduleRun {
       termination: createPlannerRunTermination({
         options: this.input.options,
         planningTargetIds: this.context.planningTargetIds,
-        checkpointRequirements: this.context.checkpointRequirements,
         bestState: this.state,
         expandedStates: this.expandedStates,
         cancelled,
@@ -1091,7 +1039,6 @@ export function createPlannerDeterministicScheduleRun(
         termination: createPlannerRunTermination({
           options: input.options,
           planningTargetIds: context.planningTargetIds,
-          checkpointRequirements: context.checkpointRequirements,
           bestState: context.initialState,
           expandedStates: 0,
           cancelled: false,

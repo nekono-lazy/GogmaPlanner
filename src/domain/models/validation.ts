@@ -11,7 +11,6 @@ import type {
 } from './common'
 import {
   APP_SETTINGS_SCHEMA_VERSION,
-  CURRENT_CALCULATION_APP_SCHEMA_VERSION,
   currentExecutionActions,
   legacyExecutionActions,
   productionPlanAbandonmentReasons,
@@ -21,8 +20,6 @@ import {
 import { stableStringify } from './hashing'
 import { improvementPreferences, targetWeaponLifecycleStatuses } from './entities'
 import type {
-  AlternativeBonusRule,
-  PracticalBonusCondition,
   BuildCandidate,
   BuildListEntry,
   BuildRoute,
@@ -33,11 +30,20 @@ import type {
   SkillCondition,
   TargetWeapon,
 } from './entities'
+import { completionConditionReviewReasons } from './common'
+import type {
+  LegacyAlternativeBonusRule,
+  LegacyPracticalBonusCondition,
+  LegacySkillCondition,
+  LegacyTargetWeapon,
+} from './legacyTargetWeapon'
+import { hasCompletionConditionTargetField, hasLegacyTargetWeaponField } from './legacyTargetWeapon'
 import { isBlindCreateNormalArtianOperation } from './entities'
 import type {
   ActualResult,
   ExecutionHistory,
   ExecutionSavePoint,
+  ExecutionUndoSnapshot,
   ExpectedPlanState,
   PlanStep,
   PlanStepExecutionEffects,
@@ -48,6 +54,7 @@ import {
   executionSavePointIdForPlan,
   rejectedBuildListEntryResourceConflictCauses,
 } from './planning'
+import type { ProductionPlanUndoState } from './productionPlanUndoState'
 import {
   areRestorationBonusSetsEqual,
   areRestorationBonusSlotsEqual,
@@ -180,6 +187,10 @@ export function validateKnownValue<T>(
   known: KnownValue<T>,
 ): DomainValidationResult {
   const issues: DomainValidationIssue[] = []
+  if (!isPlainObject(known)) {
+    addIssue(issues, '', 'invalid_structure', 'KnownValue must be an object.')
+    return result(issues)
+  }
   if (
     known.source !== null &&
     !['manual', 'observation'].includes(known.source)
@@ -211,7 +222,7 @@ function validateCounterKnownValue(
   issues: DomainValidationIssue[],
 ) {
   appendIssues(issues, path, validateKnownValue(known))
-  if (known.value !== null) {
+  if (isPlainObject(known) && known.value !== null) {
     validateNonNegativeInteger(known.value, `${path}.value`, issues)
   }
 }
@@ -305,6 +316,9 @@ export function validateRestorationBonusSet(
       'RestorationBonusSet must contain exactly five entries.',
     )
   }
+  // A value that is not an array has no entries to read: it is reported, never
+  // walked as one.
+  if (!Array.isArray(bonuses)) return result(issues)
   bonuses.forEach((bonus, index) =>
     validateRestorationBonus(bonus, `[${index}]`, issues),
   )
@@ -385,8 +399,8 @@ function validateOwnedWeaponExecutionInProgress(
   }
 }
 
-function validateBonusCondition(
-  condition: PracticalBonusCondition, count: number, path: string, issues: DomainValidationIssue[],
+function validateLegacyBonusCondition(
+  condition: LegacyPracticalBonusCondition, count: number, path: string, issues: DomainValidationIssue[],
 ) {
   validateId(condition.id, path + '.id', issues)
   validateId(condition.bonusTypeId, path + '.bonusTypeId', issues)
@@ -397,8 +411,8 @@ function validateBonusCondition(
   if ('requiredCount' in condition) addIssue(issues, path, 'invalid_structure', '旧実用条件は再設定が必要です。')
 }
 
-function validateAlternativeRule(
-  rule: AlternativeBonusRule, count: number, path: string, issues: DomainValidationIssue[],
+function validateLegacyAlternativeRule(
+  rule: LegacyAlternativeBonusRule, count: number, path: string, issues: DomainValidationIssue[],
 ) {
   validateId(rule.id, path + '.id', issues)
   validateId(rule.sourceBonusTypeId, path + '.sourceBonusTypeId', issues)
@@ -412,6 +426,10 @@ function validateAlternativeRule(
   const seen = new Set<string>()
   rule.options.forEach((option, index) => {
     const optionPath = path + '.options[' + index + ']'
+    if (!isPlainObject(option)) {
+      addIssue(issues, optionPath, 'invalid_structure', '代替候補の形式が不正です。')
+      return
+    }
     validateId(option.alternativeBonusTypeId, optionPath + '.alternativeBonusTypeId', issues)
     validateId(option.minimumRankId, optionPath + '.minimumRankId', issues)
     if (option.alternativeBonusTypeId === rule.sourceBonusTypeId || seen.has(option.alternativeBonusTypeId)) {
@@ -424,20 +442,49 @@ function validateAlternativeRule(
   })
 }
 
+function validateSkillConditionIds(
+  condition: { seriesSkillId: unknown; groupSkillId: unknown },
+  path: string,
+  issues: DomainValidationIssue[],
+) {
+  if (condition.seriesSkillId !== null) {
+    validateId(condition.seriesSkillId as string, `${path}.seriesSkillId`, issues)
+  }
+  if (condition.groupSkillId !== null) {
+    validateId(condition.groupSkillId as string, `${path}.groupSkillId`, issues)
+  }
+}
+
+/** A completion Skill condition (`docs/DATA_MODEL.md` 8.4): `matchMode` is `all` only. */
 function validateSkillCondition(
   condition: SkillCondition,
   path: string,
   issues: DomainValidationIssue[],
 ) {
+  if (!isPlainObject(condition)) {
+    addIssue(issues, path, 'invalid_structure', 'Skill condition must be an object.')
+    return
+  }
+  if (condition.matchMode !== 'all') {
+    addIssue(issues, `${path}.matchMode`, 'invalid_literal', '完成スキル条件の一致方法は「すべて満たす（all）」だけです。')
+  }
+  validateSkillConditionIds(condition, path, issues)
+}
+
+/** A legacy Skill condition, where `any` still existed (migration input only). */
+function validateLegacySkillCondition(
+  condition: LegacySkillCondition,
+  path: string,
+  issues: DomainValidationIssue[],
+) {
+  if (!isPlainObject(condition)) {
+    addIssue(issues, path, 'invalid_structure', 'Skill condition must be an object.')
+    return
+  }
   if (!['all', 'any'].includes(condition.matchMode)) {
     addIssue(issues, `${path}.matchMode`, 'invalid_literal', 'Skill matchMode is invalid.')
   }
-  if (condition.seriesSkillId !== null) {
-    validateId(condition.seriesSkillId, `${path}.seriesSkillId`, issues)
-  }
-  if (condition.groupSkillId !== null) {
-    validateId(condition.groupSkillId, `${path}.groupSkillId`, issues)
-  }
+  validateSkillConditionIds(condition, path, issues)
 }
 
 /**
@@ -448,7 +495,7 @@ function validateSkillCondition(
  * default.
  */
 function validateTargetWeaponLifecycle(
-  target: TargetWeapon,
+  target: TargetWeapon | LegacyTargetWeapon,
   issues: DomainValidationIssue[],
 ) {
   if (!(targetWeaponLifecycleStatuses as readonly unknown[]).includes(target.lifecycleStatus)) {
@@ -478,10 +525,37 @@ function validateTargetWeaponLifecycle(
   }
 }
 
-export function validateTargetWeapon(
+/**
+ * The structure of the completion assignment (`docs/DATA_MODEL.md` 8.7): an
+ * `active` Target holds `null`, a `completed` Target an `OwnedWeaponId` or
+ * `null` ("not recorded", completed before the assignment existed). The field
+ * is required - a body without it is not a current (Dexie 13 / Export 16)
+ * body. Whether the weapon exists and is assigned to no other Target needs the
+ * collections, so it belongs to `validateTargetCompletionAssignments()`. A
+ * legacy (schema 18) body never carries the field and is not checked here.
+ */
+function validateTargetCompletionAssignmentField(
   target: TargetWeapon,
-): DomainValidationResult {
-  const issues: DomainValidationIssue[] = []
+  issues: DomainValidationIssue[],
+) {
+  const record = target as unknown as Record<string, unknown>
+  if (!('completedWithOwnedWeaponId' in record) || record.completedWithOwnedWeaponId === undefined) {
+    addIssue(issues, 'completedWithOwnedWeaponId', 'invalid_structure', 'completedWithOwnedWeaponId must be null or an OwnedWeapon ID.')
+    return
+  }
+  const assigned = target.completedWithOwnedWeaponId
+  if (assigned === null) return
+  if (target.lifecycleStatus !== 'completed') {
+    addIssue(issues, 'completedWithOwnedWeaponId', 'invalid_state', 'An active Target cannot have completedWithOwnedWeaponId.')
+    return
+  }
+  validateId(assigned, 'completedWithOwnedWeaponId', issues)
+}
+
+function validateTargetWeaponCommon(
+  target: TargetWeapon | LegacyTargetWeapon,
+  issues: DomainValidationIssue[],
+) {
   validateId(target.id, 'id', issues)
   validateId(target.weaponTypeId, 'weaponTypeId', issues)
   validateId(target.elementId, 'elementId', issues)
@@ -495,30 +569,175 @@ export function validateTargetWeapon(
     validateId(target.preferredOwnedWeaponId, 'preferredOwnedWeaponId', issues)
   }
   validateTargetWeaponLifecycle(target, issues)
+}
+
+function normalizedCompletionVariantKey(slots: readonly unknown[]): string {
+  return stableStringify(
+    slots
+      .map((slot) => {
+        const record = slot as Record<string, unknown>
+        return stableStringify({ bonusTypeId: record.bonusTypeId, minimumRankId: record.minimumRankId })
+      })
+      .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0)),
+  )
+}
+
+/**
+ * Structural validation of the completion bonus Variants (`docs/DATA_MODEL.md`
+ * 8.2): one or more Variants, each with a non-empty editing `id` and exactly
+ * five slots of a bonus type and a minimum rank, and no two Variants with the
+ * same normalized form (slot order and `id` never matter). The same `(type,
+ * minimum)` may fill several slots of one Variant. No Variant count cap exists.
+ * Inclusion between Variants needs the Master rank order and belongs to
+ * `validateTargetCompletionConditions()`.
+ */
+function validateCompletionBonusVariants(variants: unknown, issues: DomainValidationIssue[]) {
+  if (!Array.isArray(variants) || variants.length === 0) {
+    addIssue(issues, 'completionBonusVariants', 'invalid_structure', '完成ボーナス構成を1件以上設定してください。')
+    return
+  }
+  const seenKeys = new Map<string, number>()
+  const seenIds = new Set<string>()
+  variants.forEach((variant: unknown, index) => {
+    const path = `completionBonusVariants[${index}]`
+    if (!isPlainObject(variant)) {
+      addIssue(issues, path, 'invalid_structure', '完成ボーナス構成の形式が不正です。')
+      return
+    }
+    if (!isNonEmptyString(variant.id)) {
+      addIssue(issues, `${path}.id`, 'invalid_id', '完成ボーナス構成のIDが不正です。')
+    } else if (seenIds.has(variant.id)) {
+      addIssue(issues, `${path}.id`, 'invalid_id', '完成ボーナス構成のIDが重複しています。')
+    } else {
+      seenIds.add(variant.id)
+    }
+    const slots: unknown = variant.slots
+    if (!Array.isArray(slots) || slots.length !== 5) {
+      addIssue(issues, `${path}.slots`, 'invalid_structure', '完成ボーナス構成は5枠を指定してください。')
+      return
+    }
+    let slotsValid = true
+    slots.forEach((slot: unknown, slotIndex) => {
+      const slotPath = `${path}.slots[${slotIndex}]`
+      if (!isPlainObject(slot)) {
+        addIssue(issues, slotPath, 'invalid_structure', '完成ボーナス構成の枠の形式が不正です。')
+        slotsValid = false
+        return
+      }
+      const before = issues.length
+      validateId(slot.bonusTypeId as string, `${slotPath}.bonusTypeId`, issues)
+      validateId(slot.minimumRankId as string, `${slotPath}.minimumRankId`, issues)
+      if (issues.length !== before) slotsValid = false
+    })
+    if (!slotsValid) return
+    const key = normalizedCompletionVariantKey(slots)
+    const duplicateOf = seenKeys.get(key)
+    if (duplicateOf !== undefined) {
+      addIssue(issues, path, 'invalid_structure', `完成構成${index + 1}は完成構成${duplicateOf + 1}と同じ内容です（枠の順番だけが異なる構成は登録できません）。`)
+    } else {
+      seenKeys.set(key, index)
+    }
+  })
+}
+
+function validateCompletionConditionReview(review: unknown, issues: DomainValidationIssue[]) {
+  if (!Array.isArray(review)) {
+    addIssue(issues, 'completionConditionReview', 'invalid_structure', 'completionConditionReview must be an array.')
+    return
+  }
+  const known: readonly unknown[] = completionConditionReviewReasons
+  review.forEach((reason: unknown, index) => {
+    if (!known.includes(reason)) {
+      addIssue(issues, `completionConditionReview[${index}]`, 'invalid_literal', 'Unknown completion condition review reason.')
+    }
+  })
+  if (new Set(review).size !== review.length) {
+    addIssue(issues, 'completionConditionReview', 'invalid_structure', 'completionConditionReview reasons must not repeat.')
+  }
+}
+
+/**
+ * Structural validation of a TargetWeapon (`docs/DATA_MODEL.md` 8): identity,
+ * priority, lifecycle, the completion Variants, the completion Skill condition
+ * (`all` only) and the review reasons. A body still carrying a legacy field
+ * (`idealBonuses`, the compromise conditions, `compromiseNeedsReview`) is not a
+ * current body and is refused rather than read. A non-empty review list is
+ * still a valid Target: valid and calculable are separate concepts (8.6).
+ */
+export function validateTargetWeapon(
+  target: TargetWeapon,
+): DomainValidationResult {
+  const issues: DomainValidationIssue[] = []
+  if (!isPlainObject(target)) {
+    addIssue(issues, '', 'invalid_structure', 'TargetWeapon must be an object.')
+    return result(issues)
+  }
+  validateTargetWeaponCommon(target, issues)
+  validateTargetCompletionAssignmentField(target, issues)
+  if (hasLegacyTargetWeaponField(target as unknown as Record<string, unknown>)) {
+    addIssue(issues, '', 'invalid_structure', '旧形式の目標武器（理想5枠・妥協条件）は移行が必要です。')
+  }
+  validateCompletionBonusVariants(target.completionBonusVariants, issues)
+  validateSkillCondition(target.completionSkillCondition, 'completionSkillCondition', issues)
+  validateCompletionConditionReview(target.completionConditionReview, issues)
+  return result(issues)
+}
+
+/**
+ * The structural validation of a legacy (calculation schema 18 / Dexie 11 /
+ * Export 14) Target body - the rule `validateTargetWeapon()` applied before
+ * Issue #100. Only the ExecutionHistory conversion of legacy data (the Dexie
+ * version(11) upgrade and the Export schema 13 -> 14 migration) reads it, for
+ * the Target bodies inside the records it converts; those bodies are migrated
+ * to the current shape by the next step.
+ */
+export function validateLegacyTargetWeapon(
+  target: LegacyTargetWeapon,
+): DomainValidationResult {
+  const issues: DomainValidationIssue[] = []
+  if (!isPlainObject(target)) {
+    addIssue(issues, '', 'invalid_structure', 'TargetWeapon must be an object.')
+    return result(issues)
+  }
+  validateTargetWeaponCommon(target, issues)
+  if (hasCompletionConditionTargetField(target as unknown as Record<string, unknown>)) {
+    addIssue(issues, '', 'invalid_structure', 'A legacy Target body cannot carry a completion condition field.')
+  }
   appendIssues(issues, 'idealBonuses', validateRestorationBonusSet(target.idealBonuses))
   if (!Array.isArray(target.practicalBonusConditions) || !Array.isArray(target.alternativeBonusRules) || 'practicalAlternativeGroups' in target) {
     addIssue(issues, 'alternativeBonusRules', 'invalid_structure', '旧条件または不正な妥協条件です。移行・再設定が必要です。')
     return result(issues)
   }
-  const idealCount = (type: string) => target.idealBonuses.filter((bonus) => bonus.bonusTypeId === type).length
+  // An Ideal that is not an array was reported above; it holds no type to count.
+  const idealBonuses: readonly unknown[] = Array.isArray(target.idealBonuses) ? target.idealBonuses : []
+  const idealCount = (type: string) =>
+    idealBonuses.filter((bonus) => isPlainObject(bonus) && bonus.bonusTypeId === type).length
   const practicalTypes = new Set<string>()
   target.practicalBonusConditions.forEach((condition, index) => {
     const path = 'practicalBonusConditions[' + index + ']'
+    if (!isPlainObject(condition)) {
+      addIssue(issues, path, 'invalid_structure', '実用条件の形式が不正です。')
+      return
+    }
     const count = idealCount(condition.bonusTypeId)
     if (count === 0 || practicalTypes.has(condition.bonusTypeId)) addIssue(issues, path, 'invalid_structure', '理想に含まれる種類を重複なく設定してください。')
     practicalTypes.add(condition.bonusTypeId)
-    validateBonusCondition(condition, count, path, issues)
+    validateLegacyBonusCondition(condition, count, path, issues)
   })
   const sources = new Set<string>()
   target.alternativeBonusRules.forEach((rule, index) => {
     const path = 'alternativeBonusRules[' + index + ']'
+    if (!isPlainObject(rule)) {
+      addIssue(issues, path, 'invalid_structure', '代替条件の形式が不正です。')
+      return
+    }
     const count = idealCount(rule.sourceBonusTypeId)
     if (count === 0 || sources.has(rule.sourceBonusTypeId)) addIssue(issues, path, 'invalid_structure', '元ボーナスは理想に含まれる種類を重複なく設定してください。')
     sources.add(rule.sourceBonusTypeId)
-    validateAlternativeRule(rule, count, path, issues)
+    validateLegacyAlternativeRule(rule, count, path, issues)
   })
-  validateSkillCondition(target.idealSkillCondition, 'idealSkillCondition', issues)
-  validateSkillCondition(target.practicalSkillCondition, 'practicalSkillCondition', issues)
+  validateLegacySkillCondition(target.idealSkillCondition, 'idealSkillCondition', issues)
+  validateLegacySkillCondition(target.practicalSkillCondition, 'practicalSkillCondition', issues)
   return result(issues)
 }
 
@@ -1180,32 +1399,20 @@ function routeLaneOperationIndexes(route: BuildRoute): {
 }
 
 /**
- * Strict intermediate state shape validation (`docs/SEARCH_SPEC.md` 5.8).
+ * Strict intermediate state shape validation (`docs/SEARCH_SPEC.md` 5.8, a
+ * historical record).
  *
- * Every Candidate generated under the current `CalculationContext` carries
- * `intermediateStateGroups`. A Candidate persisted before the field existed is
- * left alone rather than rewritten, so an absent field is an issue only at the
- * current calculation schema version.
+ * Issue #100 abolished the intermediate states: calculation schema 19 and
+ * later Candidates carry no `intermediateStateGroups`, and a historical
+ * Candidate's groups are kept as they are. The structure is validated only
+ * when the field is present (`docs/DATA_MODEL.md` 9.1).
  */
 function validateCandidateIntermediateStateGroups(
   candidate: BuildCandidate,
   issues: DomainValidationIssue[],
 ): void {
   const groups = candidate.intermediateStateGroups
-  if (groups === undefined) {
-    if (
-      candidate.calculationContext.appSchemaVersion ===
-      CURRENT_CALCULATION_APP_SCHEMA_VERSION
-    ) {
-      addIssue(
-        issues,
-        'intermediateStateGroups',
-        'invalid_state',
-        'A current-schema Candidate must carry its intermediate state groups.',
-      )
-    }
-    return
-  }
+  if (groups === undefined) return
   const lanes = routeLaneOperationIndexes(candidate.route)
   const bonusGroupIds = new Set(
     groups.filter(({ axis }) => axis === 'bonus').map(({ id }) => id),
@@ -1507,6 +1714,25 @@ function firstStepStartsFromPlanStart(plan: ProductionPlan): boolean {
     first.normalCountersHash === initial.normalCountersHash &&
     first.ownedWeaponsHash === initial.ownedWeaponsHash
   )
+}
+
+/**
+ * The first calculation schema whose Planner completes a planning Target only
+ * through its own Entry's secured weapon, one physically distinct weapon per
+ * Target (Issue #334 PR-3, `docs/PLANNER_SPEC.md` 21.5). From it on, the
+ * `targetCompletions[].ownedWeaponId` of a Plan are distinct across the whole
+ * Plan. A Plan of an earlier schema - which the zero-operation confirmation
+ * could make complete two Targets with one weapon (21.4.1) - keeps its exact
+ * persisted shape and is never failed by this rule: it fails closed at the
+ * CalculationContext boundary, and the completion assignment safety judges it
+ * before any execution.
+ */
+export const COMPLETION_WEAPON_UNIQUENESS_APP_SCHEMA_VERSION = 20
+
+export function isCompletionWeaponUniquenessProductionPlan(
+  plan: Pick<ProductionPlan, 'calculationContext'>,
+): boolean {
+  return plan.calculationContext.appSchemaVersion >= COMPLETION_WEAPON_UNIQUENESS_APP_SCHEMA_VERSION
 }
 
 /** Whether a persisted Plan claims the current Execution Plan contract. */
@@ -1913,10 +2139,126 @@ export function validatePlannerConflictRepairLineage(
   return result(issues.map((issue) => ({ ...issue, path: issue.path.replace(/^\./, '') })))
 }
 
+/** Whether an array holds an object at every index; a hole is no object. */
+function isArrayOfPlainObjects(value: unknown): value is Record<string, unknown>[] {
+  if (!Array.isArray(value)) return false
+  for (let index = 0; index < value.length; index += 1) {
+    if (!Object.prototype.hasOwnProperty.call(value, index) || !isPlainObject(value[index])) return false
+  }
+  return true
+}
+
+function validateCalculationContextStructure(value: unknown, path: string, issues: DomainValidationIssue[]) {
+  if (!isPlainObject(value)) {
+    addIssue(issues, path, 'invalid_structure', 'CalculationContext must be an object.')
+    return
+  }
+  for (const field of ['gameVersion', 'rngEngineVersion'] as const) {
+    if (typeof value[field] !== 'string') {
+      addIssue(issues, `${path}.${field}`, 'invalid_structure', `${field} must be a string.`)
+    }
+  }
+}
+
+/** An ExpectedPlanState holds hash strings only, so it is serializable for the chain comparison. */
+function validateExpectedPlanStateStructure(value: unknown, path: string, issues: DomainValidationIssue[]) {
+  if (!isPlainObject(value)) {
+    addIssue(issues, path, 'invalid_structure', 'An expected state must be an object.')
+    return
+  }
+  Object.keys(value).forEach((field) => {
+    if (typeof value[field] !== 'string') {
+      addIssue(issues, `${path}.${field}`, 'invalid_structure', 'An expected state holds hash strings only.')
+    }
+  })
+}
+
+function validateArrayOfObjectsStructure(value: unknown, path: string, issues: DomainValidationIssue[]) {
+  if (!isArrayOfPlainObjects(value)) {
+    addIssue(issues, path, 'invalid_structure', `${path} must be an array of objects.`)
+  }
+}
+
+function validatePlanStepStructure(step: Record<string, unknown>, path: string, issues: DomainValidationIssue[]) {
+  validateExpectedPlanStateStructure(step.expectedStateBefore, `${path}.expectedStateBefore`, issues)
+  validateExpectedPlanStateStructure(step.expectedStateAfter, `${path}.expectedStateAfter`, issues)
+  if (!isPlainObject(step.rngAdvance)) {
+    addIssue(issues, `${path}.rngAdvance`, 'invalid_structure', 'rngAdvance must be an object.')
+  }
+  // A legacy Step carries no executionEffects; a present value is read below.
+  const effects = step.executionEffects
+  if (effects !== undefined && effects !== null) {
+    if (!isPlainObject(effects)) {
+      addIssue(issues, `${path}.executionEffects`, 'invalid_structure', 'executionEffects must be an object.')
+    } else {
+      for (const field of ['targetLinks', 'compromiseLabels', 'targetCompletions'] as const) {
+        validateArrayOfObjectsStructure(effects[field], `${path}.executionEffects.${field}`, issues)
+      }
+      if (effects.observationBinding !== null && !isPlainObject(effects.observationBinding)) {
+        addIssue(issues, `${path}.executionEffects.observationBinding`, 'invalid_structure', 'observationBinding must be null or an object.')
+      }
+    }
+  }
+  const inventoryChange = step.inventoryChange
+  if (inventoryChange !== undefined && inventoryChange !== null) {
+    if (!isPlainObject(inventoryChange)) {
+      addIssue(issues, `${path}.inventoryChange`, 'invalid_structure', 'inventoryChange must be null or an object.')
+    } else {
+      validateArrayOfObjectsStructure(inventoryChange.materialRequirements, `${path}.inventoryChange.materialRequirements`, issues)
+    }
+  }
+}
+
+/**
+ * The structure `validateProductionPlan()` reads before it can judge a Plan:
+ * the containers it walks and the values it calls a method on. Every Plan the
+ * application writes, of any calculation schema, has it, so it finds nothing
+ * on any of them and the Plan validation runs exactly as before. A corrupted
+ * body - read back from storage, an Import or the Plan inside a game save
+ * point - is reported here with the path of what is wrong instead of letting a
+ * TypeError escape from the validation.
+ */
+function validateProductionPlanStructure(plan: unknown, issues: DomainValidationIssue[]) {
+  if (!isPlainObject(plan)) {
+    addIssue(issues, '', 'invalid_structure', 'ProductionPlan must be an object.')
+    return
+  }
+  validateCalculationContextStructure(plan.calculationContext, 'calculationContext', issues)
+  const snapshot = plan.baseSnapshot
+  if (!isPlainObject(snapshot)) {
+    addIssue(issues, 'baseSnapshot', 'invalid_structure', 'baseSnapshot must be an object.')
+  } else {
+    validateCalculationContextStructure(snapshot.calculationContext, 'baseSnapshot.calculationContext', issues)
+    validateExpectedPlanStateStructure(snapshot.initialExecutionState, 'baseSnapshot.initialExecutionState', issues)
+  }
+  if (!isArrayOfPlainObjects(plan.steps)) {
+    addIssue(issues, 'steps', 'invalid_structure', 'steps must be an array of PlanStep objects.')
+  } else {
+    plan.steps.forEach((step, index) => validatePlanStepStructure(step, `steps[${index}]`, issues))
+  }
+  validateArrayOfObjectsStructure(plan.requiredMaterials, 'requiredMaterials', issues)
+  if (!isArrayOfPlainObjects(plan.conflicts)) {
+    addIssue(issues, 'conflicts', 'invalid_structure', 'conflicts must be an array of objects.')
+  } else {
+    plan.conflicts.forEach((conflict, index) => {
+      if (!Array.isArray(conflict.buildListEntryIds)) {
+        addIssue(issues, `conflicts[${index}].buildListEntryIds`, 'invalid_structure', 'buildListEntryIds must be an array.')
+      }
+    })
+  }
+  if (!Array.isArray(plan.selectedBuildListEntryIds)) {
+    addIssue(issues, 'selectedBuildListEntryIds', 'invalid_structure', 'selectedBuildListEntryIds must be an array.')
+  }
+  validateArrayOfObjectsStructure(plan.rejectedBuildListEntries, 'rejectedBuildListEntries', issues)
+}
+
 export function validateProductionPlan(
   plan: ProductionPlan,
 ): DomainValidationResult {
   const issues: DomainValidationIssue[] = []
+  // Nothing below is safe to read from a body without this structure.
+  validateProductionPlanStructure(plan, issues)
+  if (issues.length > 0) return result(issues)
   validateId(plan.id, 'id', issues)
   if (!['draft', 'active', 'completed', 'stale', 'abandoned'].includes(plan.status)) {
     addIssue(issues, 'status', 'invalid_literal', 'ProductionPlan status is invalid.')
@@ -1968,6 +2310,14 @@ export function validateProductionPlan(
     )
     if (new Set(completedEntries).size !== completedEntries.length) {
       addIssue(issues, 'steps', 'invalid_state', 'A BuildListEntry completes its Target at most once.')
+    }
+    if (isCompletionWeaponUniquenessProductionPlan(plan)) {
+      const completedWeapons = plan.steps.flatMap((step) =>
+        step.executionEffects?.targetCompletions.map(({ ownedWeaponId }) => ownedWeaponId) ?? [],
+      )
+      if (new Set(completedWeapons).size !== completedWeapons.length) {
+        addIssue(issues, 'steps', 'invalid_state', 'An OwnedWeapon completes at most one Target in a Plan.')
+      }
     }
     const productionTargets = plan.steps.flatMap((step) =>
       step.executionEffects?.registersTrackedWeapon === true && step.executionEffects.trackedOwnedWeaponId !== null
@@ -2089,11 +2439,10 @@ function validateActualResult(
  * than staling it - but that shape is the runtime's, not an additional
  * validation contract.
  */
-function validateExecutionActionRecord(
-  history: ExecutionHistory,
+function validateExecutionActionRecordFields(
+  history: Pick<ExecutionHistory, 'action' | 'wasExpected' | 'recalculationReason' | 'actualResult'>,
   issues: DomainValidationIssue[],
 ) {
-  const snapshot = history.undoSnapshot
   switch (history.action) {
     case 'confirmed_expected':
       if (!history.wasExpected) {
@@ -2126,14 +2475,6 @@ function validateExecutionActionRecord(
       if (history.actualResult !== null) {
         addIssue(issues, 'actualResult', 'invalid_state', 'operation_uncertain records no actual result.')
       }
-      if (
-        snapshot.affectedOwnedWeaponsBefore.length > 0 ||
-        snapshot.addedOwnedWeaponIds.length > 0 ||
-        snapshot.removedOwnedWeaponsBefore.length > 0 ||
-        snapshot.affectedTargetWeaponsBefore.length > 0
-      ) {
-        addIssue(issues, 'undoSnapshot', 'invalid_state', 'operation_uncertain changes no OwnedWeapon or TargetWeapon.')
-      }
       break
     case 'operation_count_recovered':
       if (!history.wasExpected) {
@@ -2156,8 +2497,39 @@ function validateExecutionActionRecord(
           addIssue(issues, 'actualResult', 'invalid_state', 'operation_count_recovered observes either five slots or Skills, not both.')
         }
       }
-      if (snapshot.removedOwnedWeaponsBefore.length > 0) {
-        addIssue(issues, 'undoSnapshot.removedOwnedWeaponsBefore', 'invalid_state', 'operation_count_recovered removes no OwnedWeapon.')
+      break
+    default:
+      break
+  }
+}
+
+/**
+ * The OwnedWeapon / TargetWeapon collections of one record that an action's
+ * record shape constrains, as one stored part holds them: the
+ * `docs/DATA_MODEL.md` 12.2 metadata holds the added weapons and its Undo body
+ * the rest.
+ */
+interface ExecutionActionEntitySets {
+  changedEntities: readonly (readonly unknown[])[]
+  changedEntitiesPath: string
+  removedOwnedWeapons: readonly unknown[] | null
+  removedOwnedWeaponsPath: string
+}
+
+function validateExecutionActionEntitySets(
+  action: ExecutionHistory['action'],
+  sets: ExecutionActionEntitySets,
+  issues: DomainValidationIssue[],
+) {
+  switch (action) {
+    case 'operation_uncertain':
+      if (sets.changedEntities.some((entities) => entities.length > 0)) {
+        addIssue(issues, sets.changedEntitiesPath, 'invalid_state', 'operation_uncertain changes no OwnedWeapon or TargetWeapon.')
+      }
+      break
+    case 'operation_count_recovered':
+      if (sets.removedOwnedWeapons !== null && sets.removedOwnedWeapons.length > 0) {
+        addIssue(issues, sets.removedOwnedWeaponsPath, 'invalid_state', 'operation_count_recovered removes no OwnedWeapon.')
       }
       break
     default:
@@ -2165,10 +2537,129 @@ function validateExecutionActionRecord(
   }
 }
 
+/**
+ * Validates each entity of a snapshot array with its own validator. An element
+ * that is not an object (a hole included) is reported as it is, never read as
+ * an entity.
+ */
+function appendEntityIssues<T>(
+  issues: DomainValidationIssue[],
+  path: string,
+  entities: readonly T[],
+  validate: (entity: T) => DomainValidationResult,
+) {
+  for (let index = 0; index < entities.length; index += 1) {
+    const entity: unknown = entities[index]
+    if (!Object.prototype.hasOwnProperty.call(entities, index) || !isPlainObject(entity)) {
+      addIssue(issues, `${path}[${index}]`, 'invalid_structure', 'A snapshot entity must be an object.')
+      continue
+    }
+    appendIssues(issues, `${path}[${index}]`, validate(entity as T))
+  }
+}
+
+/** The IDs of the entities of a snapshot array that are objects. */
+function entityIds(entities: readonly unknown[]): unknown[] {
+  return entities.filter(isPlainObject).map(({ id }) => id)
+}
+
+const STABLE_VALUE_HASH_PATTERN = /^fnv1a32:[0-9a-f]{8}$/
+
+function validateStableValueHash(value: unknown, path: string, issues: DomainValidationIssue[]) {
+  if (typeof value !== 'string' || !STABLE_VALUE_HASH_PATTERN.test(value)) {
+    addIssue(issues, path, 'invalid_structure', 'A Plan undo hash must be a hashStableValue() result.')
+  }
+}
+
+function validateNullableDateTime(value: unknown, path: string, issues: DomainValidationIssue[]) {
+  if (value !== null && !isNonEmptyString(value)) {
+    addIssue(issues, path, 'invalid_structure', `${path} must be null or an ISO date-time string.`)
+  }
+}
+
+/**
+ * Structural validation of the Plan state a record keeps for its Undo
+ * (`docs/DATA_MODEL.md` 12.2): the two hash forms, the seven execution fields
+ * with their literals and date-times, and the changed Steps without a repeated
+ * Step. Whether the hashes match a Plan, and whether the changed Steps are
+ * Steps of it in Plan order, is the Undo's reconstruction
+ * (`reconstructProductionPlanFromUndoState()`), never this validation.
+ */
+export function validateProductionPlanUndoState(
+  state: ProductionPlanUndoState,
+): DomainValidationResult {
+  const issues: DomainValidationIssue[] = []
+  if (!isPlainObject(state)) {
+    addIssue(issues, '', 'invalid_structure', 'A Plan undo state must be an object.')
+    return result(issues)
+  }
+  validateStableValueHash(state.planContentHash, 'planContentHash', issues)
+  validateStableValueHash(state.executionStateHash, 'executionStateHash', issues)
+  const plan: unknown = state.plan
+  if (!isPlainObject(plan)) {
+    addIssue(issues, 'plan', 'invalid_structure', 'The Plan execution fields must be an object.')
+  } else {
+    if (!['draft', 'active', 'completed', 'stale', 'abandoned'].includes(plan.status as string)) {
+      addIssue(issues, 'plan.status', 'invalid_literal', 'ProductionPlan status is invalid.')
+    }
+    if (plan.currentStepId !== null) validateId(plan.currentStepId as string, 'plan.currentStepId', issues)
+    if (!Array.isArray(plan.recalculationReasons) || plan.recalculationReasons.some((reason) => !isNonEmptyString(reason))) {
+      addIssue(issues, 'plan.recalculationReasons', 'invalid_structure', 'recalculationReasons must be an array of reasons.')
+    }
+    if (plan.abandonmentReason !== null && !(productionPlanAbandonmentReasons as readonly unknown[]).includes(plan.abandonmentReason)) {
+      addIssue(issues, 'plan.abandonmentReason', 'invalid_literal', 'ProductionPlan abandonmentReason is invalid.')
+    }
+    validateNullableDateTime(plan.abandonedAt, 'plan.abandonedAt', issues)
+    validateNullableDateTime(plan.completedAt, 'plan.completedAt', issues)
+    if (!isNonEmptyString(plan.updatedAt)) {
+      addIssue(issues, 'plan.updatedAt', 'invalid_structure', 'plan.updatedAt must be an ISO date-time string.')
+    }
+  }
+  const changedSteps: unknown = state.changedSteps
+  if (!Array.isArray(changedSteps)) {
+    addIssue(issues, 'changedSteps', 'invalid_structure', 'changedSteps must be an array.')
+    return result(issues)
+  }
+  const seen = new Set<unknown>()
+  changedSteps.forEach((step: unknown, index) => {
+    const path = `changedSteps[${index}]`
+    if (!isPlainObject(step)) {
+      addIssue(issues, path, 'invalid_structure', 'A changed PlanStep must be an object.')
+      return
+    }
+    validateId(step.stepId as string, `${path}.stepId`, issues)
+    if (typeof step.isCompleted !== 'boolean') {
+      addIssue(issues, `${path}.isCompleted`, 'invalid_structure', 'isCompleted must be a boolean.')
+    }
+    validateNullableDateTime(step.completedAt, `${path}.completedAt`, issues)
+    if (seen.has(step.stepId)) {
+      addIssue(issues, `${path}.stepId`, 'invalid_id', 'changedSteps must not repeat a PlanStep.')
+    }
+    seen.add(step.stepId)
+  })
+  return result(issues)
+}
+
+/**
+ * Validation of one `docs/DATA_MODEL.md` 12.2 metadata record on its own, with
+ * no Undo body: the IDs, the action literal and its record shape, the
+ * date-time, the actual result, and the added OwnedWeapon IDs. A record of the
+ * Dexie version 10 shape (`LegacyExecutionHistory`) - holding an
+ * `undoSnapshot`, or no `addedOwnedWeaponIds` - fails it, which is how a record
+ * the version 11 upgrade could not convert is told apart without reading any
+ * Undo body (`docs/DATA_MODEL.md` 14.2).
+ */
 export function validateExecutionHistory(
   history: ExecutionHistory,
 ): DomainValidationResult {
   const issues: DomainValidationIssue[] = []
+  if (!isPlainObject(history)) {
+    addIssue(issues, '', 'invalid_structure', 'ExecutionHistory metadata must be an object.')
+    return result(issues)
+  }
+  if ('undoSnapshot' in history) {
+    addIssue(issues, 'undoSnapshot', 'invalid_structure', 'ExecutionHistory metadata holds no undoSnapshot.')
+  }
   validateId(history.id, 'id', issues)
   validateId(history.planId, 'planId', issues)
   validateId(history.planStepId, 'planStepId', issues)
@@ -2179,73 +2670,318 @@ export function validateExecutionHistory(
   if (!isNonEmptyString(history.createdAt)) {
     addIssue(issues, 'createdAt', 'invalid_structure', 'createdAt must be an ISO date-time string.')
   }
-  if (history.actualResult !== null) validateActualResult(history.actualResult, 'actualResult', issues)
-  const snapshot = history.undoSnapshot
-  // The Execution lifecycle Undo snapshot shape. A snapshot without the Target
-  // or save point fields predates it and cannot restore a Step exactly, so it
-  // is never read as "no Target changed" or "no save point existed".
-  if (
-    typeof snapshot !== 'object' || snapshot === null ||
-    !Array.isArray(snapshot.normalCountersBefore) ||
-    !Array.isArray(snapshot.affectedOwnedWeaponsBefore) ||
-    !Array.isArray(snapshot.addedOwnedWeaponIds) ||
-    !Array.isArray(snapshot.removedOwnedWeaponsBefore) ||
-    !Array.isArray(snapshot.affectedTargetWeaponsBefore) ||
-    snapshot.executionSavePointBefore === undefined ||
-    typeof snapshot.rngStateBefore !== 'object' || snapshot.rngStateBefore === null ||
-    typeof snapshot.productionPlanBefore !== 'object' || snapshot.productionPlanBefore === null
-  ) {
-    addIssue(issues, 'undoSnapshot', 'invalid_structure', 'ExecutionUndoSnapshot is incomplete.')
-    return result(issues)
+  if (typeof history.wasExpected !== 'boolean') {
+    addIssue(issues, 'wasExpected', 'invalid_structure', 'wasExpected must be a boolean.')
   }
-  appendIssues(issues, 'undoSnapshot.rngStateBefore', validateRngState(snapshot.rngStateBefore))
-  snapshot.normalCountersBefore.forEach((counter, index) =>
-    appendIssues(issues, `undoSnapshot.normalCountersBefore[${index}]`, validateNormalArtianCounter(counter)),
-  )
-  snapshot.affectedOwnedWeaponsBefore.forEach((weapon, index) =>
-    appendIssues(issues, `undoSnapshot.affectedOwnedWeaponsBefore[${index}]`, validateOwnedWeapon(weapon)),
-  )
-  snapshot.removedOwnedWeaponsBefore.forEach((weapon, index) =>
-    appendIssues(issues, `undoSnapshot.removedOwnedWeaponsBefore[${index}]`, validateOwnedWeapon(weapon)),
-  )
-  snapshot.affectedTargetWeaponsBefore.forEach((target, index) =>
-    appendIssues(issues, `undoSnapshot.affectedTargetWeaponsBefore[${index}]`, validateTargetWeapon(target)),
-  )
-  appendIssues(issues, 'undoSnapshot.productionPlanBefore', validateProductionPlan(snapshot.productionPlanBefore))
-  if (history.planId !== snapshot.productionPlanBefore.id) {
-    addIssue(issues, 'planId', 'inconsistent_snapshot', 'History planId must match productionPlanBefore.id.')
+  if (history.recalculationReason !== null && !isNonEmptyString(history.recalculationReason)) {
+    addIssue(issues, 'recalculationReason', 'invalid_structure', 'recalculationReason must be null or a reason.')
   }
-  if (snapshot.executionSavePointBefore !== null) {
-    appendIssues(issues, 'undoSnapshot.executionSavePointBefore', validateExecutionSavePoint(snapshot.executionSavePointBefore))
-    if (snapshot.executionSavePointBefore.productionPlanId !== history.planId) {
-      addIssue(issues, 'undoSnapshot.executionSavePointBefore.productionPlanId', 'inconsistent_snapshot', 'The save point snapshot must belong to the history Plan.')
+  if (history.actualResult !== null) {
+    if (!isPlainObject(history.actualResult)) {
+      addIssue(issues, 'actualResult', 'invalid_structure', 'actualResult must be null or an object.')
+    } else {
+      validateActualResult(history.actualResult, 'actualResult', issues)
     }
   }
-  validateExecutionActionRecord(history, issues)
+  if (!Array.isArray(history.addedOwnedWeaponIds)) {
+    addIssue(issues, 'addedOwnedWeaponIds', 'invalid_structure', 'addedOwnedWeaponIds must be an array.')
+    return result(issues)
+  }
+  for (let index = 0; index < history.addedOwnedWeaponIds.length; index += 1) {
+    // A hole is no ID and is reported like one.
+    validateId(history.addedOwnedWeaponIds[index], `addedOwnedWeaponIds[${index}]`, issues)
+  }
+  if (new Set(history.addedOwnedWeaponIds).size !== history.addedOwnedWeaponIds.length) {
+    addIssue(issues, 'addedOwnedWeaponIds', 'invalid_id', 'Undo OwnedWeapon IDs must be unique within their role.')
+  }
+  if (history.actualResult === null || isPlainObject(history.actualResult)) {
+    validateExecutionActionRecordFields(history, issues)
+  }
+  validateExecutionActionEntitySets(history.action, {
+    changedEntities: [history.addedOwnedWeaponIds],
+    changedEntitiesPath: 'addedOwnedWeaponIds',
+    removedOwnedWeapons: null,
+    removedOwnedWeaponsPath: '',
+  }, issues)
   if (!history.wasExpected && history.recalculationReason === null) {
     addIssue(issues, 'recalculationReason', 'invalid_state', 'Unexpected execution requires a recalculation reason.')
   }
-  const affected = new Set(snapshot.affectedOwnedWeaponsBefore.map(({ id }) => id))
-  const added = new Set(snapshot.addedOwnedWeaponIds)
-  const removed = new Set(snapshot.removedOwnedWeaponsBefore.map(({ id }) => id))
+  return result(issues)
+}
+
+/**
+ * Validation of one `docs/DATA_MODEL.md` 12.2 Undo body on its own: the
+ * entities it restores, the Plan undo state and the deleted game save point,
+ * and that it holds no ProductionPlan body of its own.
+ */
+/**
+ * How the Target bodies an Execution record or a save point carries are
+ * validated. The default is the current `validateTargetWeapon()`; only the
+ * ExecutionHistory conversion of legacy data (Dexie version(11), Export schema
+ * 13 -> 14), whose bodies are still the legacy shape the next migration step
+ * converts, passes `validateLegacyTargetWeapon()`.
+ */
+export interface TargetBodyValidationOptions {
+  validateTargetBody?: (target: TargetWeapon) => DomainValidationResult
+}
+
+export function validateExecutionUndoSnapshot(
+  snapshot: ExecutionUndoSnapshot,
+  options: TargetBodyValidationOptions = {},
+): DomainValidationResult {
+  const issues: DomainValidationIssue[] = []
+  if (!isPlainObject(snapshot)) {
+    addIssue(issues, '', 'invalid_structure', 'ExecutionUndoSnapshot must be an object.')
+    return result(issues)
+  }
+  if ('productionPlanBefore' in snapshot || 'executionSavePointBefore' in snapshot) {
+    addIssue(issues, '', 'invalid_structure', 'An ExecutionUndoSnapshot of this shape holds no Plan or save point before the Step.')
+  }
+  validateId(snapshot.executionHistoryId, 'executionHistoryId', issues)
+  if (
+    !Array.isArray(snapshot.normalCountersBefore) ||
+    !Array.isArray(snapshot.affectedOwnedWeaponsBefore) ||
+    !Array.isArray(snapshot.removedOwnedWeaponsBefore) ||
+    !Array.isArray(snapshot.affectedTargetWeaponsBefore) ||
+    !isPlainObject(snapshot.rngStateBefore) ||
+    !isPlainObject(snapshot.productionPlanStateBefore) ||
+    (snapshot.deletedExecutionSavePoint !== null && !isPlainObject(snapshot.deletedExecutionSavePoint))
+  ) {
+    addIssue(issues, '', 'invalid_structure', 'ExecutionUndoSnapshot is incomplete.')
+    return result(issues)
+  }
+  appendIssues(issues, 'rngStateBefore', validateRngState(snapshot.rngStateBefore))
+  appendEntityIssues(issues, 'normalCountersBefore', snapshot.normalCountersBefore, validateNormalArtianCounter)
+  appendEntityIssues(issues, 'affectedOwnedWeaponsBefore', snapshot.affectedOwnedWeaponsBefore, validateOwnedWeapon)
+  appendEntityIssues(issues, 'removedOwnedWeaponsBefore', snapshot.removedOwnedWeaponsBefore, validateOwnedWeapon)
+  appendEntityIssues(issues, 'affectedTargetWeaponsBefore', snapshot.affectedTargetWeaponsBefore, options.validateTargetBody ?? validateTargetWeapon)
+  const hasDuplicates = (ids: readonly unknown[]) => new Set(ids).size !== ids.length
+  if (
+    hasDuplicates(entityIds(snapshot.affectedOwnedWeaponsBefore)) ||
+    hasDuplicates(entityIds(snapshot.removedOwnedWeaponsBefore))
+  ) {
+    addIssue(issues, '', 'invalid_id', 'Undo OwnedWeapon IDs must be unique within their role.')
+  }
+  if (hasDuplicates(entityIds(snapshot.affectedTargetWeaponsBefore))) {
+    addIssue(issues, 'affectedTargetWeaponsBefore', 'invalid_id', 'Undo TargetWeapon IDs must be unique.')
+  }
+  appendIssues(issues, 'productionPlanStateBefore', validateProductionPlanUndoState(snapshot.productionPlanStateBefore))
+  if (snapshot.deletedExecutionSavePoint !== null) {
+    appendIssues(issues, 'deletedExecutionSavePoint', validateExecutionSavePoint(snapshot.deletedExecutionSavePoint, options))
+  }
+  return result(issues)
+}
+
+/**
+ * Validation of one `docs/DATA_MODEL.md` 12.2 record - its metadata and its
+ * Undo body together: each on its own, the body belonging to the metadata,
+ * a deleted save point of the record's own Plan, the action record shape
+ * across both (`operation_uncertain` changes no entity, `operation_count_recovered`
+ * removes none), and the three OwnedWeapon roles never overlapping. Metadata
+ * issues are reported under `executionHistory`, body issues under
+ * `executionUndoSnapshot`.
+ */
+export function validateExecutionRecord(
+  history: ExecutionHistory,
+  snapshot: ExecutionUndoSnapshot,
+  options: TargetBodyValidationOptions = {},
+): DomainValidationResult {
+  const metadata = validateExecutionHistory(history)
+  const body = validateExecutionUndoSnapshot(snapshot, options)
+  const issues: DomainValidationIssue[] = []
+  appendIssues(issues, 'executionHistory', metadata)
+  appendIssues(issues, 'executionUndoSnapshot', body)
+  if (!isPlainObject(history) || !isPlainObject(snapshot)) return result(issues)
+  if (snapshot.executionHistoryId !== history.id) {
+    addIssue(issues, 'executionUndoSnapshot.executionHistoryId', 'inconsistent_snapshot', 'The Undo body must belong to the ExecutionHistory.')
+  }
+  const savePoint: unknown = snapshot.deletedExecutionSavePoint
+  if (isPlainObject(savePoint) && savePoint.productionPlanId !== history.planId) {
+    addIssue(issues, 'executionUndoSnapshot.deletedExecutionSavePoint.productionPlanId', 'inconsistent_snapshot', 'The deleted save point must belong to the history Plan.')
+  }
+  if (
+    !Array.isArray(history.addedOwnedWeaponIds) ||
+    !Array.isArray(snapshot.affectedOwnedWeaponsBefore) ||
+    !Array.isArray(snapshot.removedOwnedWeaponsBefore) ||
+    !Array.isArray(snapshot.affectedTargetWeaponsBefore)
+  ) {
+    return result(issues)
+  }
+  validateExecutionActionEntitySets(history.action, {
+    changedEntities: [snapshot.affectedOwnedWeaponsBefore, snapshot.removedOwnedWeaponsBefore, snapshot.affectedTargetWeaponsBefore],
+    changedEntitiesPath: 'executionUndoSnapshot',
+    removedOwnedWeapons: snapshot.removedOwnedWeaponsBefore,
+    removedOwnedWeaponsPath: 'executionUndoSnapshot.removedOwnedWeaponsBefore',
+  }, issues)
+  const affected = new Set(entityIds(snapshot.affectedOwnedWeaponsBefore))
+  const added = new Set<unknown>(history.addedOwnedWeaponIds)
+  const removed = new Set(entityIds(snapshot.removedOwnedWeaponsBefore))
   const overlaps = [...affected].some((id) => added.has(id) || removed.has(id)) || [...added].some((id) => removed.has(id))
   if (overlaps) {
-    addIssue(issues, 'undoSnapshot', 'invalid_state', 'Undo OwnedWeapon roles must not overlap.')
+    addIssue(issues, '', 'invalid_state', 'Undo OwnedWeapon roles must not overlap.')
   }
-  const hasDuplicates = (ids: readonly string[]) => new Set(ids).size !== ids.length
-  if (
-    hasDuplicates(snapshot.affectedOwnedWeaponsBefore.map(({ id }) => id)) ||
-    hasDuplicates(snapshot.addedOwnedWeaponIds) ||
-    hasDuplicates(snapshot.removedOwnedWeaponsBefore.map(({ id }) => id))
-  ) {
-    addIssue(issues, 'undoSnapshot', 'invalid_id', 'Undo OwnedWeapon IDs must be unique within their role.')
+  return result(issues)
+}
+
+/**
+ * Collection validation of `docs/DATA_MODEL.md` 12.2 records against their
+ * Plans: every metadata record has exactly one Undo body and every Undo body
+ * exactly one metadata record (no repeated ID on either side), each changed
+ * Step is a Step of the record's Plan in Plan order, and a Plan has at most one
+ * record holding a deleted save point. Each record on its own is
+ * `validateExecutionRecord()`; this checks only how they relate.
+ */
+export function validateExecutionHistoryReferences(
+  histories: readonly ExecutionHistory[],
+  snapshots: readonly ExecutionUndoSnapshot[],
+  productionPlans: readonly Pick<ProductionPlan, 'id' | 'steps'>[],
+): DomainValidationResult {
+  const issues: DomainValidationIssue[] = []
+  const historyById = new Map<string, ExecutionHistory>()
+  histories.forEach((history, index) => {
+    if (!isPlainObject(history)) {
+      addIssue(issues, `executionHistory[${index}]`, 'invalid_structure', 'ExecutionHistory metadata must be an object.')
+      return
+    }
+    if (historyById.has(history.id)) {
+      addIssue(issues, `executionHistory[${index}].id`, 'invalid_id', 'ExecutionHistory IDs must be unique.')
+    }
+    historyById.set(history.id, history)
+  })
+  const snapshotIds = new Set<string>()
+  const savePointRecordPlans = new Set<string>()
+  const stepOrderByPlan = new Map<string, Map<string, number>>()
+  const stepOrderOf = (plan: Pick<ProductionPlan, 'id' | 'steps'>) => {
+    let order = stepOrderByPlan.get(plan.id)
+    if (!order) {
+      order = new Map(plan.steps.map(({ id }, index) => [id, index]))
+      stepOrderByPlan.set(plan.id, order)
+    }
+    return order
   }
-  if (hasDuplicates(snapshot.affectedTargetWeaponsBefore.map(({ id }) => id))) {
-    addIssue(issues, 'undoSnapshot.affectedTargetWeaponsBefore', 'invalid_id', 'Undo TargetWeapon IDs must be unique.')
+  const planById = new Map(productionPlans.map((plan) => [plan.id, plan]))
+  snapshots.forEach((snapshot, index) => {
+    const path = `executionUndoSnapshots[${index}]`
+    if (!isPlainObject(snapshot)) {
+      addIssue(issues, path, 'invalid_structure', 'ExecutionUndoSnapshot must be an object.')
+      return
+    }
+    if (snapshotIds.has(snapshot.executionHistoryId)) {
+      addIssue(issues, `${path}.executionHistoryId`, 'invalid_id', 'An ExecutionHistory has at most one Undo body.')
+      return
+    }
+    snapshotIds.add(snapshot.executionHistoryId)
+    const history = historyById.get(snapshot.executionHistoryId)
+    if (!history) {
+      addIssue(issues, `${path}.executionHistoryId`, 'invalid_reference', 'An Undo body must belong to an existing ExecutionHistory.')
+      return
+    }
+    if (snapshot.deletedExecutionSavePoint !== null) {
+      if (savePointRecordPlans.has(history.planId)) {
+        addIssue(issues, `${path}.deletedExecutionSavePoint`, 'invalid_state', 'A ProductionPlan has at most one record holding a deleted save point.')
+      }
+      savePointRecordPlans.add(history.planId)
+    }
+    const plan = planById.get(history.planId)
+    if (!plan) {
+      addIssue(issues, `${path}.executionHistoryId`, 'invalid_reference', 'The ExecutionHistory Plan must exist.')
+      return
+    }
+    const changedSteps: unknown = snapshot.productionPlanStateBefore?.changedSteps
+    if (!Array.isArray(changedSteps)) return
+    const order = stepOrderOf(plan)
+    let previous = -1
+    changedSteps.forEach((step: unknown, stepIndex: number) => {
+      // A changed Step that is not an object is the record validation's issue.
+      if (!isPlainObject(step)) return
+      const at = order.get(step.stepId as ProductionPlanUndoState['changedSteps'][number]['stepId'])
+      if (at === undefined) {
+        addIssue(issues, `${path}.productionPlanStateBefore.changedSteps[${stepIndex}].stepId`, 'invalid_reference', 'A changed PlanStep must be a PlanStep of the record Plan.')
+        return
+      }
+      if (at <= previous) {
+        addIssue(issues, `${path}.productionPlanStateBefore.changedSteps[${stepIndex}].stepId`, 'invalid_state', 'changedSteps must follow the Plan order.')
+      }
+      previous = at
+    })
+  })
+  histories.forEach((history, index) => {
+    if (isPlainObject(history) && !snapshotIds.has(history.id)) {
+      addIssue(issues, `executionHistory[${index}].id`, 'invalid_reference', 'An ExecutionHistory must have its Undo body.')
+    }
+  })
+  return result(issues)
+}
+
+/** Runs one validation over untrusted structure, reporting a throw as an issue at `path`. */
+function containedIssues(path: string, validate: () => DomainValidationIssue[]): DomainValidationIssue[] {
+  try {
+    return validate()
+  } catch {
+    return [{ path, code: 'invalid_structure', message: `${path} has a malformed nested structure.` }]
   }
-  snapshot.addedOwnedWeaponIds.forEach((id, index) =>
-    validateId(id, `undoSnapshot.addedOwnedWeaponIds[${index}]`, issues),
-  )
+}
+
+function prefixedIssues(prefix: string, nested: DomainValidationResult): DomainValidationIssue[] {
+  return nested.issues.map((issue) => ({ ...issue, path: issue.path ? `${prefix}.${issue.path}` : prefix }))
+}
+
+/**
+ * Validation of a whole ExecutionHistory record collection (`docs/DATA_MODEL.md`
+ * 12.2 / 14.6 / 15.2): each metadata record and each Undo body on its own,
+ * each pair together (`validateExecutionRecord()`), and how they relate
+ * (`validateExecutionHistoryReferences()`: 1:1 with no repeated ID on either
+ * side, the changed Steps of the record's Plan in Plan order, at most one
+ * deleted save point per Plan). A metadata record with no Undo body, an Undo
+ * body with no metadata record and a malformed body are all issues; nothing is
+ * filled in or left out. No hash is compared and no Plan is rebuilt: that is
+ * the Undo's (`docs/PLANNER_SPEC.md` 19.5).
+ *
+ * The one authority for "the records are complete": Export / Import validate a
+ * root with it, and the OwnedWeapon delete reference check refuses to decide
+ * from records it rejects. Issues are reported under `executionHistory[i]` and
+ * `executionUndoSnapshots[j]`, the indexes of the given collections.
+ */
+export function validateExecutionRecordCollection(
+  histories: readonly ExecutionHistory[],
+  snapshots: readonly ExecutionUndoSnapshot[],
+  productionPlans: readonly Pick<ProductionPlan, 'id' | 'steps'>[],
+): DomainValidationResult {
+  const issues: DomainValidationIssue[] = []
+  const bodyIndexById = new Map<unknown, number>()
+  snapshots.forEach((body, index) => {
+    const id: unknown = isPlainObject(body) ? body.executionHistoryId : undefined
+    if (id !== undefined && !bodyIndexById.has(id)) bodyIndexById.set(id, index)
+  })
+  const pairedBodies = new Set<number>()
+  histories.forEach((history, index) => {
+    const path = `executionHistory[${index}]`
+    const bodyIndex = isPlainObject(history) ? bodyIndexById.get(history.id) : undefined
+    if (bodyIndex === undefined || pairedBodies.has(bodyIndex)) {
+      issues.push(...containedIssues(path, () => prefixedIssues(path, validateExecutionHistory(history))))
+      return
+    }
+    pairedBodies.add(bodyIndex)
+    const bodyPath = `executionUndoSnapshots[${bodyIndex}]`
+    // `validateExecutionRecord()` reports the metadata under `executionHistory`
+    // and the body under `executionUndoSnapshot`; each goes back to its own
+    // collection path.
+    const relocate = (issuePath: string): string => {
+      if (issuePath.startsWith('executionUndoSnapshot')) return `${bodyPath}${issuePath.slice('executionUndoSnapshot'.length)}`
+      if (issuePath.startsWith('executionHistory')) return `${path}${issuePath.slice('executionHistory'.length)}`
+      return issuePath ? `${path}.${issuePath}` : path
+    }
+    issues.push(...containedIssues(path, () =>
+      validateExecutionRecord(history, snapshots[bodyIndex]).issues
+        .map((issue) => ({ ...issue, path: relocate(issue.path) }))))
+  })
+  snapshots.forEach((body, index) => {
+    if (pairedBodies.has(index)) return
+    const path = `executionUndoSnapshots[${index}]`
+    issues.push(...containedIssues(path, () => prefixedIssues(path, validateExecutionUndoSnapshot(body))))
+  })
+  issues.push(...containedIssues('executionHistory', () =>
+    validateExecutionHistoryReferences(histories, snapshots, productionPlans).issues))
   return result(issues)
 }
 
@@ -2259,6 +2995,7 @@ export function validateExecutionHistory(
  */
 export function validateExecutionSavePoint(
   savePoint: ExecutionSavePoint,
+  options: TargetBodyValidationOptions = {},
 ): DomainValidationResult {
   const issues: DomainValidationIssue[] = []
   validateId(savePoint.id, 'id', issues)
@@ -2286,23 +3023,17 @@ export function validateExecutionSavePoint(
     return result(issues)
   }
   appendIssues(issues, 'rngState', validateRngState(savePoint.rngState))
-  savePoint.normalCounters.forEach((counter, index) =>
-    appendIssues(issues, `normalCounters[${index}]`, validateNormalArtianCounter(counter)),
-  )
-  savePoint.ownedWeapons.forEach((weapon, index) =>
-    appendIssues(issues, `ownedWeapons[${index}]`, validateOwnedWeapon(weapon)),
-  )
-  savePoint.targetWeapons.forEach((target, index) =>
-    appendIssues(issues, `targetWeapons[${index}]`, validateTargetWeapon(target)),
-  )
-  const hasDuplicates = (ids: readonly string[]) => new Set(ids).size !== ids.length
-  if (hasDuplicates(savePoint.normalCounters.map(({ id }) => id))) {
+  appendEntityIssues(issues, 'normalCounters', savePoint.normalCounters, validateNormalArtianCounter)
+  appendEntityIssues(issues, 'ownedWeapons', savePoint.ownedWeapons, validateOwnedWeapon)
+  appendEntityIssues(issues, 'targetWeapons', savePoint.targetWeapons, options.validateTargetBody ?? validateTargetWeapon)
+  const hasDuplicates = (ids: readonly unknown[]) => new Set(ids).size !== ids.length
+  if (hasDuplicates(entityIds(savePoint.normalCounters))) {
     addIssue(issues, 'normalCounters', 'invalid_id', 'Snapshot NormalArtianCounter IDs must be unique.')
   }
-  if (hasDuplicates(savePoint.ownedWeapons.map(({ id }) => id))) {
+  if (hasDuplicates(entityIds(savePoint.ownedWeapons))) {
     addIssue(issues, 'ownedWeapons', 'invalid_id', 'Snapshot OwnedWeapon IDs must be unique.')
   }
-  if (hasDuplicates(savePoint.targetWeapons.map(({ id }) => id))) {
+  if (hasDuplicates(entityIds(savePoint.targetWeapons))) {
     addIssue(issues, 'targetWeapons', 'invalid_id', 'Snapshot TargetWeapon IDs must be unique.')
   }
   appendIssues(issues, 'productionPlan', validateProductionPlan(savePoint.productionPlan))

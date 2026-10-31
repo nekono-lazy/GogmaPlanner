@@ -4,7 +4,7 @@ import type {
 } from '../../models/publicTypes'
 import { isBlindCreateNormalArtianOperation } from '../../models/publicTypes'
 import type { RngEngine } from '../../rng/rngEngine'
-import { evaluateSkillCondition, satisfiesIdealBonuses } from '../../target'
+import { evaluateSkillCondition, satisfiesCompletionBonuses } from '../../target'
 import { createTargetBonusStream } from '../bonusStream'
 import { countRouteOperationUnits } from '../candidateFactory'
 import { createSearchPredictionSupport } from '../searchPredictionSupport'
@@ -201,13 +201,13 @@ export async function visitConstrainedCandidates(
     normalPredictions: new Map<number, RestorationBonusSet>(),
     // SEARCH_SPEC 5.6.1 continuation rules, evaluated with the shared Target
     // Domain authority. A stream whose current state already satisfies the
-    // Ideal condition contributes only its zero-operation solution, which
+    // completion condition contributes only its zero-operation solution, which
     // occupies no Counter position and therefore cannot conflict.
     bonusesSatisfyIdeal: (bonuses, scope) =>
-      satisfiesIdealBonuses(target, bonuses, scope, origin.master),
+      satisfiesCompletionBonuses(target, bonuses, scope, origin.master),
     skillsSatisfyIdeal: (seriesSkillId, groupSkillId) =>
       evaluateSkillCondition(
-        target.idealSkillCondition,
+        target.completionSkillCondition,
         seriesSkillId,
         groupSkillId,
       ),

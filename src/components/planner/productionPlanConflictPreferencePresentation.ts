@@ -32,7 +32,7 @@ export interface ConflictPreferenceNotice {
 
 const UNCHANGED = '表示中の生産計画は変更していません。'
 const NEXT_STEPS =
-  '優先する候補を選び直すか、作成リストで候補（途中採用する状態を含む）を見直してください。作成リスト画面の「生産計画を作成」から作り直すこともできます。'
+  '優先する候補を選び直すか、作成リストで候補を見直してください。作成リスト画面の「生産計画を作成」から作り直すこともできます。'
 
 function joinNames(names: readonly string[]): string {
   return names.map((name) => `「${name}」`).join('、')
@@ -63,11 +63,6 @@ export function presentConflictDecisionRefusal(
         title: '現在の状態が変化したため、この候補を優先できませんでした',
         messages: ['作成リスト・目標武器・状態のいずれかが変わり、この競合または候補が現在の入力にありません。', UNCHANGED],
       }
-    case 'checkpoint_conflict':
-      return {
-        title: 'この競合には途中採用する状態の選択が関係しています',
-        messages: ['作成リストで途中採用する状態を変更または解除してください。', UNCHANGED],
-      }
     case 'inconsistent_decision_set':
       return {
         title: '以前の選択どうしが矛盾しているため、計算を開始しませんでした',
@@ -92,13 +87,11 @@ const notCarriedReasonText: Record<PlannerConflictDecisionNotCarriedReason, stri
   conflict_not_current: '現在の入力にその競合がありません',
   entry_not_participant: 'その候補が現在の競合に含まれていません',
   entry_not_valid: 'その候補が現在の計画対象から外れています',
-  checkpoint_conflict: '途中採用する状態の選択が関係するようになりました',
 }
 
 const supersededReasonText: Record<PlannerConflictDecisionSupersededReason, string> = {
   selected_entry_not_preferred: '今回の選択で、その候補は作成しない候補になります',
   preferred_entry_was_excluded: '今回優先する候補を、その選択では作成しない候補にしていました',
-  checkpoint_participant_restored: '途中採用する状態の選択が関係するようになりました',
 }
 
 export interface ConflictPreferenceConfirmation {
@@ -130,10 +123,6 @@ function incompleteCauseText(
       return '計画の途中で手順が行き詰まり、作成を続けられませんでした。'
     case 'execution_precondition_failed':
       return '実行の前提（抽選位置や所持武器の状態など）が満たせなくなりました。'
-    case 'checkpoint_not_reached':
-      return '選択した途中採用する状態に届きません。'
-    case 'satisfied_by_other_entry':
-      return '別の候補の武器でこの目標武器の条件を満たすため、この候補では作成しません。'
     case 'inconsistent_completion_record':
     case 'unknown':
       return '完成できません。'
@@ -188,6 +177,8 @@ export function presentConflictPreferenceSaveRefusal(caught: unknown): string {
       case 'planner_result_invalid':
       case 'validation_failed':
         return '保存前の確認で、この計算結果が保存できる条件を満たしていないことが分かりました。表示中の生産計画は変更していません。'
+      case 'plan_completion_assignment_conflict':
+        return 'この選択では、1本の所持武器を2件の目標武器の完成品にする計画になるため、保存しませんでした。表示中の生産計画は変更していません。作成リストで同じ所持武器を起点にする候補を見直すか、一方の目標武器を「この武器で目標を完了にする」で完了にしてください。'
       case 'transaction_failed':
         return '保存処理が完了しませんでした。表示中の生産計画は変更していません。'
       default:

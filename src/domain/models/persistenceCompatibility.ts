@@ -155,3 +155,56 @@ export function fillProductionPlanConflictRepairLineage(plan: Record<string, unk
   plan[CONFLICT_REPAIR_LINEAGE_FIELD] = null
   return true
 }
+
+/** The completion assignment field every TargetWeapon body carries since Dexie v13 / Export 16 (Issue #334). */
+export const TARGET_COMPLETION_ASSIGNMENT_FIELD = 'completedWithOwnedWeaponId'
+
+/**
+ * A Target body the completion assignment migration cannot fill: it is not an
+ * object, or it already carries the field and so is not a Dexie 12 / Export 15
+ * body. Nothing is guessed and nothing is overwritten.
+ */
+export class TargetCompletionAssignmentMigrationError extends Error {
+  readonly path: string
+  constructor(path: string, message: string) {
+    super(`${path}: ${message}`)
+    this.name = 'TargetCompletionAssignmentMigrationError'
+    this.path = path
+  }
+}
+
+function isRecordValue(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/**
+ * Gives one TargetWeapon body written before the completion assignment existed
+ * its `completedWithOwnedWeaponId = null` ("not recorded";
+ * `docs/DATA_MODEL.md` 8.7 / 14.2 / 15.1, `docs/PLANNER_SPEC.md` 21.3 / 21.9).
+ * A `completed` Target gets `null` too: the weapon that completed it is never
+ * inferred from `completedByProductionPlanId`, a Plan's `targetCompletions`, an
+ * owned Ideal weapon or a preference. Shared by the Dexie version(13) upgrade
+ * and the Export schema 15 -> 16 migration. Mutates the body in place; a body
+ * that is not an object or already carries the field throws.
+ */
+export function fillTargetWeaponCompletionAssignment(target: unknown, path: string): void {
+  if (!isRecordValue(target)) {
+    throw new TargetCompletionAssignmentMigrationError(path, 'A TargetWeapon body must be an object.')
+  }
+  if (TARGET_COMPLETION_ASSIGNMENT_FIELD in target) {
+    throw new TargetCompletionAssignmentMigrationError(path, 'A TargetWeapon body written before the completion assignment cannot carry completedWithOwnedWeaponId.')
+  }
+  target[TARGET_COMPLETION_ASSIGNMENT_FIELD] = null
+}
+
+/**
+ * `fillTargetWeaponCompletionAssignment()` over every body of a Target list in
+ * place (a save point's `targetWeapons`, an Undo body's
+ * `affectedTargetWeaponsBefore`). A non-array throws.
+ */
+export function fillTargetWeaponListCompletionAssignment(value: unknown, path: string): void {
+  if (!Array.isArray(value)) {
+    throw new TargetCompletionAssignmentMigrationError(path, 'A TargetWeapon body list must be an array.')
+  }
+  value.forEach((target: unknown, index) => fillTargetWeaponCompletionAssignment(target, `${path}[${index}]`))
+}

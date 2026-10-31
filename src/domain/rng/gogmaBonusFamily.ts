@@ -79,3 +79,21 @@ export function keepFamilyMultisetKey(
 ): string {
   return keepFamilyLayout(bonuses, master).sort().join('\u0000')
 }
+
+/**
+ * The Keep family multiset keys of every completion Variant of a Target
+ * (`docs/SEARCH_SPEC.md` 6.1.2, Issue #100): each Variant's five bonus types
+ * normalized to their Keep families and sorted. A minimum rank never enters, so
+ * two Variants differing only in rank share one key. A five-slot set whose own
+ * family multiset is not in this set can reach no Variant by Keep alone.
+ */
+export function completionVariantKeepFamilyMultisetKeys(
+  variants: readonly { slots: readonly { bonusTypeId: BonusTypeId }[] }[],
+  master: KeepFamilyMasterSubset,
+): Set<string> {
+  return new Set(
+    variants.map((variant) =>
+      variant.slots.map((slot) => keepFamilyBonusTypeId(slot.bonusTypeId, master)).sort().join('\u0000'),
+    ),
+  )
+}

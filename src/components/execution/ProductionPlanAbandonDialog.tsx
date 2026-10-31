@@ -16,6 +16,8 @@ import type {
   PlanAbandonSavePointDecision,
   ProductionPlanAbandonmentOptions,
 } from '../../domain/execution'
+import { SAVE_POINT_RESTORE_UNAVAILABLE_GUIDANCE } from './savePointRestoreUnavailablePresentation'
+import { SavePointRestoreUnavailableNotice } from './SavePointRestoreUnavailableNotice'
 
 type Phase = 'decide' | 'restore_confirm'
 
@@ -30,7 +32,9 @@ const actionSx = { minHeight: 44, width: { xs: '100%', sm: 'auto' } } as const
  * - No choice: the plain confirmation, then `savePointDecision = null`.
  * - Choice: 「現在地点を維持」 / 「最後のゲーム内セーブ地点へ戻す」 / 「キャンセル」.
  *   The restore first needs the user's confirmation that the game itself went
- *   back; the restore and the abandonment are then one runtime call.
+ *   back; the restore and the abandonment are then one runtime call. When the
+ *   inspection says the restore cannot run for this Plan (Issue #335), that
+ *   choice is disabled with its reason and 「現在地点を維持」 still abandons it.
  * 「キャンセル」 never calls anything.
  */
 export function ProductionPlanAbandonDialog({
@@ -52,6 +56,10 @@ export function ProductionPlanAbandonDialog({
   const [gameRestored, setGameRestored] = useState(false)
   const titleId = useId()
   const descriptionId = useId()
+  const restoreUnavailableId = useId()
+  const restoreUnavailable = options !== null && options.savePointChoiceRequired && !options.savePointRestore.restorable
+    ? options.savePointRestore.reason
+    : null
   const reset = () => {
     setPhase('decide')
     setGameRestored(false)
@@ -92,7 +100,7 @@ export function ProductionPlanAbandonDialog({
         </Button>
       </>
     )
-  } else if (options !== null && phase === 'decide') {
+  } else if (options !== null && (phase === 'decide' || restoreUnavailable !== null)) {
     content = (
       <>
         <Typography component="p" variant="body2">
@@ -103,9 +111,17 @@ export function ProductionPlanAbandonDialog({
             最後のゲーム内セーブ地点: {savePointPositionLabel}
           </Typography>
         )}
-        <Typography component="p" variant="body2" sx={{ mt: 1 }}>
-          「現在地点を維持」は現在のアプリ状態のまま、「最後のゲーム内セーブ地点へ戻す」はアプリ側もセーブ地点へ戻してから、作成プランを破棄します。
-        </Typography>
+        {restoreUnavailable === null ? (
+          <Typography component="p" variant="body2" sx={{ mt: 1 }}>
+            「現在地点を維持」は現在のアプリ状態のまま、「最後のゲーム内セーブ地点へ戻す」はアプリ側もセーブ地点へ戻してから、作成プランを破棄します。
+          </Typography>
+        ) : (
+          <SavePointRestoreUnavailableNotice
+            id={restoreUnavailableId}
+            reason={restoreUnavailable}
+            guidance={SAVE_POINT_RESTORE_UNAVAILABLE_GUIDANCE.abandonment}
+          />
+        )}
         <Box sx={{ mt: 1 }}>{explanation}</Box>
       </>
     )
@@ -125,8 +141,11 @@ export function ProductionPlanAbandonDialog({
         <Button
           variant="outlined"
           color="warning"
-          disabled={submitting}
-          onClick={() => setPhase('restore_confirm')}
+          disabled={submitting || restoreUnavailable !== null}
+          aria-describedby={restoreUnavailable === null ? undefined : restoreUnavailableId}
+          onClick={() => {
+            if (restoreUnavailable === null) setPhase('restore_confirm')
+          }}
           sx={{ minHeight: 44 }}
         >
           最後のゲーム内セーブ地点へ戻す
@@ -181,7 +200,7 @@ export function ProductionPlanAbandonDialog({
         <DialogContentText id={descriptionId} component="div">
           {content}
         </DialogContentText>
-        {options !== null && options.savePointChoiceRequired && phase === 'restore_confirm' && (
+        {options !== null && options.savePointChoiceRequired && restoreUnavailable === null && phase === 'restore_confirm' && (
           <FormControlLabel
             sx={{ mt: 1.5, alignItems: 'flex-start' }}
             control={

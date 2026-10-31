@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { MasterDataRoot } from '../../domain/master/masterTypes'
 import type { CalculationContext, ProductionPlan } from '../../domain/models/publicTypes'
-import type { PlannerOptions, PlannerResult } from '../../domain/planner'
+import type { PlannerOptions, PlannerResult, ProductionPlanCompletionAssignmentIssue } from '../../domain/planner'
+import { RepositoryError } from '../../db/repositoryError'
 import { createBuildListCalculationContext } from '../../services/buildList/createBuildListCalculationContext'
 import {
   buildListOptimizationAdoptionSourceOf,
@@ -20,6 +21,7 @@ import type { BuildListOptimizationAdoptionInspection } from '../../services/pla
 import {
   presentBuildListOptimizationAdoptionRefusal,
   type BuildListOptimizationAdoptionRefusalPresentation,
+  type PlanCreationPreStartView,
 } from './planCreationPresentation'
 
 /**
@@ -58,16 +60,29 @@ export interface BuildListPlanCreationDependencies {
   ): Promise<ProductionPlan>
 }
 
-/** The pre-start judgement shown before a press (`docs/UI_FLOW.md` 10.4). Display only. */
-export type PlanCreationPreStartState =
-  | { status: 'loading' }
-  | { status: 'ready'; preparation: PlanCreationPreparation }
+/**
+ * The pre-start judgement shown before a press (`docs/UI_FLOW.md` 10.4). Display only. While a re-judgement runs, `previous` keeps the
+ * last judged preparation for what must not flicker (the ordinary Planner settings, Issue #359); it is never shown as current, and it is
+ * dropped when a press that judged afresh and started nothing asks for the re-judgement (that press's judgement is newer).
+ */
+export type PlanCreationPreStartState = PlanCreationPreStartView
 
 /** The save of one ordinary Planner run (`operation` + `runId` name the press it belongs to). */
 export type OrdinaryPlannerSaveState =
   | { operation: PlanCreationOperation; runId: number; status: 'saving' }
   | { operation: PlanCreationOperation; runId: number; status: 'no_plan' }
-  | { operation: PlanCreationOperation; runId: number; status: 'failed'; message: string }
+  | {
+      operation: PlanCreationOperation
+      runId: number
+      status: 'failed'
+      message: string
+      /**
+       * The save refused the Plan for its completion assignments (Issue #334,
+       * `plan_completion_assignment_conflict`): the typed issues the screen names
+       * the Targets and the weapon from (`docs/UI_FLOW.md` 12.11).
+       */
+      completionAssignmentIssues?: readonly ProductionPlanCompletionAssignmentIssue[]
+    }
 
 /** One optimization run of the primary operation: the plan creation press and the optimization session's run of it. */
 interface OptimizationRunKey {
@@ -193,13 +208,17 @@ export function useBuildListPlanCreation({
     sessionRef.current === target && runIdOf(slotOf(target.getState(), operation)) === runId
   ), [])
 
-  const refreshPreStart = useCallback(() => {
+  /** Reads the pre-start judgement again; `keepPrevious` holds the last settled one while it runs (never shown as current). */
+  const rejudgePreStart = useCallback((keepPrevious: boolean) => {
     const current = sessionRef.current
     if (current === null) return
     inspectSequenceRef.current += 1
     const sequence = inspectSequenceRef.current
-    // While the judgement runs, the previous one is not shown as current.
-    setPreStart({ status: 'loading' })
+    // While the judgement runs, the previous one is not shown as current (it is only kept as `previous`).
+    setPreStart((current) => {
+      const previous = !keepPrevious ? undefined : current.status === 'ready' ? current.preparation : current.previous
+      return previous === undefined ? { status: 'loading' } : { status: 'loading', previous }
+    })
     void current.inspect().catch((error: unknown): PlanCreationPreparation => ({
       kind: 'start_read_failed',
       code: 'transaction_failed',
@@ -215,6 +234,8 @@ export function useBuildListPlanCreation({
       }
     })
   }, [])
+
+  const refreshPreStart = useCallback(() => rejudgePreStart(true), [rejudgePreStart])
 
   const saveOrdinaryResult = useCallback(async (
     target: PlanCreationSession,
@@ -238,6 +259,16 @@ export function useBuildListPlanCreation({
       setOrdinarySave({ operation, runId, status: 'no_plan' })
     } catch (caught: unknown) {
       if (!isCurrentPress(target, operation, runId)) return
+      if (caught instanceof RepositoryError && caught.code === 'plan_completion_assignment_conflict') {
+        setOrdinarySave({
+          operation,
+          runId,
+          status: 'failed',
+          message: '1本の所持武器を2件の目標武器の完成品にする計画になったため、保存しませんでした。',
+          completionAssignmentIssues: caught.completionAssignmentIssues,
+        })
+        return
+      }
       setOrdinarySave({ operation, runId, status: 'failed', message: caught instanceof Error ? caught.message : '生産計画を保存できませんでした。' })
     } finally {
       savingRef.current = false
@@ -260,15 +291,16 @@ export function useBuildListPlanCreation({
     if (runId === null || !isCurrentPress(target, operation, runId)) return
     const slot = slotOf(target.getState(), operation)
     if (slot.status === 'not_started') {
-      // The press judged afresh and started nothing: the pre-start body follows the current state again.
+      // The press judged afresh and started nothing: the pre-start body follows the current state again. The judgement held before the
+      // press is older than the press's own, so it keeps nothing in place while the new one is read (Issue #359).
       if (slot.reason.kind === 'running_plan_exists') callbacksRef.current.onPersistedStateChanged()
-      refreshPreStart()
+      rejudgePreStart(false)
       return
     }
     if (slot.status === 'ordinary_planner' && slot.run.status === 'completed') {
       await saveOrdinaryResult(target, operation, runId, slot.run.result)
     }
-  }, [isCurrentPress, refreshPreStart, saveOrdinaryResult])
+  }, [isCurrentPress, rejudgePreStart, saveOrdinaryResult])
 
   const resetAdoption = useCallback(() => {
     adoptionRef.current = null

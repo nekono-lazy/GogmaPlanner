@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useMemo, useState } from 'react'
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import {
   Alert,
   Box,
@@ -20,37 +20,62 @@ import {
   TextField,
   Typography,
 } from '@mui/material'
-import { Link as RouterLink } from 'react-router-dom'
+import { Link as RouterLink, useNavigate } from 'react-router-dom'
 import { DialogFormError } from '../components/DialogFormError'
 import { DisclosureAccordion } from '../components/DisclosureAccordion'
 import { OwnedIdealCompletionDialog } from '../components/target/OwnedIdealCompletionDialog'
 import { OwnedIdealWeaponNotice } from '../components/target/OwnedIdealWeaponNotice'
+import { TargetCompletionOverlapDialog } from '../components/target/TargetCompletionOverlapDialog'
+import type { CompletionOverlapSaveMode } from '../components/target/completionOverlapPresentation'
 import {
   COMPLETED_TARGETS_HEADING,
   formatCompletedAt,
   REOPEN_TARGET_LABEL,
   REOPEN_TARGET_LINES,
+  reopenTargetCompletionWeaponLine,
   REOPEN_TARGET_PLAN_BREAKING_NOTE,
   REOPEN_TARGET_TITLE,
   targetLifecycleErrorMessage,
 } from '../components/target/ownedIdealPresentation'
 import { useOwnedIdealCompletion, type OwnedIdealCompletionApi } from '../components/target/useOwnedIdealCompletion'
 import { PlanBreakingChangeDialog } from '../components/execution/PlanBreakingChangeDialog'
-import { usePlanBreakingChangeApproval } from '../components/execution/usePlanBreakingChangeApproval'
+import {
+  runningPlanReplanExclusionRequest,
+  runningPlanReplanNavigationState,
+} from '../components/execution/runningPlanReplanRequest'
+import {
+  usePlanBreakingChangeApproval,
+  type PlanBreakingReplanExclusionRequest,
+} from '../components/execution/usePlanBreakingChangeApproval'
 import type { PlanBreakingChangeApproval, PlanBreakingChangeInspection } from '../domain/execution'
 import { PageShell } from '../components/PageShell'
 import { StatusChip } from '../components/StatusChip'
-import { BonusSlotList, ManagementListItem } from '../components/ManagementListItem'
-import { BonusSetEditor } from '../components/forms/BonusSetEditor'
-import { TargetCompromiseEditor } from '../components/forms/TargetCompromiseEditor'
+import { ManagementListItem } from '../components/ManagementListItem'
+import { CompletionBonusVariantsEditor } from '../components/forms/CompletionBonusVariantsEditor'
 import {
+  CompletionConditionReviewStatus,
+  CompletionConditionSummary,
+} from '../components/target/CompletionConditionSummary'
+import {
+  COMPLETION_CONDITION_REVIEW_DIALOG_LEAD,
+  COMPLETION_CONDITION_REVIEW_DIALOG_TITLE,
+  COMPLETION_CONDITION_REVIEW_FILTER_LABEL,
+  COMPLETION_CONDITION_REVIEW_SAVE_NOTE,
+  completionConditionReviewGuidance,
+  completionConditionReviewListNotice,
+  completionConditionReviewReasonLabels,
+  completionConditionReviewSectionNotes,
+  targetFormValidationIssuesText,
+} from '../components/target/completionConditionPresentation'
+import {
+  collectCompletionAssignedOwnedWeaponIds,
+  completionBonusVariantFromBonuses,
   findOwnedIdealWeaponsForTarget,
-  hasTargetCompromise,
   isCompatiblePreferredOwnedWeapon,
   isEligiblePreferredOwnedWeapon,
+  type TargetCompletionOverlapConfirmation,
 } from '../domain/target'
 import { SkillConditionEditor } from '../components/forms/SkillConditionEditor'
-import { skillConditionSummary } from '../components/search/searchPresentation'
 import { MasterDataStatusAlert } from '../components/MasterDataStatusAlert'
 import { loadMasterData } from '../domain/master/loadMasterData'
 import {
@@ -69,7 +94,7 @@ import type {
 } from '../domain/models/publicTypes'
 import { ownedWeaponRepository } from '../db/repositories'
 import { artianWeaponKindLabels, ownedWeaponStatusLabels } from '../presentation/labels'
-import { sortByRegistrationOrder, upsertPreservingOrder } from '../presentation/managementListOrder'
+import { compareByRegistrationOrder, sortByRegistrationOrder, upsertPreservingOrder } from '../presentation/managementListOrder'
 import {
   emptyWeaponListFilter,
   matchesWeaponListFilter,
@@ -87,8 +112,17 @@ import {
   TargetWeaponLifecycleService,
   type TargetOwnedIdealCompletion,
 } from '../services/crud/targetWeaponLifecycleService'
+import {
+  createRunningPlanReplanGuidanceReader,
+  type RunningPlanReplanGuidanceReader,
+} from '../services/execution/runningPlanReplanGuidanceService'
 
 const NO_PREFERRED_OWNED_WEAPON = ''
+
+/** Whether the Target carries a completion condition review reason (`docs/UI_FLOW.md` 8.4). Display only. */
+function needsCompletionConditionReview(target: Pick<TargetWeapon, 'completionConditionReview'>): boolean {
+  return target.completionConditionReview.length > 0
+}
 
 /** The operation-specific line under the breaking-change warning (`docs/UI_FLOW.md` 16.3). */
 const TARGET_WEAPON_PLAN_BREAKING_NOTE =
@@ -117,21 +151,53 @@ function preferredOptionGroup(
   weapon: OwnedWeapon,
   currentPreferredId: string | null,
   claimedByOtherTarget: boolean,
+  completionAssigned: boolean,
 ): number {
   if (weapon.id === currentPreferredId) return 0
-  if (weapon.isProtected) return 3
+  if (weapon.isProtected || completionAssigned) return 3
   return claimedByOtherTarget ? 2 : 1
+}
+
+const COMPLETION_WEAPON_NAME_UNKNOWN = '名前を確認できない所持武器'
+
+/**
+ * 「完成に使った武器」 of a completed Target (Issue #334, `docs/UI_FLOW.md` 8.3):
+ * the recorded completion assignment by name, or 「記録なし」 with how to record
+ * one for a Target completed before the assignment existed. No weapon is
+ * guessed.
+ */
+function CompletionWeaponLine({ target, weaponName }: { target: TargetWeapon; weaponName: string | null }) {
+  if (weaponName !== null) {
+    return (
+      <Typography variant="body2" sx={{ overflowWrap: 'anywhere' }}>
+        完成に使った武器: {weaponName}
+      </Typography>
+    )
+  }
+  return (
+    <Stack spacing={0.25} sx={{ minWidth: 0 }}>
+      <Typography variant="body2" sx={{ overflowWrap: 'anywhere' }}>
+        完成に使った武器: 記録なし
+      </Typography>
+      <Typography variant="body2" color="text.secondary" sx={{ overflowWrap: 'anywhere' }}>
+        {`「${target.name}」は完成に使った武器を記録する前に完了したため、どの武器で完成したか分かりません。記録したい場合は「未完了に戻す」のあと「この武器で目標を完了にする」で完了し直してください。`}
+      </Typography>
+    </Stack>
+  )
 }
 
 /** The confirmation 「未完了に戻す」 needs (`docs/UI_FLOW.md` 8.3). */
 function ReopenTargetDialog({
   target,
+  completionWeaponName,
   submitting,
   error,
   onCancel,
   onConfirm,
 }: {
   target: TargetWeapon | null
+  /** The recorded completion weapon's name; `null` when it cannot be resolved. */
+  completionWeaponName: string | null
   submitting: boolean
   error: string | null
   onCancel(): void
@@ -153,6 +219,11 @@ function ReopenTargetDialog({
               {line}
             </Typography>
           ))}
+          {target.completedWithOwnedWeaponId !== null && (
+            <Typography component="p" variant="body2" sx={{ mt: 1, overflowWrap: 'anywhere' }}>
+              {reopenTargetCompletionWeaponLine(completionWeaponName ?? COMPLETION_WEAPON_NAME_UNKNOWN)}
+            </Typography>
+          )}
         </DialogContentText>
       </DialogContent>
       {error !== null && <DialogFormError message={error} />}
@@ -180,6 +251,16 @@ export interface TargetWeaponsPageDependencies extends OwnedIdealCompletionApi {
   ): Promise<TargetWeapon>
   /** The read-only breaking-change inspection of that very save. */
   inspectSave(draft: TargetWeaponDraft, existing: TargetWeapon | null): Promise<PlanBreakingChangeInspection>
+  /**
+   * The read-only completion condition overlap inspection of that very save
+   * (Issue #338, `docs/UI_FLOW.md` 8.5): the save's own input validation first
+   * (`EntityFormValidationError`), then the other active Targets to confirm,
+   * judged from the latest stored Targets. Writes nothing.
+   */
+  inspectCompletionOverlap(
+    draft: TargetWeaponDraft,
+    existing: TargetWeapon | null,
+  ): Promise<TargetCompletionOverlapConfirmation[]>
   delete(id: TargetWeapon['id'], approval?: PlanBreakingChangeApproval | null): Promise<void>
   /** The read-only breaking-change inspection of that very delete. */
   inspectDelete(id: TargetWeapon['id']): Promise<PlanBreakingChangeInspection>
@@ -188,6 +269,12 @@ export interface TargetWeaponsPageDependencies extends OwnedIdealCompletionApi {
   /** The read-only breaking-change inspection of returning that Target to active (`docs/UI_FLOW.md` 8.3). */
   inspectReopen(id: TargetWeapon['id']): Promise<PlanBreakingChangeInspection>
   reopen(id: TargetWeapon['id'], approval?: PlanBreakingChangeApproval | null): Promise<TargetWeapon>
+  /**
+   * The read-only running Plan replan guidance (Issue #276 PR-6B): whether the
+   * breaking-change warning of a Plan-dependent Target may offer to leave the
+   * change unsaved and exclude the Target in a replan instead.
+   */
+  replanGuidance: RunningPlanReplanGuidanceReader
 }
 
 function deleteReferenceMessage(error: ReferencedEntityDeleteError) {
@@ -220,6 +307,7 @@ export function TargetWeaponsPage({
             getAll: () => defaultService.getAll(),
             save: (draft, existing, approval) => defaultService.save(draft, existing, undefined, approval ?? null),
             inspectSave: (draft, existing) => defaultService.inspectSave(draft, existing),
+            inspectCompletionOverlap: (draft, existing) => defaultService.inspectSaveCompletionOverlap(draft, existing),
             delete: (id, approval) => defaultService.delete(id, approval ?? null),
             inspectDelete: (id) => defaultService.inspectDelete(id),
             getOwnedWeapons: () => ownedWeaponRepository.getAllOwnedWeapons(),
@@ -229,6 +317,7 @@ export function TargetWeaponsPage({
               defaultLifecycleService.completeWithOwnedIdeal(targetId, weaponId, undefined, approval ?? null),
             inspectReopen: (id) => defaultLifecycleService.inspectReopen(id),
             reopen: (id, approval) => defaultLifecycleService.reopen(id, undefined, approval ?? null),
+            replanGuidance: createRunningPlanReplanGuidanceReader(),
           }
         : null),
     [defaultLifecycleService, defaultService, dependencies],
@@ -246,11 +335,47 @@ export function TargetWeaponsPage({
   // the open Dialog, where the modal keeps it reachable next to 保存.
   const [formError, setFormError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
+  // One add / edit save at a time, from the overlap inspection to the guarded
+  // save: 保存 stays disabled and a second press is ignored (Issue #338).
+  const [savePending, setSavePending] = useState(false)
+  const savePendingRef = useRef(false)
+  // The completion condition overlap confirmation the paused save waits on
+  // (`docs/UI_FLOW.md` 8.5). Never persisted.
+  const [overlapPrompt, setOverlapPrompt] = useState<{
+    confirmations: TargetCompletionOverlapConfirmation[]
+    mode: CompletionOverlapSaveMode
+    resolve(confirmed: boolean): void
+  } | null>(null)
+  const saveButtonRef = useRef<HTMLButtonElement>(null)
+  // 「編集へ戻る」 returns focus to 保存 once the paused save has settled and 保存
+  // is enabled again.
+  const restoreSaveFocusRef = useRef(false)
+  useEffect(() => {
+    if (!savePending && restoreSaveFocusRef.current) {
+      restoreSaveFocusRef.current = false
+      saveButtonRef.current?.focus()
+    }
+  }, [savePending])
   // An approved breaking change ends the `active` Plan, which clears the
   // in-progress marks of the weapons this list offers: it is re-read afterwards.
   const [loadSequence, setLoadSequence] = useState(0)
   // The breaking-change warning of every save and delete (`docs/UI_FLOW.md` 16.3).
-  const planGuard = usePlanBreakingChangeApproval()
+  // For a Plan-dependent Target it may also offer to leave the change unsaved
+  // and exclude the Target in a replan (Issue #276 PR-6B); the guard's
+  // judgement, approval and save are untouched.
+  const replanGuidance = api?.replanGuidance
+  const planGuard = usePlanBreakingChangeApproval({
+    replanExclusion: replanGuidance === undefined
+      ? undefined
+      : (planId, targetWeaponId) => replanGuidance.canExcludeInReplan(planId, targetWeaponId),
+  })
+  const navigate = useNavigate()
+  /** 「保存せずに再計画を開く」: nothing was saved; the Build List's replan opens with the Target left out, and calculates nothing. */
+  const openReplanExclusion = useCallback((request: PlanBreakingReplanExclusionRequest) => {
+    void navigate('/build-list', {
+      state: runningPlanReplanNavigationState(runningPlanReplanExclusionRequest(request.planId, request.targetWeaponId)),
+    })
+  }, [navigate])
   const listHeadingId = useId()
   const completedHeadingId = useId()
   const preferredHelpId = useId()
@@ -273,7 +398,14 @@ export function TargetWeaponsPage({
     setError(null)
     if (planAbandoned) setLoadSequence((sequence) => sequence + 1)
   }, [])
-  const completion = useOwnedIdealCompletion({ api, planGuard, targets, onApplied: onCompletionApplied })
+  const completion = useOwnedIdealCompletion({
+    api,
+    planGuard,
+    targets,
+    master: masterResult.ok ? masterResult.data : null,
+    onApplied: onCompletionApplied,
+    onReplanExclusion: openReplanExclusion,
+  })
   // 「未完了に戻す」 (`docs/UI_FLOW.md` 8.3), behind its own confirmation.
   const [reopening, setReopening] = useState<TargetWeapon | null>(null)
   const [reopenSubmitting, setReopenSubmitting] = useState(false)
@@ -281,6 +413,13 @@ export function TargetWeaponsPage({
   // Display-only filter of the active list (`docs/UI_FLOW.md` 3.2 / 8): never
   // persisted, and never a Search / Planner input.
   const [filter, setFilter] = useState<WeaponListFilter>(emptyWeaponListFilter)
+  // 「完成条件の再設定が必要な目標武器だけ表示」 (`docs/UI_FLOW.md` 8.4): display
+  // only too, combined with the weapon type / element filter.
+  const [reviewOnly, setReviewOnly] = useState(false)
+  const clearFilters = () => {
+    setFilter(emptyWeaponListFilter)
+    setReviewOnly(false)
+  }
 
   useEffect(() => {
     if (!api) return
@@ -321,13 +460,21 @@ export function TargetWeaponsPage({
   }
 
   const master = masterResult.data
+  // The completion assignments (Issue #334, `docs/DATA_MODEL.md` 8.7) through the
+  // one Domain authority, for display only: the Services re-check everything.
+  const completionAssignments = collectCompletionAssignedOwnedWeaponIds(targets)
+  const targetById = new Map(targets.map((target) => [target.id, target]))
+  const ownedWeaponById = new Map(ownedWeapons.map((weapon) => [weapon.id, weapon]))
   const weaponTypes = getEnabledWeaponTypes(master)
   const elements = getEnabledElements(master)
   // The ordinary list holds active Targets only; completed ones sit in their
   // own read-only section (`docs/UI_FLOW.md` 8 / 8.3).
   const activeTargets = targets.filter(({ lifecycleStatus }) => lifecycleStatus === 'active')
   const completedTargets = targets.filter(({ lifecycleStatus }) => lifecycleStatus === 'completed')
-  const shownActiveTargets = activeTargets.filter((target) => matchesWeaponListFilter(target, filter))
+  const reviewTargetCount = activeTargets.filter(needsCompletionConditionReview).length
+  const shownActiveTargets = activeTargets.filter(
+    (target) => matchesWeaponListFilter(target, filter) && (!reviewOnly || needsCompletionConditionReview(target)),
+  )
   // The owned Ideal notice per active Target (`docs/UI_FLOW.md` 8.2), judged by
   // the shared Domain authority from the loaded Targets and weapons - after a
   // save too, with no reload. A judgement failure is reported, never read as
@@ -337,7 +484,7 @@ export function TargetWeaponsPage({
   if (!loading && !loadFailed) {
     for (const target of activeTargets) {
       try {
-        ownedIdealByTarget.set(target.id, findOwnedIdealWeaponsForTarget(target, ownedWeapons, master))
+        ownedIdealByTarget.set(target.id, findOwnedIdealWeaponsForTarget(target, ownedWeapons, master, targets))
       } catch (caught: unknown) {
         ownedIdealEvaluationError = `既所持の理想武器を判定できませんでした: ${caught instanceof Error ? caught.message : String(caught)}`
         break
@@ -375,22 +522,68 @@ export function TargetWeaponsPage({
   }
 
   const closeDialog = () => {
+    // A save in progress keeps its dialog: the overlap confirmation and the
+    // breaking-change warning both return to it.
+    if (savePendingRef.current) return
     setDraft(null)
     setFormError(null)
   }
 
+  const settleOverlapPrompt = (confirmed: boolean) => {
+    if (overlapPrompt === null) return
+    setOverlapPrompt(null)
+    // A promise settles once, so a second press before the close is a no-op.
+    overlapPrompt.resolve(confirmed)
+  }
+
   const save = async () => {
-    if (!api || !draft) return
+    if (!api || !draft || savePendingRef.current || planGuard.busy) return
+    // Every step closes over this very draft against this very shown Target,
+    // so what the user confirmed is what is saved.
+    const pendingDraft = draft
+    const pendingEditing = editing
+    savePendingRef.current = true
+    setSavePending(true)
     try {
+      // `docs/UI_FLOW.md` 8.5: (1) the input validation and (2) the completion
+      // condition overlap confirmation come before (3) the breaking-change
+      // confirmation and (4) the save. The inspection runs the save's own
+      // validation first, so an invalid input is reported here and never
+      // asked about; going back saves nothing and keeps the draft.
+      const confirmations = await api.inspectCompletionOverlap(pendingDraft, pendingEditing)
+      if (confirmations.length > 0) {
+        const confirmed = await new Promise<boolean>((resolve) => {
+          setOverlapPrompt({
+            confirmations: [...confirmations].sort((left, right) => compareByRegistrationOrder(left.target, right.target)),
+            mode: pendingEditing === null ? 'new' : 'edit',
+            resolve,
+          })
+        })
+        if (!confirmed) {
+          restoreSaveFocusRef.current = true
+          return
+        }
+      }
       // The inspection and the save close over the same draft against the same
       // shown Target; the runtime alone judges the whole post-state, the
-      // takeover release included.
+      // takeover release included, and re-validates everything.
       const outcome = await planGuard.run({
-        inspect: () => api.inspectSave(draft, editing),
-        apply: (approval) => api.save(draft, editing, approval),
+        inspect: () => api.inspectSave(pendingDraft, pendingEditing),
+        apply: (approval) => api.save(pendingDraft, pendingEditing, approval),
         note: TARGET_WEAPON_PLAN_BREAKING_NOTE,
+        // Only an existing Target can be one the running Plan makes.
+        ...(pendingEditing === null ? {} : { replanExclusionTargetWeaponId: pendingEditing.id }),
       })
-      if (outcome.status === 'cancelled') return
+      if (outcome.status === 'cancelled') {
+        if (outcome.replanExclusion !== undefined) {
+          // The edit is left unsaved: the dialog closes, then the replan opens.
+          setDraft(null)
+          setEditing(null)
+          setFormError(null)
+          openReplanExclusion(outcome.replanExclusion)
+        }
+        return
+      }
       if (outcome.status === 'refused') {
         setFormError(outcome.message)
         return
@@ -418,11 +611,14 @@ export function TargetWeaponsPage({
     } catch (caught: unknown) {
       setFormError(
         caught instanceof EntityFormValidationError
-          ? caught.issues.join(' / ')
+          ? targetFormValidationIssuesText(caught.issues)
           : caught instanceof Error
             ? caught.message
             : '保存できません。',
       )
+    } finally {
+      savePendingRef.current = false
+      setSavePending(false)
     }
   }
 
@@ -435,8 +631,13 @@ export function TargetWeaponsPage({
         inspect: () => api.inspectDelete(target.id),
         apply: (approval) => api.delete(target.id, approval),
         note: TARGET_WEAPON_DELETE_PLAN_BREAKING_NOTE,
+        replanExclusionTargetWeaponId: target.id,
       })
-      if (outcome.status === 'cancelled') return
+      if (outcome.status === 'cancelled') {
+        // Nothing was deleted; 「保存せずに再計画を開く」 opens the replan with the Target left out.
+        if (outcome.replanExclusion !== undefined) openReplanExclusion(outcome.replanExclusion)
+        return
+      }
       if (outcome.status === 'refused') {
         setError(outcome.message)
         return
@@ -505,7 +706,7 @@ export function TargetWeaponsPage({
     )
     const keepsPreferred =
       preferred !== undefined &&
-      isEligiblePreferredOwnedWeapon({ weaponTypeId, elementId }, preferred)
+      isEligiblePreferredOwnedWeapon({ weaponTypeId, elementId }, preferred, completionAssignments)
     return {
       ...value,
       weaponTypeId,
@@ -513,20 +714,24 @@ export function TargetWeaponsPage({
       preferredOwnedWeaponId: keepsPreferred
         ? value.preferredOwnedWeaponId
         : null,
-      idealBonuses: createDefaultBonusSet(
-        master,
-        weaponTypeId,
-        elementId,
-        'gogma_artian',
-      ),
-      practicalBonusConditions: [],
-      alternativeBonusRules: [],
+      // The weapon type / element decides every slot's choices, so the
+      // completion Variants restart from one default Variant
+      // (`docs/UI_FLOW.md` 8).
+      completionBonusVariants: [
+        completionBonusVariantFromBonuses(
+          createDefaultBonusSet(master, weaponTypeId, elementId, 'gogma_artian'),
+          crypto.randomUUID(),
+        ),
+      ],
     }
   }
 
-  // Compatible weapons only, protected ones included so the user can see why
-  // they cannot be chosen. Status is deliberately not a filter: a Material,
-  // Practical, or Ideal weapon is equally selectable (`docs/UI_FLOW.md` 8.1).
+  // Compatible weapons only, protected ones and completion-assigned ones
+  // included so the user can see why they cannot be chosen. Status is
+  // deliberately not a filter: a Material, Practical, or Ideal weapon is equally
+  // selectable (`docs/UI_FLOW.md` 8.1). A weapon that is the completion of a
+  // Target (Issue #334, `docs/DATA_MODEL.md` 8.7) is never a preferred origin,
+  // even once unprotected.
   const preferredOwnedWeaponOptions = draft
     ? ownedWeapons
         .filter((weapon) => isCompatiblePreferredOwnedWeapon(draft, weapon))
@@ -537,14 +742,18 @@ export function TargetWeaponsPage({
                 target.id !== editing?.id &&
                 target.preferredOwnedWeaponId === weapon.id,
             ) ?? null
+          const assignedTargetId = completionAssignments.get(weapon.id)
+          const completedTarget = assignedTargetId === undefined ? null : (targetById.get(assignedTargetId) ?? null)
           return {
             weapon,
             holder,
-            selectable: !weapon.isProtected,
+            completedTarget,
+            selectable: !weapon.isProtected && !completionAssignments.has(weapon.id),
             group: preferredOptionGroup(
               weapon,
               draft.preferredOwnedWeaponId,
               holder !== null,
+              completionAssignments.has(weapon.id),
             ),
           }
         })
@@ -559,7 +768,7 @@ export function TargetWeaponsPage({
   return (
     <PageShell
       title="目標武器"
-      description="欲しい完成武器の理想条件と実用条件を管理します。"
+      description="欲しい完成武器の完成条件（完成ボーナス構成と完成スキル）を管理します。"
       actions={
         <Button variant="contained" onClick={openNew} sx={{ minHeight: 44 }}>
           目標武器を追加
@@ -573,6 +782,21 @@ export function TargetWeaponsPage({
         {notice && (
           <Alert severity="success" onClose={() => setNotice(null)}>
             {notice}
+          </Alert>
+        )}
+        {!loading && !loadFailed && reviewTargetCount > 0 && !reviewOnly && (
+          <Alert
+            severity="warning"
+            // A standing notice, not an interruption: read politely.
+            role="status"
+            action={
+              <Button color="inherit" onClick={() => setReviewOnly(true)} sx={{ minHeight: 44 }}>
+                該当する目標武器を表示
+              </Button>
+            }
+            sx={{ flexWrap: { xs: 'wrap', sm: 'nowrap' }, '& .MuiAlert-action': { ml: { xs: 0, sm: 'auto' }, pl: { xs: 0, sm: 2 } } }}
+          >
+            {completionConditionReviewListNotice(reviewTargetCount)}
           </Alert>
         )}
         <Paper
@@ -607,7 +831,22 @@ export function TargetWeaponsPage({
                 totalCount={activeTargets.length}
                 shownCount={shownActiveTargets.length}
                 unit="件"
-              />
+                additionalFilterActive={reviewOnly}
+                onClearAll={clearFilters}
+              >
+                {(reviewTargetCount > 0 || reviewOnly) && (
+                  <FormControlLabel
+                    sx={{ minHeight: 44, mr: 0 }}
+                    control={
+                      <Checkbox
+                        checked={reviewOnly}
+                        onChange={(event) => setReviewOnly(event.target.checked)}
+                      />
+                    }
+                    label={`${COMPLETION_CONDITION_REVIEW_FILTER_LABEL}（${reviewTargetCount}件）`}
+                  />
+                )}
+              </WeaponListFilterBar>
             </Box>
           )}
           {loading && <LinearProgress aria-label="目標武器を読み込み中" />}
@@ -615,7 +854,7 @@ export function TargetWeaponsPage({
             <Box sx={{ px: { xs: 2, md: 2.5 }, py: 3, borderTop: 1, borderColor: 'divider' }}>
               <Typography>{targets.length === 0 ? '目標武器は未登録です。' : '未完了の目標武器はありません。'}</Typography>
               <Typography variant="body2" color="text.secondary">
-                「目標武器を追加」から、欲しい完成武器の理想条件を登録します。
+                「目標武器を追加」から、欲しい完成武器の完成条件を登録します。
               </Typography>
             </Box>
           )}
@@ -623,7 +862,7 @@ export function TargetWeaponsPage({
             <Box sx={{ px: { xs: 2, md: 2.5 }, py: 3, borderTop: 1, borderColor: 'divider' }}>
               <WeaponListFilterEmpty
                 message="条件に一致する目標武器はありません。"
-                onClear={() => setFilter(emptyWeaponListFilter)}
+                onClear={clearFilters}
               />
             </Box>
           )}
@@ -652,16 +891,7 @@ export function TargetWeaponsPage({
                   }
                   detail={
                     <Stack spacing={1}>
-                      <BonusSlotList
-                        heading="理想ボーナス"
-                        bonuses={target.idealBonuses}
-                        weaponTypeId={target.weaponTypeId}
-                        master={master}
-                        scope="gogma_artian"
-                      />
-                      <Typography variant="body2">
-                        理想スキル: {skillConditionSummary(target.idealSkillCondition, master)}
-                      </Typography>
+                      <CompletionConditionSummary target={target} master={master} />
                       {(ownedIdealByTarget.get(target.id)?.length ?? 0) > 0 && (
                         <OwnedIdealWeaponNotice
                           target={target}
@@ -675,27 +905,7 @@ export function TargetWeaponsPage({
                   }
                   status={
                     <Stack spacing={0.75} sx={{ alignItems: 'flex-start' }}>
-                      <Typography variant="caption" color="text.secondary">
-                        妥協条件
-                      </Typography>
-                      {hasTargetCompromise(target) ? (
-                        <Typography variant="body2">
-                          実用ボーナス条件 {target.practicalBonusConditions.length}件
-                          {' ／ '}代替ボーナス条件 {target.alternativeBonusRules.length}件
-                          <br />
-                          実用スキル: {skillConditionSummary(target.practicalSkillCondition, master)}
-                        </Typography>
-                      ) : (
-                        <Typography variant="body2">妥協なし（理想のみ検索）</Typography>
-                      )}
-                      {target.compromiseNeedsReview && (
-                        <>
-                          <StatusChip label="妥協条件の再設定が必要" tone="caution" />
-                          <Typography variant="body2" color="text.secondary">
-                            条件の仕様変更により旧妥協条件を解除しました。理想条件を保持しています。実用・代替・実用スキルを確認して再設定してください。
-                          </Typography>
-                        </>
-                      )}
+                      <CompletionConditionReviewStatus target={target} />
                       <Typography variant="body2" sx={{ overflowWrap: 'anywhere' }}>
                         優先起点:{' '}
                         {ownedWeapons.find(({ id }) => id === target.preferredOwnedWeaponId)?.name ?? 'なし'}
@@ -716,8 +926,9 @@ export function TargetWeaponsPage({
             </Typography>
             <Box sx={{ px: { xs: 2, md: 2.5 }, pb: 2 }}>
               {/* Read-only history (`docs/UI_FLOW.md` 8.3): no edit, delete, enablement
-                  or preference control. The weapon that completed a Target is not
-                  persisted on it, so none is guessed here. */}
+                  or preference control. The weapon that completed a Target is its
+                  recorded completion assignment (Issue #334); a Target completed
+                  before the assignment existed shows 「記録なし」, never a guess. */}
               <DisclosureAccordion title={`完了済みの目標武器（${completedTargets.length}件）`} headingLevel="h3">
                 <Box component="ul" aria-label={COMPLETED_TARGETS_HEADING} sx={{ m: 0, p: 0, listStyle: 'none', display: 'grid', gap: 1.5 }}>
                   {completedTargets.map((target) => (
@@ -741,6 +952,14 @@ export function TargetWeaponsPage({
                         <Typography variant="body2" sx={{ overflowWrap: 'anywhere' }}>
                           完了日時: {target.completedAt === null ? '不明' : formatCompletedAt(target.completedAt)}
                         </Typography>
+                        <CompletionWeaponLine
+                          target={target}
+                          weaponName={
+                            target.completedWithOwnedWeaponId === null
+                              ? null
+                              : (ownedWeaponById.get(target.completedWithOwnedWeaponId)?.name ?? COMPLETION_WEAPON_NAME_UNKNOWN)
+                          }
+                        />
                         {target.completedByProductionPlanId !== null && (
                           <Button
                             component={RouterLink}
@@ -784,6 +1003,30 @@ export function TargetWeaponsPage({
           {draft && (
             <DialogContent dividers sx={{ px: { xs: 2, sm: 3 } }}>
               <Stack spacing={3}>
+                {draft.completionConditionReview.length > 0 && (
+                  // `docs/UI_FLOW.md` 8.4: the reasons, in words, what to check
+                  // for each, and that the explicit save - never closing - is
+                  // what makes the Target calculable again.
+                  <Alert severity="warning">
+                    <Stack spacing={1}>
+                      <Typography component="h3" variant="body1" sx={{ fontWeight: 700 }}>
+                        {COMPLETION_CONDITION_REVIEW_DIALOG_TITLE}
+                      </Typography>
+                      <Typography variant="body2">{COMPLETION_CONDITION_REVIEW_DIALOG_LEAD}</Typography>
+                      <Box component="ul" sx={{ m: 0, pl: 2.5, display: 'grid', gap: 0.75 }}>
+                        {draft.completionConditionReview.map((reason) => (
+                          <li key={reason}>
+                            <Typography variant="body2" sx={{ fontWeight: 700 }}>
+                              {completionConditionReviewReasonLabels[reason]}
+                            </Typography>
+                            <Typography variant="body2">{completionConditionReviewGuidance[reason]}</Typography>
+                          </li>
+                        ))}
+                      </Box>
+                      <Typography variant="body2">{COMPLETION_CONDITION_REVIEW_SAVE_NOTE}</Typography>
+                    </Stack>
+                  </Alert>
+                )}
                 <Stack component="section" spacing={1.5}>
                   <Typography component="h3" variant="h3">基本情報</Typography>
                   <TextField
@@ -939,7 +1182,7 @@ export function TargetWeaponsPage({
                     >
                       <MenuItem value={NO_PREFERRED_OWNED_WEAPON}>指定なし</MenuItem>
                       {preferredOwnedWeaponOptions.map(
-                        ({ weapon, holder, selectable }) => (
+                        ({ weapon, holder, completedTarget, selectable }) => (
                           <MenuItem
                             key={weapon.id}
                             value={weapon.id}
@@ -952,11 +1195,13 @@ export function TargetWeaponsPage({
                             {weapon.kind === 'gogma'
                               ? ` / ${ownedWeaponStatusLabels[weapon.status]}`
                               : ''}
-                            {weapon.isProtected
-                              ? ' [保護中・選択不可]'
-                              : holder
-                                ? ` [${holder.name}に割当中]`
-                                : ''}
+                            {completedTarget
+                              ? ` [${completedTarget.name}の完成品・選択不可]`
+                              : weapon.isProtected
+                                ? ' [保護中・選択不可]'
+                                : holder
+                                  ? ` [${holder.name}に割当中]`
+                                  : ''}
                           </MenuItem>
                         ),
                       )}
@@ -967,37 +1212,37 @@ export function TargetWeaponsPage({
                     より短い作成ルートがある場合は、そちらが選ばれることがあります。
                   </Typography>
                 </Stack>
-                <BonusSetEditor
-                  label="理想の復元ボーナス5枠"
+                <CompletionBonusVariantsEditor
                   master={master}
                   weaponTypeId={draft.weaponTypeId}
                   elementId={draft.elementId}
-                  scope="gogma_artian"
-                  value={draft.idealBonuses}
-                  onChange={(idealBonuses) =>
-                    setDraft({ ...draft, idealBonuses })
+                  value={draft.completionBonusVariants}
+                  onChange={(completionBonusVariants) => {
+                    setDraft({ ...draft, completionBonusVariants })
+                    // A save error names Variants by their former numbers;
+                    // the editor's own messages follow the edit instead.
+                    setFormError(null)
+                  }}
+                  createVariantId={() => crypto.randomUUID()}
+                  reviewNote={
+                    draft.completionConditionReview.includes('compromise_conditions_removed')
+                      ? completionConditionReviewSectionNotes.compromise_conditions_removed
+                      : null
                   }
                 />
-                <TargetCompromiseEditor target={draft} master={master} onChange={(conditions) => setDraft({ ...draft, ...conditions })} />
-                <Stack spacing={2}>
-                  <Typography variant="body2" color="text.secondary">実用スキルの指定がない場合、スキルは理想条件だけを許可します。ボーナスが実用・代替の場合も、実用スキルと組み合わせられます。</Typography>
-                  <SkillConditionEditor
-                    label="理想スキル条件"
-                    master={master}
-                    value={draft.idealSkillCondition}
-                    onChange={(idealSkillCondition) =>
-                      setDraft({ ...draft, idealSkillCondition })
-                    }
-                  />
-                  <SkillConditionEditor
-                    label="実用スキル条件"
-                    master={master}
-                    value={draft.practicalSkillCondition}
-                    onChange={(practicalSkillCondition) =>
-                      setDraft({ ...draft, practicalSkillCondition })
-                    }
-                  />
-                </Stack>
+                <SkillConditionEditor
+                  label="完成スキル条件"
+                  master={master}
+                  value={draft.completionSkillCondition}
+                  onChange={(completionSkillCondition) =>
+                    setDraft({ ...draft, completionSkillCondition })
+                  }
+                  reviewNote={
+                    draft.completionConditionReview.includes('skill_condition_normalized')
+                      ? completionConditionReviewSectionNotes.skill_condition_normalized
+                      : null
+                  }
+                />
                 <TextField
                   label="メモ"
                   multiline
@@ -1021,8 +1266,14 @@ export function TargetWeaponsPage({
           {/* Never shrinks: 保存 / キャンセル stay reachable however long the
               form or the error is. */}
           <DialogActions sx={{ px: { xs: 2, sm: 3 }, py: 1.5, gap: 1, flexShrink: 0 }}>
-            <Button onClick={closeDialog} disabled={planGuard.busy} sx={{ minHeight: 44 }}>キャンセル</Button>
-            <Button variant="contained" disabled={planGuard.busy} onClick={() => void save()} sx={{ minHeight: 44, minWidth: 96 }}>
+            <Button onClick={closeDialog} disabled={planGuard.busy || savePending} sx={{ minHeight: 44 }}>キャンセル</Button>
+            <Button
+              ref={saveButtonRef}
+              variant="contained"
+              disabled={planGuard.busy || savePending}
+              onClick={() => void save()}
+              sx={{ minHeight: 44, minWidth: 96 }}
+            >
               保存
             </Button>
           </DialogActions>
@@ -1030,6 +1281,8 @@ export function TargetWeaponsPage({
         <OwnedIdealCompletionDialog
           pending={completion.pending}
           affectedTargets={completion.affectedTargets}
+          otherSatisfiedTargets={completion.otherSatisfiedTargets}
+          unrecordedCompletedTargets={completion.unrecordedCompletedTargets}
           submitting={completion.submitting}
           error={completion.error}
           onCancel={completion.cancel}
@@ -1037,6 +1290,11 @@ export function TargetWeaponsPage({
         />
         <ReopenTargetDialog
           target={reopening}
+          completionWeaponName={
+            reopening?.completedWithOwnedWeaponId != null
+              ? (ownedWeaponById.get(reopening.completedWithOwnedWeaponId)?.name ?? null)
+              : null
+          }
           submitting={reopenSubmitting}
           error={reopenError}
           onCancel={() => {
@@ -1046,6 +1304,12 @@ export function TargetWeaponsPage({
             }
           }}
           onConfirm={() => void reopen()}
+        />
+        <TargetCompletionOverlapDialog
+          confirmations={overlapPrompt?.confirmations ?? null}
+          mode={overlapPrompt?.mode ?? 'new'}
+          onBack={() => settleOverlapPrompt(false)}
+          onContinue={() => settleOverlapPrompt(true)}
         />
         <PlanBreakingChangeDialog controller={planGuard} />
       </Stack>

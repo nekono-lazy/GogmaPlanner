@@ -5,6 +5,7 @@ import {
 } from '../../domain/execution'
 import type { MasterDataRoot } from '../../domain/master/masterTypes'
 import type {
+  BuildListEntry,
   ExecutionHistory,
   ExpectedResult,
   NormalArtianCounter,
@@ -16,8 +17,13 @@ import type {
   TargetWeapon,
   TargetWeaponId,
 } from '../../domain/models/publicTypes'
+import type { TargetEvaluationMasterSubset } from '../../domain/target/targetEvaluationTypes'
 import { planStepOperationLabels } from '../../presentation/labels'
 import { orderPlanSteps } from '../planner/productionPlanPresentation'
+import {
+  describeEntryAchievedCompletionVariants,
+  type AchievedCompletionVariants,
+} from '../target/completionConditionPresentation'
 
 /**
  * Pure presentation over an exact persisted ProductionPlan for the Execution
@@ -106,8 +112,13 @@ export interface ExecutionStepPresentation {
   expected: ExecutionExpectedView
   /** Target names from `executionEffects.targetCompletions` only. */
   completionTargetLabels: string[]
-  /** The Step carries `checkpointMilestones`: it reaches a selected intermediate state. */
-  reachesCheckpoint: boolean
+  /**
+   * The same completions with the completion Variants each achieves, judged at
+   * display time (`docs/REQUIREMENTS.md` 13.2) from the completing Entry's
+   * Candidate Snapshot and the current Target. `achieved` is null when the
+   * caller gave no completion sources.
+   */
+  completionTargets: ExecutionCompletionTargetView[]
   /**
    * The game operation of a `create_normal_artian` Step whose
    * `executionEffects.normalCreationRole` is recorded (Issue #275), shown in
@@ -333,11 +344,28 @@ function actionKindFor(step: PlanStep): ExecutionStepActionKind {
   }
 }
 
+/** One Target a Step completes and, when the caller gave the sources, the completion Variants it achieves. */
+export interface ExecutionCompletionTargetView {
+  label: string
+  achieved: AchievedCompletionVariants | null
+}
+
+/**
+ * What the achieved completion Variants of a Step's completions are judged
+ * from: the Navigator snapshot's Build List Entries (whose Candidate Snapshot
+ * is the completion result the Step confirms) and the Master. Display only.
+ */
+export interface ExecutionCompletionSources {
+  buildListEntries: readonly BuildListEntry[]
+  master: TargetEvaluationMasterSubset
+}
+
 export function createExecutionStepPresentation(
   step: PlanStep,
   ownedWeapons: readonly OwnedWeapon[],
   targetWeapons: readonly TargetWeapon[],
   normalCreationSources: ExecutionNormalCreationSources,
+  completionSources: ExecutionCompletionSources | null = null,
 ): ExecutionStepPresentation {
   const effects = step.executionEffects
   const actionKind = actionKindFor(step)
@@ -374,7 +402,16 @@ export function createExecutionStepPresentation(
     completionTargetLabels: (effects?.targetCompletions ?? []).map(({ targetWeaponId }) =>
       targetWeaponLabel(targetWeaponId, targetWeapons),
     ),
-    reachesCheckpoint: (step.checkpointMilestones ?? []).length > 0,
+    completionTargets: (effects?.targetCompletions ?? []).map(({ targetWeaponId, buildListEntryId }) => ({
+      label: targetWeaponLabel(targetWeaponId, targetWeapons),
+      achieved: completionSources === null
+        ? null
+        : describeEntryAchievedCompletionVariants(
+            completionSources.buildListEntries.find(({ id }) => id === buildListEntryId),
+            targetWeapons.find(({ id }) => id === targetWeaponId),
+            completionSources.master,
+          ),
+    })),
     normalCreation: createNormalCreationGuidance(step, target, normalCreationSources),
   }
 }
@@ -425,6 +462,24 @@ export function weaponSwitchTarget(
 export const SAVE_POINT_UNSAFE_MESSAGE =
   'このセーブ地点を安全に復元できません。必要な所持武器・目標武器・作成リストの状態を確認し、現在状態から再計画してください。状態は変更されていません。'
 
+/**
+ * The execution history holds a record the database upgrade could not convert
+ * (`docs/DATA_MODEL.md` 14.2, case 2), so nothing that depends on it can be
+ * decided. Never read as "no history" or "nothing to re-identify"; the only
+ * recoveries are a full-replacement Import or clearing all data.
+ */
+export const EXECUTION_HISTORY_UNCONVERTIBLE_MESSAGE =
+  '実行履歴に現在の形式へ変換できない記録があるため、この操作はできません。状態は変更されていません。バックアップからの全置換Import、または全データクリアで回復できます。'
+
+/**
+ * Why an operation that reads every ExecutionHistory record refused
+ * (`execution_history_record_invalid`, `docs/DATA_MODEL.md` 14.6): a record of
+ * the current shape lacks its Undo body, or a body lacks its record or is
+ * broken, so what it holds is unknown and nothing was decided or written.
+ */
+export const EXECUTION_HISTORY_RECORD_INVALID_MESSAGE =
+  '実行履歴の記録とUndo情報の対応が壊れているため、参照を確認できず、この操作はできません。状態は変更されていません。バックアップからの全置換Import、または全データクリアで回復できます。'
+
 /** A typed Execution runtime refusal, in the words the Navigator shows. */
 export function executionErrorMessage(code: ExecutionRuntimeErrorCode): string {
   switch (code) {
@@ -446,6 +501,8 @@ export function executionErrorMessage(code: ExecutionRuntimeErrorCode): string {
       return 'この生産計画が前提とする目標武器または作成リストが変更されています。'
     case 'execution_state_mismatch':
       return '現在の保存状態が、このStep開始時の想定と一致しません。'
+    case 'completion_assignment_conflict':
+      return 'この生産計画は、1本の所持武器を2件の目標武器の完成品にする予定を含むため続行できません。作成プランで理由と再計画の導線を確認してください。'
     case 'observation_required':
       return 'ゲーム画面で確認した実際の5枠を入力してください。'
     case 'observation_not_expected':
@@ -504,10 +561,10 @@ export function executionErrorMessage(code: ExecutionRuntimeErrorCode): string {
     case 'undo_snapshot_invalid':
     case 'undo_result_invalid':
       return '操作前の状態を正しく復元できないため、Undoしませんでした。状態は変更されていません。'
-    case 'compromise_finish_not_applicable':
-      return 'この武器は作成リストで選んだ途中採用状態として終了できません。'
-    case 'compromise_checkpoint_not_current':
-      return '途中採用状態は既に通過しているため、妥協品として終了できません。'
+    case 'execution_history_unconvertible':
+      return EXECUTION_HISTORY_UNCONVERTIBLE_MESSAGE
+    case 'execution_history_record_invalid':
+      return EXECUTION_HISTORY_RECORD_INVALID_MESSAGE
     case 'execution_effect_inconsistent':
     case 'expected_state_after_mismatch':
     case 'collection_validation_failed':

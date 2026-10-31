@@ -17,6 +17,8 @@ import {
   COMPLETE_WITH_OWNED_IDEAL_LABEL,
   COMPLETE_WITH_OWNED_IDEAL_TITLE,
   COMPLETE_WITH_OWNED_IDEAL_UNCHANGED_NOTE,
+  COMPLETE_WITH_OWNED_IDEAL_UNRECORDED_NOTE,
+  completeWithOwnedIdealCrossSatisfactionNote,
 } from './ownedIdealPresentation'
 
 const actionSx = { minHeight: 44, width: { xs: '100%', sm: 'auto' } } as const
@@ -26,6 +28,10 @@ export interface OwnedIdealCompletionDialogProps {
   pending: { target: TargetWeapon; weapon: OwnedGogmaArtianWeapon } | null
   /** The other Targets that prefer the weapon and will lose that preference. */
   affectedTargets: readonly TargetWeapon[]
+  /** The other active Targets the weapon also satisfies; they stay active (Issue #334). */
+  otherSatisfiedTargets?: readonly TargetWeapon[]
+  /** Completed Targets whose completion weapon was not recorded and the weapon satisfies (Issue #334). */
+  unrecordedCompletedTargets?: readonly TargetWeapon[]
   submitting: boolean
   error: string | null
   onCancel(): void
@@ -42,6 +48,8 @@ export interface OwnedIdealCompletionDialogProps {
 export function OwnedIdealCompletionDialog({
   pending,
   affectedTargets,
+  otherSatisfiedTargets = [],
+  unrecordedCompletedTargets = [],
   submitting,
   error,
   onCancel,
@@ -84,6 +92,17 @@ export function OwnedIdealCompletionDialog({
                 {COMPLETE_WITH_OWNED_IDEAL_AFFECTED_NOTE}
               </Typography>
             </>
+          )}
+          {otherSatisfiedTargets.length > 0 && (
+            // Issue #334 (`docs/UI_FLOW.md` 8.2): one weapon completes one Target.
+            <Typography component="p" variant="body2" sx={{ mt: 1.5, overflowWrap: 'anywhere' }}>
+              {completeWithOwnedIdealCrossSatisfactionNote(pending.target, otherSatisfiedTargets)}
+            </Typography>
+          )}
+          {unrecordedCompletedTargets.length > 0 && (
+            <Typography component="p" variant="body2" sx={{ mt: 1, overflowWrap: 'anywhere' }}>
+              {COMPLETE_WITH_OWNED_IDEAL_UNRECORDED_NOTE}
+            </Typography>
           )}
         </DialogContentText>
       </DialogContent>

@@ -10,6 +10,7 @@ import {
   hasConfirmedGogmaInputs,
   hasConfirmedSkillInputs,
   isAvailableRouteSource,
+  partitionCompletionAssignedRouteSources,
   partitionExcludedRouteSources,
   type RouteSearchContext,
   type RouteSearchResult,
@@ -69,14 +70,20 @@ const amendmentKinds = ['existing_gogma_reset_bonuses', 'existing_gogma_keep_bon
 /**
  * Why the amendment RouteKinds have no unprotected source left: the request's
  * source exclusion (SEARCH_SPEC 3.3) when it removed an unprotected source,
- * otherwise the ordinary protection reason, exactly as without the exclusion.
+ * then the completion assignment of another Target (5.5.1, Issue #334) when it
+ * removed one, otherwise the ordinary protection reason, exactly as without
+ * either.
  */
 function noUnprotectedSource(
   excluded: readonly OwnedGogmaArtianWeapon[],
+  assigned: readonly OwnedGogmaArtianWeapon[],
   detail: string,
-): { reason: 'source_excluded_for_other_targets' | 'no_unprotected_source_weapon'; detail: string } {
-  return excluded.some((weapon) => !weapon.isProtected)
-    ? { reason: 'source_excluded_for_other_targets', detail: 'Every unprotected owned Gogma source is excluded for use by other Target weapons.' }
+): { reason: 'source_excluded_for_other_targets' | 'source_completion_assigned' | 'no_unprotected_source_weapon'; detail: string } {
+  if (excluded.some((weapon) => !weapon.isProtected)) {
+    return { reason: 'source_excluded_for_other_targets', detail: 'Every unprotected owned Gogma source is excluded for use by other Target weapons.' }
+  }
+  return assigned.some((weapon) => !weapon.isProtected)
+    ? { reason: 'source_completion_assigned', detail: 'Every unprotected owned Gogma source is the completion of another Target weapon.' }
     : { reason: 'no_unprotected_source_weapon', detail }
 }
 
@@ -85,16 +92,24 @@ export async function searchExistingGogmaRoutes(context: RouteSearchContext, sch
   const result: RouteSearchResult = { candidates: [], searchedRoutes: [], skippedRoutes: [], warnings: [] }
   // The request's source exclusion (SEARCH_SPEC 3.3) applies on top of every
   // source rule, before any base or prediction exists for the weapon; the
-  // zero-operation current Route of a protected weapon is excluded too.
-  const { kept: all, excluded } = partitionExcludedRouteSources(context, compatibleSources(context))
+  // zero-operation current Route of a protected weapon is excluded too. A
+  // weapon another Target was completed with is no Route base at all, its
+  // zero-operation current Route included, protected or not (SEARCH_SPEC
+  // 5.5.1, Issue #334); it is removed before the request's exclusion.
+  const { kept: unassigned, assigned } = partitionCompletionAssignedRouteSources(context, compatibleSources(context))
+  const { kept: all, excluded } = partitionExcludedRouteSources(context, unassigned)
   if (excluded.length > 0) result.excludedSourceOwnedWeaponIds = excluded.map(({ id }) => id)
   if (all.length === 0) {
     if (excluded.length === 0) {
+      if (assigned.length > 0) {
+        pushAll(result, ['existing_gogma_current', ...amendmentKinds], 'source_completion_assigned', 'Every compatible owned Gogma source is the completion of another Target weapon.')
+        return result
+      }
       pushAll(result, ['existing_gogma_current', ...amendmentKinds], 'no_owned_weapon_available', 'No compatible owned Gogma weapon is available.')
       return result
     }
     result.skippedRoutes.push({ route: 'existing_gogma_current', reason: 'source_excluded_for_other_targets', detail: 'Every compatible owned Gogma source is excluded for use by other Target weapons.' })
-    const shortage = noUnprotectedSource(excluded, 'Only protected sources are available for performance-amendment routes.')
+    const shortage = noUnprotectedSource(excluded, assigned, 'Only protected sources are available for performance-amendment routes.')
     pushAll(result, amendmentKinds, shortage.reason, shortage.detail)
     return result
   }
@@ -124,7 +139,7 @@ export async function searchExistingGogmaRoutes(context: RouteSearchContext, sch
   } else if (mutableSources.length === 0) {
     result.skippedRoutes.push({
       route: 'existing_gogma_reset_skills',
-      ...noUnprotectedSource(excluded, 'Only protected sources are available for Reset Skills routes.'),
+      ...noUnprotectedSource(excluded, assigned, 'Only protected sources are available for Reset Skills routes.'),
     })
   } else {
     result.skippedRoutes.push({
@@ -183,7 +198,7 @@ export async function searchExistingGogmaRoutes(context: RouteSearchContext, sch
   }
 
   if (mutableSources.length === 0) {
-    const shortage = noUnprotectedSource(excluded, 'Only protected sources are available for performance-amendment routes.')
+    const shortage = noUnprotectedSource(excluded, assigned, 'Only protected sources are available for performance-amendment routes.')
     pushAll(result, bonusAmendmentKinds, shortage.reason, shortage.detail)
     return result
   }

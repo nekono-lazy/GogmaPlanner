@@ -1,11 +1,20 @@
-import Dexie, { type Table } from 'dexie'
+import Dexie, { type Table, type Transaction } from 'dexie'
+import { upgradeExecutionHistoryToV11 } from './executionHistoryV11Migration'
 import { migrateLegacyTargetCompromise } from './migrateLegacyTargetCompromise'
+import {
+  LegacyTargetWeaponMigrationError,
+  migrateLegacyTargetWeaponList,
+  migrateLegacyTargetWeaponToCompletionConditions,
+} from '../domain/models/legacyTargetWeapon'
 import {
   fillNonTerminalPlanLifecycle,
   fillNormalCounterIdentificationProvenance,
   fillProductionPlanConflictRepairLineage,
   fillRngStateIdentificationProvenance,
+  fillTargetWeaponCompletionAssignment,
+  fillTargetWeaponListCompletionAssignment,
   isDraftProductionPlanRecord,
+  TargetCompletionAssignmentMigrationError,
   upgradeAppSettingsToV2,
 } from '../domain/models/persistenceCompatibility'
 import type {
@@ -14,6 +23,7 @@ import type {
   BuildListEntry,
   ExecutionHistory,
   ExecutionSavePoint,
+  ExecutionUndoSnapshot,
   NormalArtianCounter,
   OwnedWeapon,
   ProductionPlan,
@@ -22,7 +32,7 @@ import type {
 } from '../domain/models/publicTypes'
 
 export const DATABASE_NAME = 'mh-wilds-gogma-artian-planner'
-export const DATABASE_SCHEMA_VERSION = 10
+export const DATABASE_SCHEMA_VERSION = 13
 
 export class AppDatabase extends Dexie {
   rngState!: Table<RngState, 'current'>
@@ -32,7 +42,15 @@ export class AppDatabase extends Dexie {
   buildCandidates!: Table<BuildCandidate, string>
   buildListEntries!: Table<BuildListEntry, string>
   productionPlans!: Table<ProductionPlan, string>
+  /**
+   * The ExecutionHistory metadata (`docs/DATA_MODEL.md` 12.2). A record the
+   * version 11 upgrade could not convert is kept here in its version 10 shape;
+   * read the table through `ExecutionHistoryRepository`, which never returns
+   * such a record as metadata.
+   */
   executionHistory!: Table<ExecutionHistory, string>
+  /** The ExecutionHistory Undo bodies, keyed by `executionHistoryId` (`docs/DATA_MODEL.md` 12.2). */
+  executionUndoSnapshots!: Table<ExecutionUndoSnapshot, string>
   executionSavePoints!: Table<ExecutionSavePoint, string>
   settings!: Table<AppSettings, 'settings'>
 
@@ -252,7 +270,7 @@ export class AppDatabase extends Dexie {
     // ExecutionHistory, and a body already carrying the field is left as it is.
     // The calculation boundary is separate: `CURRENT_CALCULATION_APP_SCHEMA_VERSION`
     // 16 fails every earlier Plan closed through its CalculationContext.
-    this.version(DATABASE_SCHEMA_VERSION).stores({}).upgrade(async (transaction) => {
+    this.version(10).stores({}).upgrade(async (transaction) => {
       const fillPlan = (value: unknown) => {
         if (isPlainRecord(value)) fillProductionPlanConflictRepairLineage(value)
       }
@@ -270,7 +288,111 @@ export class AppDatabase extends Dexie {
         if (isPlainRecord(savePointBefore)) fillPlan(savePointBefore.productionPlan)
       })
     })
+    // v11 splits ExecutionHistory into its metadata and its Undo body
+    // (`docs/DATA_MODEL.md` 12.2 / 14.2, `docs/PLANNER_SPEC.md` 19.8, Issue #312):
+    // the new `executionUndoSnapshots` table (key `executionHistoryId`, no index)
+    // holds the bodies, which no longer copy the whole Plan, and every existing
+    // record is converted in this one versionchange transaction. The
+    // `executionHistory` indexes stay as they are and no compound index is
+    // added. A record that cannot be converted - broken data only - stays in
+    // its version 10 shape without a body (case 2); any failure aborts the
+    // whole upgrade and leaves the database at version 10 (case 3). No other
+    // table changes and no calculation semantics change, so
+    // `CURRENT_CALCULATION_APP_SCHEMA_VERSION` stays where it is and no Plan
+    // becomes stale.
+    this.version(11).stores({
+      executionUndoSnapshots: 'executionHistoryId',
+    }).upgrade(upgradeExecutionHistoryToV11)
+    // v12 moves every TargetWeapon body to the Issue #100 completion condition
+    // (`docs/DATA_MODEL.md` 8.6 / 14.2, `docs/PLANNER_SPEC.md` 20.8): the
+    // `targetWeapons` table, the Target bodies of every game save point, of
+    // every Undo body and of the save point an Undo body holds as
+    // `deletedExecutionSavePoint`, all through the one pure conversion the
+    // Export schema 14 -> 15 migration shares. The Ideal five slots become one
+    // Variant with those ranks as minimums, the compromise conditions are
+    // removed (never turned into a Variant) and flagged for review, `any` is
+    // normalized to `all` and flagged, and the former `compromiseNeedsReview`
+    // is dropped. No table or index changes (no Target index holds a
+    // performance definition). BuildCandidate, BuildListEntry, ProductionPlan
+    // and ExecutionHistory bodies are untouched: the calculation schema 19
+    // boundary makes them `calculation_context_changed`. A body without the
+    // legacy structure throws, which aborts the whole upgrade and leaves the
+    // database at version 11 for a retry.
+    this.version(12).stores({}).upgrade(upgradeTargetWeaponsToV12)
+    // v13 adds the completion assignment `completedWithOwnedWeaponId` to every
+    // TargetWeapon body (Issue #334, `docs/DATA_MODEL.md` 8.7 / 14.2,
+    // `docs/PLANNER_SPEC.md` 21.3 / 21.9): the `targetWeapons` table, the Target
+    // bodies of every game save point, of every Undo body and of the save point
+    // an Undo body holds as `deletedExecutionSavePoint` get `null` ("not
+    // recorded") through the one fill the Export schema 15 -> 16 migration
+    // shares. A completed Target gets `null` too: the weapon that completed it is
+    // never inferred from `completedByProductionPlanId`, a Plan's
+    // `targetCompletions`, an owned Ideal or a preference. No table or index
+    // changes, and no BuildCandidate, BuildListEntry, ProductionPlan or
+    // ExecutionHistory metadata body is rewritten; a version 10 record the
+    // version 11 upgrade kept (case 2) is left exactly as persisted. No
+    // assignment exists before this version, so no calculation result changes
+    // and `CURRENT_CALCULATION_APP_SCHEMA_VERSION` stays where it is. A body that
+    // already carries the field is not a version 12 body: it throws, which
+    // aborts the whole upgrade and leaves the database at version 12 for a retry.
+    this.version(DATABASE_SCHEMA_VERSION).stores({}).upgrade(upgradeTargetWeaponsToV13)
   }
+}
+
+async function upgradeTargetWeaponsToV13(transaction: Transaction): Promise<void> {
+  await transaction.table('targetWeapons').toCollection().modify((target: Record<string, unknown>) => {
+    fillTargetWeaponCompletionAssignment(target, `targetWeapons[${String(target.id)}]`)
+  })
+  await transaction.table('executionSavePoints').toCollection().modify((savePoint: Record<string, unknown>) => {
+    fillTargetWeaponListCompletionAssignment(
+      savePoint.targetWeapons,
+      `executionSavePoints[${String(savePoint.id)}].targetWeapons`,
+    )
+  })
+  await transaction.table('executionUndoSnapshots').toCollection().modify((snapshot: Record<string, unknown>) => {
+    const path = `executionUndoSnapshots[${String(snapshot.executionHistoryId)}]`
+    fillTargetWeaponListCompletionAssignment(snapshot.affectedTargetWeaponsBefore, `${path}.affectedTargetWeaponsBefore`)
+    const deleted = snapshot.deletedExecutionSavePoint
+    if (deleted === null || deleted === undefined) return
+    if (!isPlainRecord(deleted)) {
+      throw new TargetCompletionAssignmentMigrationError(`${path}.deletedExecutionSavePoint`, 'A deleted save point must be an object or null.')
+    }
+    fillTargetWeaponListCompletionAssignment(deleted.targetWeapons, `${path}.deletedExecutionSavePoint.targetWeapons`)
+  })
+}
+
+async function upgradeTargetWeaponsToV12(transaction: Transaction): Promise<void> {
+  await transaction.table('targetWeapons').toCollection().modify((target: Record<string, unknown>) => {
+    replaceRecord(target, migrateLegacyTargetWeaponToCompletionConditions(target, `targetWeapons[${String(target.id)}]`))
+  })
+  await transaction.table('executionSavePoints').toCollection().modify((savePoint: Record<string, unknown>) => {
+    savePoint.targetWeapons = migrateLegacyTargetWeaponList(
+      savePoint.targetWeapons,
+      `executionSavePoints[${String(savePoint.id)}].targetWeapons`,
+    )
+  })
+  await transaction.table('executionUndoSnapshots').toCollection().modify((snapshot: Record<string, unknown>) => {
+    const path = `executionUndoSnapshots[${String(snapshot.executionHistoryId)}]`
+    snapshot.affectedTargetWeaponsBefore = migrateLegacyTargetWeaponList(
+      snapshot.affectedTargetWeaponsBefore,
+      `${path}.affectedTargetWeaponsBefore`,
+    )
+    const deleted = snapshot.deletedExecutionSavePoint
+    if (deleted === null || deleted === undefined) return
+    if (!isPlainRecord(deleted)) {
+      throw new LegacyTargetWeaponMigrationError(`${path}.deletedExecutionSavePoint`, 'A deleted save point must be an object or null.')
+    }
+    deleted.targetWeapons = migrateLegacyTargetWeaponList(
+      deleted.targetWeapons,
+      `${path}.deletedExecutionSavePoint.targetWeapons`,
+    )
+  })
+}
+
+/** Replaces every field of a record Dexie `modify()` hands over, keeping the object identity Dexie writes back. */
+function replaceRecord(record: Record<string, unknown>, next: Record<string, unknown>): void {
+  Object.keys(record).forEach((key) => delete record[key])
+  Object.assign(record, next)
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {

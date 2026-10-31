@@ -2,7 +2,7 @@ import { useId, type ReactNode } from 'react'
 import { Box, Button, Stack, Typography } from '@mui/material'
 import { useTheme } from '@mui/material/styles'
 import type { ArtianBonusScope, MasterDataRoot } from '../domain/master/masterTypes'
-import type { RestorationBonusSet } from '../domain/models/publicTypes'
+import type { BonusRankId, RestorationBonusSet } from '../domain/models/publicTypes'
 import {
   isRestorationBonusExRank,
   resolveRestorationBonusTone,
@@ -139,12 +139,15 @@ export function BonusSlotList({
   weaponTypeId,
   master,
   scope,
+  formatLabel,
 }: {
   heading: string
   bonuses: RestorationBonusSet
   weaponTypeId: string
   master: MasterDataRoot
   scope: ArtianBonusScope
+  /** Words around one slot label, given its rank ID; a completion Variant reads 「… III以上」 / 「… EX」. */
+  formatLabel?(label: string, bonusRankId: BonusRankId): string
 }) {
   const headingId = useId()
   const theme = useTheme()
@@ -191,7 +194,9 @@ export function BonusSlotList({
                 {index + 1}
               </Typography>
               <Typography component="span" variant="body2" sx={{ overflowWrap: 'anywhere' }}>
-                {bonusLabel(bonus, weaponTypeId, master, scope)}
+                {formatLabel
+                  ? formatLabel(bonusLabel(bonus, weaponTypeId, master, scope), bonus.bonusRankId)
+                  : bonusLabel(bonus, weaponTypeId, master, scope)}
               </Typography>
             </Box>
           )

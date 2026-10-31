@@ -1,11 +1,12 @@
 /*
  * Layout shared by the Export / Import Dialogs (`docs/UI_FLOW.md` 14 / 3.1).
- * The JSON is never truncated: it scrolls inside a fixed-height field that
- * wraps long tokens, so neither the Dialog nor the page scrolls sideways on a
- * 375px screen.
+ * Only the Import Dialog has a JSON field: the pasted JSON is never truncated,
+ * it scrolls inside a fixed-height field that wraps long tokens, so neither
+ * the Dialog nor the page scrolls sideways on a 375px screen. The Export
+ * Dialog renders no JSON at all (`docs/PLANNER_SPEC.md` 19.9).
  */
 
-/** A little more width for the JSON on a phone than the MUI default 32px margins give. */
+/** A little more width on a phone than the MUI default 32px margins give. */
 export const dataTransferDialogPaperSx = {
   m: { xs: 1.5, sm: 4 },
   width: { xs: 'calc(100% - 24px)', sm: 'calc(100% - 64px)' },
@@ -20,9 +21,8 @@ export const dataTransferDialogPaperSx = {
 export const JSON_TEXT_FIELD_ROWS = 14
 
 /**
- * A monospace multiline field with internal scroll. `fontSize` differs per
- * Dialog: the editable Import field keeps 16px on a phone so iOS does not zoom
- * on focus.
+ * A monospace multiline field with internal scroll. The editable Import field
+ * keeps 16px on a phone so iOS does not zoom on focus.
  */
 export function jsonTextFieldSx(fontSize: string | { xs: string; sm: string }) {
   return {

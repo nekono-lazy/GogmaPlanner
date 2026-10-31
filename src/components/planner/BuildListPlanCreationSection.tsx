@@ -26,7 +26,6 @@ import {
   buildListOptimizationOutcomeOf,
 } from './buildListOptimizationPresentation'
 import {
-  ADOPTION_INSPECTING_MESSAGE,
   PLAN_CREATION_BUSY_MESSAGE,
   PLAN_CREATION_CANCELLED_MESSAGE,
   PLAN_CREATION_DRAFT_REPLACED_NOTE,
@@ -43,6 +42,7 @@ import {
   PLAN_CREATION_RUNNING_PLAN_MESSAGE,
   PLAN_CREATION_SAVING_MESSAGE,
   PLAN_CREATION_SETTINGS_HEADING,
+  isPlanCreationOrdinaryPlannerSettingsShown,
   ordinaryPlannerRetryAction,
   planCreationOptimizationLines,
   planCreationUnsupportedLead,
@@ -60,6 +60,10 @@ import {
   productionPlannerRunningTitles,
 } from './productionPlannerSettingsPresentation'
 import type { BuildListPlanCreationController, OrdinaryPlannerSaveState } from './useBuildListPlanCreation'
+import { CompletionAssignmentConflictAlert } from '../execution/CompletionAssignmentConflictAlert'
+import type { CompletionAssignmentNames } from '../execution/completionAssignmentConflictPresentation'
+
+const UNRESOLVED_COMPLETION_ASSIGNMENT_NAMES: CompletionAssignmentNames = { targetName: () => null, weaponName: () => null }
 
 const cancelButtonSx = { minHeight: 44, alignSelf: { xs: 'stretch', sm: 'flex-start' } } as const
 
@@ -91,19 +95,27 @@ function IndeterminateStatus({ title, progressLabel, note, onCancel }: { title: 
  * (`docs/UI_FLOW.md` 10.0 / 10.1 / 10.2): the indeterminate running state, an incomplete search (never saved), the save, the no-Plan
  * notice, a failure, a cancellation and the Planner warnings.
  */
+/** What a refused save names the Targets and weapons with (Issue #334), and whether IDs show (Debug Mode). */
+interface CompletionAssignmentDisplay {
+  completionAssignmentNames: CompletionAssignmentNames
+  debugMode: boolean
+}
+
 function OrdinaryPlannerRunDisplay({
   operation,
   runId,
   run,
   save,
   onCancel,
+  completionAssignmentNames,
+  debugMode,
 }: {
   operation: PlanCreationOperation
   runId: number
   run: OrdinaryPlannerRunState
   save: OrdinaryPlannerSaveState | null
   onCancel(): void
-}) {
+} & CompletionAssignmentDisplay) {
   switch (run.status) {
     case 'running':
       return <IndeterminateStatus title={productionPlannerRunningTitles.plan} progressLabel="生産計画の作成中" note={productionPlannerRunningNote} onCancel={onCancel} />
@@ -139,7 +151,20 @@ function OrdinaryPlannerRunDisplay({
             </Box>
           )}
           {ownSave?.status === 'no_plan' && <Alert severity="info">{PLAN_CREATION_NO_PLAN_MESSAGE}</Alert>}
-          {ownSave?.status === 'failed' && <Alert severity="error">{ownSave.message}</Alert>}
+          {ownSave?.status === 'failed' && (ownSave.completionAssignmentIssues !== undefined
+            ? (
+                // Issue #334 (`docs/UI_FLOW.md` 12.11): nothing was saved; the user
+                // reviews the Candidates or completes one Target directly.
+                <CompletionAssignmentConflictAlert
+                  title="この生産計画は保存できません"
+                  issues={ownSave.completionAssignmentIssues}
+                  names={completionAssignmentNames}
+                  debugMode={debugMode}
+                  recovery={<Typography variant="body2">作成リストと未開始の生産計画は変更されていません。</Typography>}
+                  links={[{ label: '目標武器を見る', to: '/target-weapons' }]}
+                />
+              )
+            : <Alert severity="error">{ownSave.message}</Alert>)}
           {result.warnings.length > 0 && (
             <Alert severity="warning">
               <AlertTitle>Planner警告</AlertTitle>
@@ -169,12 +194,14 @@ function PressDisplay({
   slot,
   save,
   onCancel,
+  completionAssignmentNames,
+  debugMode,
 }: {
   operation: PlanCreationOperation
   slot: PrimaryPlanCreationState
   save: OrdinaryPlannerSaveState | null
   onCancel(): void
-}) {
+} & CompletionAssignmentDisplay) {
   switch (slot.status) {
     case 'preparing':
       return <IndeterminateStatus title={PLAN_CREATION_PREPARING_TITLE} progressLabel="作成リストの確認中" onCancel={onCancel} />
@@ -185,7 +212,17 @@ function PressDisplay({
       return <Alert severity={notice.severity}>{notice.message}</Alert>
     }
     case 'ordinary_planner':
-      return <OrdinaryPlannerRunDisplay operation={operation} runId={slot.runId} run={slot.run} save={save} onCancel={onCancel} />
+      return (
+        <OrdinaryPlannerRunDisplay
+          operation={operation}
+          runId={slot.runId}
+          run={slot.run}
+          save={save}
+          onCancel={onCancel}
+          completionAssignmentNames={completionAssignmentNames}
+          debugMode={debugMode}
+        />
+      )
     case 'idle':
     case 'disposed':
     case 'build_list_optimization':
@@ -196,8 +233,9 @@ function PressDisplay({
 /**
  * 「生産計画の作成」 of the Build List (`docs/UI_FLOW.md` 10.2 / 10.4, `docs/PLANNER_SPEC.md` 17.2, Issue #260 PR-6C): the one primary
  * operation 「生産計画を作成」, the pre-start body that says which method it runs for the judged state (and why it cannot start), the
- * ordinary Planner detail settings, and below them the running state, the typed results, the unsaved Preview, the ordinary Planner
- * auxiliary operation where a reason or a result offers it, and the adoption confirmation.
+ * ordinary Planner detail settings while an ordinary Planner operation is offered or shown (Issue #359), and below them the running
+ * state, the typed results, the unsaved Preview, the ordinary Planner auxiliary operation where a reason or a result offers it, and the
+ * adoption confirmation.
  *
  * It renders the controller's typed state and decides nothing: the method, the support and the auxiliary offer are the Domain's and
  * the Application's, the adoption contents the Persistence inspection's.
@@ -209,6 +247,7 @@ export function BuildListPlanCreationSection({
   plannerOptions,
   currentDraft,
   detailSettings,
+  completionAssignmentNames = UNRESOLVED_COMPLETION_ASSIGNMENT_NAMES,
 }: {
   controller: BuildListPlanCreationController
   master: MasterDataRoot
@@ -216,7 +255,14 @@ export function BuildListPlanCreationSection({
   /** The ordinary Planner setting, or null while it is invalid (U7: only the ordinary Planner operations read it). */
   plannerOptions: PlannerOptions | null
   currentDraft: ProductionPlan | null
+  /**
+   * The screen's one 「詳細設定（通常Planner用）」. Rendered only while an ordinary Planner operation - the one valid Entry
+   * 「生産計画を作成」 or the auxiliary operation - is offered or shown (`isPlanCreationOrdinaryPlannerSettingsShown()`); its value is
+   * the screen's state, so hiding it never resets what the user entered.
+   */
   detailSettings: ReactNode
+  /** Names a refused save's completion assignment issues by (Issue #334); without it they read as unresolved. */
+  completionAssignmentNames?: CompletionAssignmentNames
 }) {
   const descriptionId = useId()
   const invalidOptionsId = useId()
@@ -248,6 +294,8 @@ export function BuildListPlanCreationSection({
   const selection = preparation?.kind === 'judged' ? preparation.selection : null
   const method = selection === null ? null : planCreationMethodOf(selection)
   const ordinaryOptionsInvalid = method === 'ordinary_planner' && plannerOptions === null
+  // What the presses actually do decides first; the pre-start judgement (kept in place while it is read again) only stands in for them.
+  const settingsShown = isPlanCreationOrdinaryPlannerSettingsShown(preStart, state)
   const primaryDisabled = !controller.available || busy || method === null || ordinaryOptionsInvalid
 
   const auxiliaryInProgress = auxiliary.status === 'preparing' || (auxiliary.status === 'ordinary_planner' && auxiliary.run.status === 'running')
@@ -399,7 +447,7 @@ export function BuildListPlanCreationSection({
       {currentDraft !== null && (
         <Typography variant="body2" color="text.secondary">{PLAN_CREATION_DRAFT_REPLACED_NOTE}</Typography>
       )}
-      {detailSettings}
+      {settingsShown && detailSettings}
 
       {adoptionRefusal !== null && (
         <Alert
@@ -427,7 +475,14 @@ export function BuildListPlanCreationSection({
         </Alert>
       )}
 
-      <PressDisplay operation="primary" slot={primary} save={controller.ordinarySave} onCancel={controller.cancel} />
+      <PressDisplay
+        operation="primary"
+        slot={primary}
+        save={controller.ordinarySave}
+        onCancel={controller.cancel}
+        completionAssignmentNames={completionAssignmentNames}
+        debugMode={debugMode}
+      />
       {optimization !== null && optimizationOutcome === null && optimization.optimization.status !== 'disposed' && (
         <BuildListOptimizationRunningPanel
           runKey={optimization.runId}
@@ -449,22 +504,22 @@ export function BuildListPlanCreationSection({
           onRetry={() => controller.startPrimary(plannerOptions)}
           onAdopt={controller.requestAdoption}
           actionsDisabled={adoption.status === 'saving' || auxiliaryInProgress || ordinarySaving}
+          adoptionInspecting={adoption.status === 'inspecting'}
           focusHeadingOnMount
           adoptButtonRef={adoptButtonRef}
         />
       )}
-      {adoption.status === 'inspecting' && (
-        <Box role="status" aria-live="polite">
-          <Typography variant="body2">{ADOPTION_INSPECTING_MESSAGE}</Typography>
-          <LinearProgress aria-label={ADOPTION_INSPECTING_MESSAGE} sx={{ mt: 1 }} />
-        </Box>
-      )}
-      <PressDisplay operation="ordinary_planner_auxiliary" slot={auxiliary} save={controller.ordinarySave} onCancel={controller.cancel} />
+      <PressDisplay
+        operation="ordinary_planner_auxiliary"
+        slot={auxiliary}
+        save={controller.ordinarySave}
+        onCancel={controller.cancel}
+        completionAssignmentNames={completionAssignmentNames}
+        debugMode={debugMode}
+      />
 
       <BuildListOptimizationAdoptionDialog
         inspection={adoption.status === 'confirming' || adoption.status === 'saving' ? adoption.inspection : null}
-        startContext={optimization?.startContext ?? null}
-        master={master}
         submitting={adoption.status === 'saving'}
         onCancel={cancelAdoption}
         onConfirm={controller.confirmAdoption}

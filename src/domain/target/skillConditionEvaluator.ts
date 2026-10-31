@@ -17,8 +17,7 @@ export function evaluateSkillCondition(
     matches.push(condition.groupSkillId === groupSkillId)
   }
 
-  if (matches.length === 0) return true
-  return condition.matchMode === 'all'
-    ? matches.every(Boolean)
-    : matches.some(Boolean)
+  // Every specified Skill must match (`all`, `docs/DATA_MODEL.md` 8.4); none
+  // specified constrains nothing.
+  return matches.every(Boolean)
 }

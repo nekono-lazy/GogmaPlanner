@@ -172,18 +172,41 @@ export interface ExcludedBuildListEntry {
   reason: string
 }
 
+/**
+ * The *performance* satisfaction of one Target by the owned inventory: whether
+ * an owned Gogma meets the Target's completion condition
+ * (`docs/PLANNER_SPEC.md` 20.2 / 20.3), and which ones. Calculation schema
+ * 11..18 also carried a Practical tier (`hasPractical` /
+ * `practicalOwnedWeaponIds`); with the compromise conditions gone it equalled
+ * `hasIdeal` and was removed (Issue #100 stage 2, 20.10).
+ *
+ * Since calculation schema 20 (Issue #334 PR-3, `docs/PLANNER_SPEC.md` 21.2 /
+ * 21.5) this is **not** the Planner's completion of a Target: performance
+ * satisfaction is neither a completion assignment nor a lifecycle completion.
+ * The Planner tracks its run-internal completion in `PlannerTargetSatisfaction`
+ * and reads this derivation nowhere; the Global Assignment Research diagnostics
+ * and the owned-Ideal notice are its remaining readers.
+ */
 export interface TargetSatisfaction {
   targetWeaponId: TargetWeaponId
-  hasPractical: boolean
   hasIdeal: boolean
-  practicalOwnedWeaponIds: OwnedWeaponId[]
   idealOwnedWeaponIds: OwnedWeaponId[]
 }
 
-/** Planner-state form of Target satisfaction, indexed for direct lookup. */
+/**
+ * The Planner-state completion of one planning Target, indexed for direct
+ * lookup (Issue #334 PR-3, `docs/PLANNER_SPEC.md` 21.5).
+ *
+ * `completedInRun` is `true` exactly when the Target's own BuildListEntry
+ * secured a weapon in this run - its internal reserve right after its last
+ * physical unit, or its zero-operation `confirm_owned_ideal`. It is never
+ * derived from what the inventory performs: a weapon another Entry secured
+ * satisfies no other Target, an owned weapon that meets the condition at
+ * Planner start completes nothing, and no reserve of another Entry changes it.
+ * Calculation schema 11..19 held the inventory-derived `hasIdeal` here.
+ */
 export interface PlannerTargetSatisfaction {
-  hasPractical: boolean
-  hasIdeal: boolean
+  completedInRun: boolean
 }
 
 /** Immutable, branch-safe inventory used only by Planner calculations. */
@@ -198,9 +221,7 @@ export interface SimulatedInventory {
  * How valuable selecting one BuildListEntry is in one state.
  *
  * There is no category term any more: every Candidate is a canonical Ideal
- * Candidate, so a per-Candidate category score would be a constant. Selected
- * compromise checkpoints are a hard constraint, never a score
- * (`docs/PLANNER_SPEC.md` 7.5.3).
+ * Candidate, so a per-Candidate category score would be a constant.
  */
 export interface CandidateScore {
   targetPriorityScore: number
@@ -300,18 +321,16 @@ export interface PlannerSearchState {
   candidateReadySourceVersionByEntryId: Record<string, number>
   /** The existing-source version each Route is currently allowed to continue from. */
   routeSourceVersionByEntryId: Record<string, number>
-  /** Existing sources are excluded from satisfaction until a Candidate result is reserved. */
-  inFlightExistingSourceByOwnedWeaponId: Record<string, true>
-  securedOwnedWeaponIdByEntryId: Record<string, OwnedWeaponId>
   /**
-   * Which Entries' compromise checkpoints this branch has actually reached:
-   * the moment both lanes held their pinned state at once.
-   *
-   * A hard constraint's progress record, not a score: a branch may only secure
-   * an Entry's Candidate once the checkpoint the user selected for it has
-   * really been reached (`docs/PLANNER_SPEC.md` 7.5.3).
+   * The weapon each secured Entry completed its Target with: an existing
+   * source, or the ID reserved for a new weapon. One OwnedWeapon ID appears at
+   * most once (Issue #334 PR-3, `docs/PLANNER_SPEC.md` 21.5): a reserve of a
+   * weapon already secured here is refused. Calculation schema 11..19 also kept
+   * `inFlightExistingSourceByOwnedWeaponId`, which excluded a mutated source
+   * from the inventory-derived satisfaction; nothing derives satisfaction from
+   * the inventory any more.
    */
-  reachedCheckpointByEntryId: Record<string, true>
+  securedOwnedWeaponIdByEntryId: Record<string, OwnedWeaponId>
   trace: PlannerSearchAction[]
   /**
    * How many times the player has to put one weapon down and pick another one
@@ -333,18 +352,6 @@ export interface PlannerSearchState {
    */
   preferredSourceProgressCount: number
   /**
-   * How many stream-lane operations this branch executed against an Entry's
-   * improvement preference: a Bonus amendment while a `skill_first` Entry
-   * still had Skill lane units left, or the mirror image, counted only once
-   * that Entry's compromise checkpoint was reached (or from the start when it
-   * selected none).
-   *
-   * Plan preference only, never correctness or feasibility: it sits below the
-   * preferred-source preference and above `weaponSwitchCount` in
-   * `comparePlannerSearchStates()` (`docs/PLANNER_SPEC.md` 7.6).
-   */
-  improvementPreferenceViolationCount: number
-  /**
    * The weapon subject of the most recent switch-counted operation, or `null`
    * before the branch has run one. Operations with no continuously operated
    * subject - `reserve_weapon` above all - leave it untouched, so they never
@@ -362,14 +369,7 @@ export type PlannerSearchRejectionReason =
   | 'inventory_precondition_failed'
   | 'protected_destructive_use'
   | 'conflict_resolution_not_selected'
-  | 'candidate_already_satisfied'
   | 'rng_contract_unavailable'
-  /**
-   * The compromise checkpoint the user selected for this BuildListEntry was
-   * not reached: its Candidate may not be secured yet, and a lane may not run
-   * past its pinned state before the other lane arrived (PLANNER_SPEC 7.5.3).
-   */
-  | 'selected_checkpoint_not_reached'
   /**
    * The deterministic scheduler did not commit this BuildListEntry, or dropped
    * it from its commitment, because of a resource conflict it had to settle
@@ -442,7 +442,7 @@ export interface PlannerConflictProvisionalOutcome {
 /** The final route commitment state of one searchable Entry of a scheduler run. */
 export interface PlannerRouteCommitmentEntryEvidence {
   buildListEntryId: BuildListEntryId
-  status: 'committed' | 'secured' | 'not_needed' | 'released' | 'dropped'
+  status: 'committed' | 'secured' | 'dropped'
   /**
    * Set only when the Entry's final state is the drop a provisional outcome
    * decided - that decision was its terminal and only drop (a dropped Entry is
@@ -494,32 +494,35 @@ export type PlannerWarningKind =
   | 'protected_weapon_required'
   | 'build_list_entry_stale'
   | 'calculation_context_incompatible'
-  | 'all_targets_already_satisfied'
+  /*
+   * Calculation schema 11..19 also had `all_targets_already_satisfied` (every
+   * planning Target held an Ideal owned weapon at Planner start). Since Issue
+   * #334 PR-3 an owned weapon's performance completes no planning Target
+   * (`docs/PLANNER_SPEC.md` 21.5), so it cannot arise; warnings are never
+   * persisted, so no migration follows.
+   */
   | 'invalid_conflict_resolution'
   /**
    * The Production `maxPlanSteps` bound of a full Planner run. The Beam Search
    * oracle's own `maxExpandedStates` bound has no warning kind: its typed
    * `reachedLimits` alone reports it (Issue #103 Phase D-2b). The legacy B8
    * orchestration stop kinds were removed with that path (Phase 6-B2b): the
-   * Planner Alternative reports its bound stops and a checkpoint-blocked Target
-   * as typed comparison outcomes, never as warnings (PLANNER_SPEC 9.2.19.13).
+   * Planner Alternative reports its bound stops as typed outcomes, never as
+   * warnings (PLANNER_SPEC 9.2.19.13).
    */
   | 'max_steps_reached'
   /**
-   * Planner input fail-closed reasons for selected checkpoints
-   * (PLANNER_SPEC 7.5.6 / 7.5.7 / 7.5.8). The first two accompany a validation
-   * issue, so the Build List can say why no Plan was calculated; the third is
-   * informational: another Entry of a Target with a required checkpoint Entry
-   * was left out of this run's candidate selection.
-   */
-  | 'multiple_selected_checkpoint_entries'
-  | 'selected_checkpoint_target_already_ideal'
-  | 'selected_checkpoint_fixes_target_entry'
-  /**
-   * A BuildListEntry's `intermediateStateSelection` is structurally invalid
-   * (unknown id, an id of the other lane, unknown preference). The Planner input
-   * fails closed with a validation issue; the selection is never read as
-   * empty (PLANNER_SPEC 7.5.9).
+   * A BuildListEntry carries a legacy `intermediateStateSelection` the current
+   * Planner cannot plan (Issue #100, `docs/PLANNER_SPEC.md` 20.7 / 20.10): a
+   * structurally invalid one on any input Entry (unknown id, an id of the other
+   * lane, unknown preference, 7.5.9), or a selected opportunity on a valid
+   * Entry. The Planner input fails closed with a validation issue; the
+   * selection is never read as empty and never cleared.
+   *
+   * Calculation schema 11..18 also had `multiple_selected_checkpoint_entries`,
+   * `selected_checkpoint_target_already_ideal` and
+   * `selected_checkpoint_fixes_target_entry`; this one fail closed replaces
+   * them (warnings are never persisted).
    */
   | 'invalid_checkpoint_selection'
   /**
@@ -536,6 +539,15 @@ export type PlannerWarningKind =
    * Ideal weapon (`docs/DATA_MODEL.md` 8.1).
    */
   | 'completed_target_excluded'
+  /**
+   * A BuildListEntry whose Route references an owned weapon another Target was
+   * completed with (`TargetWeapon.completedWithOwnedWeaponId`, Issue #334,
+   * `docs/PLANNER_SPEC.md` 21.4) - its zero-operation weapon included - was left
+   * out of Planner input. Like `protected_weapon_required` it excludes that Entry
+   * alone, and the Entry is not stale: one weapon completes at most one Target,
+   * whatever its protection.
+   */
+  | 'completion_assigned_weapon_required'
 
 export const plannerWarningKinds: readonly PlannerWarningKind[] = [
   'no_build_list_entries',
@@ -544,15 +556,12 @@ export const plannerWarningKinds: readonly PlannerWarningKind[] = [
   'protected_weapon_required',
   'build_list_entry_stale',
   'calculation_context_incompatible',
-  'all_targets_already_satisfied',
   'invalid_conflict_resolution',
   'max_steps_reached',
-  'multiple_selected_checkpoint_entries',
-  'selected_checkpoint_target_already_ideal',
-  'selected_checkpoint_fixes_target_entry',
   'invalid_checkpoint_selection',
   'duplicate_build_list_entries_for_target',
   'completed_target_excluded',
+  'completion_assigned_weapon_required',
 ]
 
 export interface PlannerWarning {
@@ -723,7 +732,6 @@ export interface ProductionPlanGenerationObserver {
  *   Entry set after the last full run
  * - `execution_projection`: `projectProductionPlanExecution()`
  * - `planning_input_snapshot`: `createPlanningInputSnapshot()`
- * - `checkpoint_defence`: the checkpoint requirement defence
  * - `rejected_build_list_entries`: `createRejectedBuildListEntries()` (and the
  *   Plan field clones evaluated before it)
  * - `required_materials`: `collectRequiredMaterials()`
@@ -734,7 +742,6 @@ export type ProductionPlanGenerationPhase =
   | 'post_processing'
   | 'execution_projection'
   | 'planning_input_snapshot'
-  | 'checkpoint_defence'
   | 'rejected_build_list_entries'
   | 'required_materials'
   | 'plan_assembly'

@@ -1,4 +1,5 @@
 import type { AppDatabase } from '../../db/AppDatabase'
+import { ExecutionHistoryRepository } from '../../db/repositories/executionHistoryRepository'
 import type { ExecutionSavePointRestoreWrite } from '../../domain/execution'
 
 /**
@@ -23,7 +24,6 @@ export async function writeExecutionSavePointRestore(
   if (restore.restoredOwnedWeapons.length > 0) await database.ownedWeapons.bulkPut(restore.restoredOwnedWeapons)
   if (restore.restoredTargetWeapons.length > 0) await database.targetWeapons.bulkPut(restore.restoredTargetWeapons)
   await database.productionPlans.put(restore.plan)
-  if (restore.deletedExecutionHistoryIds.length > 0) {
-    await database.executionHistory.bulkDelete(restore.deletedExecutionHistoryIds)
-  }
+  // The later records' metadata and Undo bodies are deleted together (12.2).
+  await new ExecutionHistoryRepository(database).deleteExecutionRecords(restore.deletedExecutionHistoryIds)
 }

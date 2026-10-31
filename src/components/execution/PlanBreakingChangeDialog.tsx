@@ -11,6 +11,13 @@ import {
   Typography,
 } from '@mui/material'
 import { ExecutionSavePointRestoreDialog } from './ExecutionSavePointRestoreDialog'
+import { SAVE_POINT_RESTORE_UNAVAILABLE_GUIDANCE } from './savePointRestoreUnavailablePresentation'
+import { SavePointRestoreUnavailableNotice } from './SavePointRestoreUnavailableNotice'
+import {
+  PLAN_BREAKING_REPLAN_EXCLUSION_LABEL,
+  PLAN_BREAKING_REPLAN_EXCLUSION_TEXT,
+  PLAN_BREAKING_REPLAN_EXCLUSION_TITLE,
+} from './runningPlanReplanGuidancePresentation'
 import {
   formatSavePointRecordedAt,
   PLAN_BREAKING_APPROVE_LABEL,
@@ -59,24 +66,62 @@ function savePointPositionText(
 }
 
 /**
+ * 「保存せずに再計画を開く」 (Issue #276 PR-6B, `docs/UI_FLOW.md` 16.3 / 16.5): an
+ * alternative beside the warning's own choices, never one of them. It sits in
+ * the content - apart from 「キャンセル」 and the destructive approval - and
+ * leaves the change unsaved exactly as a cancellation does.
+ */
+function ReplanExclusionGuidance({ disabled, onChoose }: { disabled: boolean; onChoose(): void }) {
+  const textId = useId()
+  return (
+    <Box sx={{ mt: 2, p: 1.5, border: 1, borderColor: 'divider', borderRadius: 1 }}>
+      <Typography component="p" variant="subtitle2">
+        {PLAN_BREAKING_REPLAN_EXCLUSION_TITLE}
+      </Typography>
+      <Typography id={textId} component="p" variant="body2" sx={{ mt: 0.5, overflowWrap: 'anywhere' }}>
+        {PLAN_BREAKING_REPLAN_EXCLUSION_TEXT}
+      </Typography>
+      <Button
+        variant="outlined"
+        onClick={onChoose}
+        disabled={disabled}
+        aria-describedby={textId}
+        sx={{ mt: 1, minHeight: 44, width: { xs: '100%', sm: 'auto' } }}
+      >
+        {PLAN_BREAKING_REPLAN_EXCLUSION_LABEL}
+      </Button>
+    </Box>
+  )
+}
+
+/**
  * The breaking-change warning (`docs/UI_FLOW.md` 16.3) with the 16.2 save point
  * choice, shared by every guarded screen. Everything shown comes from the
  * controller's inspection: the reasons, whether the choice is asked and which
  * save point it names. 「キャンセル」 at any phase saves nothing. The game-side
  * restore confirmation is the same dialog the Navigator and the replan adoption
  * use; confirming it submits the restore decision to the one guarded save,
- * never a separate restore.
+ * never a separate restore. When the controller offers the replan exclusion
+ * (a Plan-dependent Target or Entry, Issue #276 PR-6B), the warning adds
+ * 「保存せずに再計画を開く」; a warning without the offer is exactly as before.
+ * When the inspection says the restore cannot run for the `active` Plan (Issue
+ * #335), the choice keeps 「現在地点を維持」 and disables the restore with its
+ * reason.
  */
 export function PlanBreakingChangeDialog({ controller, savePointPositionLabel }: PlanBreakingChangeDialogProps) {
   const titleId = useId()
   const descriptionId = useId()
+  const restoreUnavailableId = useId()
   const { state } = controller
   if (state.status === 'idle') return null
   const submitting = state.status === 'submitting'
   const phase: PlanBreakingChangePhase = state.status === 'submitting' ? state.phase : state.status
   const { inspection, note } = state
+  const restoreUnavailable = inspection.savePointChoiceRequired && !inspection.savePointRestore.restorable
+    ? inspection.savePointRestore.reason
+    : null
 
-  if (phase === 'confirming_restore') {
+  if (phase === 'confirming_restore' && restoreUnavailable === null) {
     return (
       <ExecutionSavePointRestoreDialog
         open
@@ -118,6 +163,9 @@ export function PlanBreakingChangeDialog({ controller, savePointPositionLabel }:
         <Typography component="p" variant="body2" sx={{ mt: 1.5 }}>
           {PLAN_BREAKING_NOT_UNDOABLE_NOTE}
         </Typography>
+        {state.replanExclusion !== null && (
+          <ReplanExclusionGuidance disabled={submitting} onChoose={controller.chooseReplanExclusion} />
+        )}
       </>
     )
     actions = (
@@ -141,9 +189,17 @@ export function PlanBreakingChangeDialog({ controller, savePointPositionLabel }:
             {PLAN_BREAKING_SAVE_POINT_FALLBACK_LABEL}: {savePointPositionText(inspection, savePointPositionLabel)}
           </Typography>
         )}
-        <Typography component="p" variant="body2" sx={{ mt: 1 }}>
-          {PLAN_BREAKING_SAVE_POINT_CHOICE_EXPLANATION}
-        </Typography>
+        {restoreUnavailable === null ? (
+          <Typography component="p" variant="body2" sx={{ mt: 1 }}>
+            {PLAN_BREAKING_SAVE_POINT_CHOICE_EXPLANATION}
+          </Typography>
+        ) : (
+          <SavePointRestoreUnavailableNotice
+            id={restoreUnavailableId}
+            reason={restoreUnavailable}
+            guidance={SAVE_POINT_RESTORE_UNAVAILABLE_GUIDANCE.breakingChange}
+          />
+        )}
       </>
     )
     actions = (
@@ -151,7 +207,14 @@ export function PlanBreakingChangeDialog({ controller, savePointPositionLabel }:
         <Button variant="contained" color="error" disabled={submitting} onClick={controller.keepCurrent} sx={{ minHeight: 44 }}>
           現在地点を維持
         </Button>
-        <Button variant="outlined" color="warning" disabled={submitting} onClick={controller.chooseRestore} sx={{ minHeight: 44 }}>
+        <Button
+          variant="outlined"
+          color="warning"
+          disabled={submitting || restoreUnavailable !== null}
+          aria-describedby={restoreUnavailable === null ? undefined : restoreUnavailableId}
+          onClick={controller.chooseRestore}
+          sx={{ minHeight: 44 }}
+        >
           最後のゲーム内セーブ地点へ戻す
         </Button>
         <Button onClick={controller.cancel} disabled={submitting} sx={{ minHeight: 44 }}>

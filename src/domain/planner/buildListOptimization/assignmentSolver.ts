@@ -147,6 +147,8 @@ class Search implements ResourceAssignmentSearch {
     const resetThenKeepByTarget = new Map(table.targets.map(target => [target.targetWeaponId, createResetThenKeepIndex(target)]))
     this.lattices = new Map(table.targets.map(target => [target.targetWeaponId, createTargetOptionLattice(target, table, resetThenKeepByTarget.get(target.targetWeaponId)!)]))
     this.menus = createTargetStreamMenus(table, resetThenKeepByTarget)
+    // Each Bonus-empty source ends at its first Skill requirement (Issue #351), so a Target whose sources hold no option is judged
+    // without walking their conversions.
     this.targetsWithoutOption = table.targets.filter(target => enumerateReachOptions(target, table).next().done === true).map(target => target.targetWeaponId)
   }
 

@@ -29,6 +29,7 @@ import {
   type ExecutionUndoControlPresentation,
 } from './executionStepPresentation'
 import { ProductionPlanAbandonDialog } from './ProductionPlanAbandonDialog'
+import { savePointRestoreUnavailableMessage } from './savePointRestoreUnavailablePresentation'
 
 const buttonSx = { minHeight: 44, width: { xs: '100%', sm: 'auto' } } as const
 
@@ -291,6 +292,11 @@ export function ExecutionStateControls({
               {showsSavePointRestore && savePointRestore.kind === 'at_current_position' && (
                 <Typography variant="caption" color="text.secondary">
                   現在地点がセーブ地点のため、戻す操作はありません。
+                </Typography>
+              )}
+              {showsSavePointRestore && savePointRestore.kind === 'blocked' && (
+                <Typography variant="caption" color="text.secondary">
+                  {savePointRestoreUnavailableMessage(savePointRestore.reason)}
                 </Typography>
               )}
             </Stack>

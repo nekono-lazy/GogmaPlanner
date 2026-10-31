@@ -18,6 +18,7 @@ import {
   type RngCapabilityMissingRequirement,
 } from '../../domain/rng/capabilities'
 import type { RngEngineCapabilities } from '../../domain/rng/rngEngine'
+import { evaluateProductionPlanContinuation } from '../../domain/execution/planContinuation'
 import { evaluateProductionPlanCalculationCompatibility } from '../../services/planner/prepareProductionPlanInteraction'
 
 /**
@@ -85,6 +86,12 @@ export interface DashboardCapability {
 export type DashboardNextAction =
   | { kind: 'resume_execution'; planId: ProductionPlanId }
   | { kind: 'review_incompatible_plan'; planId: ProductionPlanId }
+  /**
+   * The active Plan would make one owned weapon the completion of two Targets
+   * (Issue #334, `docs/UI_FLOW.md` 12.11): it is not resumed, and the Production
+   * Plan page shows why and the recovery.
+   */
+  | { kind: 'review_unsafe_plan'; planId: ProductionPlanId }
   | { kind: 'setup_rng' }
   | { kind: 'register_target' }
   | { kind: 'start_search' }
@@ -109,7 +116,12 @@ export interface DashboardSummary {
   ownedWeapons: { normal: number; gogma: number }
   targetWeapons: { enabled: number; total: number }
   buildList: { total: number; stale: number }
-  activePlan: { id: ProductionPlanId; isCalculationCompatible: boolean } | null
+  activePlan: {
+    id: ProductionPlanId
+    isCalculationCompatible: boolean
+    /** `evaluateProductionPlanContinuation()` refuses it for its completion assignments (Issue #334). */
+    hasCompletionAssignmentConflict: boolean
+  } | null
   nextAction: DashboardNextAction
 }
 
@@ -119,9 +131,10 @@ function selectNextAction(
   // An Active Plan takes precedence over every preparation step: execution
   // follows the finalized Plan (`docs/UI_FLOW.md` 4 / 16).
   if (summary.activePlan) {
-    return summary.activePlan.isCalculationCompatible
-      ? { kind: 'resume_execution', planId: summary.activePlan.id }
-      : { kind: 'review_incompatible_plan', planId: summary.activePlan.id }
+    if (!summary.activePlan.isCalculationCompatible) return { kind: 'review_incompatible_plan', planId: summary.activePlan.id }
+    return summary.activePlan.hasCompletionAssignmentConflict
+      ? { kind: 'review_unsafe_plan', planId: summary.activePlan.id }
+      : { kind: 'resume_execution', planId: summary.activePlan.id }
   }
   if (!summary.gogmaPrediction.available && !summary.skillPrediction.available) {
     return { kind: 'setup_rng' }
@@ -230,6 +243,11 @@ export function createDashboardSummary(
             snapshot.activePlan,
             context.planCalculationContext,
           ).isCompatible,
+          hasCompletionAssignmentConflict: evaluateProductionPlanContinuation(
+            snapshot.activePlan,
+            snapshot.targetWeapons,
+            context.planCalculationContext,
+          ).kind === 'completion_assignment_conflict',
         }
       : null,
   }

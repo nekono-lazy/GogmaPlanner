@@ -14,10 +14,6 @@ import { DisclosureAccordion } from '../DisclosureAccordion'
 import { nextHeadingLevel } from '../headingLevel'
 import { RestorationBonusSlots } from '../RestorationBonusSlots'
 import { StatusChip } from '../StatusChip'
-import {
-  IntermediateStateSelector,
-  type IntermediateStateSelectionContext,
-} from './IntermediateStateSelector'
 import { SearchDefinitionItem, SearchDefinitionList } from './SearchDefinitionList'
 import {
   candidateRouteOriginLabel,
@@ -30,11 +26,16 @@ import {
   type SearchSourceExclusionDisplay,
 } from './sourceExclusionPresentation'
 import { CostEstimateSummary } from '../cost/CostEstimateSummary'
+import { AchievedCompletionVariants } from '../target/AchievedCompletionVariants'
+import {
+  ACHIEVED_COMPLETION_VARIANTS_LABEL,
+  describeAchievedCompletionVariants,
+  minimumRankSlotLabel,
+} from '../target/completionConditionPresentation'
 import { estimateCandidateCost } from '../../domain/cost'
 import type { MasterDataRoot } from '../../domain/master/masterTypes'
 import type {
   BuildCandidate,
-  IntermediateStateSelection,
   OwnedWeapon,
   SkillAmendmentResult,
   TargetWeapon,
@@ -72,29 +73,8 @@ interface CandidateCardProps {
    */
   buildListStatus?: 'added' | 'not_added'
   /**
-   * The intermediate states and improvement preference the user has chosen.
-   *
-   * They are a BuildListEntry input, never part of the Candidate, so the owner
-   * of the selection passes it in rather than the card holding it
-   * (`docs/DATA_MODEL.md` 9.4). Omitted means nothing is selected and the
-   * selector is read-only.
-   */
-  intermediateStateSelection?: IntermediateStateSelection
-  onIntermediateStateSelectionChange?: (selection: IntermediateStateSelection) => void
-  /**
-   * The selection controls stay visible but cannot be changed while a save of
-   * a selection is in flight or waits for the user's confirmation.
-   */
-  intermediateStateSelectionDisabled?: boolean
-  /**
-   * Which screen the editable selection explanation is written for. The
-   * Search screen is the default; the Build List, where the Candidate is
-   * already registered, passes `build_list`.
-   */
-  intermediateStateSelectionContext?: IntermediateStateSelectionContext
-  /**
-   * Heading level of the card heading. Detail and selection sections take
-   * the following levels, so the outline stays sequential where the card is
+   * Heading level of the card heading. The detail section takes the following
+   * levels, so the outline stays sequential where the card is
    * embedded under a Target group heading (Build List) or directly under a
    * section heading (Search).
    */
@@ -140,14 +120,6 @@ export function CandidateCard({
   addDisabled = false,
   addFeedback,
   buildListStatus,
-  intermediateStateSelection = {
-    skillOpportunityId: null,
-    bonusOpportunityId: null,
-    improvementPreference: 'planner',
-  },
-  onIntermediateStateSelectionChange,
-  intermediateStateSelectionDisabled = false,
-  intermediateStateSelectionContext = 'search',
   headingLevel = 'h3',
   showPreferredOwnedWeaponNotice = false,
   searchSourceExclusion = null,
@@ -239,6 +211,13 @@ export function CandidateCard({
               シリーズ: {seriesSkillLabel(candidate.seriesSkillId, master)} ／ グループ:{' '}
               {groupSkillLabel(candidate.groupSkillId, master)}
             </SearchDefinitionItem>
+            {/* Re-judged now from the finished slots and the Target as it is now
+                (`docs/REQUIREMENTS.md` 13.2): never read from the Candidate. */}
+            <SearchDefinitionItem label={ACHIEVED_COMPLETION_VARIANTS_LABEL}>
+              <AchievedCompletionVariants
+                achieved={describeAchievedCompletionVariants(target, candidate.finalBonuses, scope, master)}
+              />
+            </SearchDefinitionItem>
           </SearchDefinitionList>
 
           <Box
@@ -289,7 +268,7 @@ export function CandidateCard({
             <Stack spacing={2}>
               <Box>
                 <Typography component={detailLevel} variant="subtitle2" sx={{ mb: 1 }}>
-                  理想との差分
+                  完成条件との差分
                 </Typography>
                 <SearchDefinitionList>
                   <SearchDefinitionItem label="ボーナス一致">
@@ -300,8 +279,9 @@ export function CandidateCard({
                     {candidate.idealDifference.groupSkillMatches ? '一致' : '不一致'}
                   </SearchDefinitionItem>
                   <SearchDefinitionItem label="不足">
+                    {/* A missing slot is the closest Variant's minimum rank: "this rank or higher". */}
                     {candidate.idealDifference.missingBonuses
-                      .map((bonus) => bonusLabel(bonus, weaponTypeId, master, 'gogma_artian'))
+                      .map((bonus) => minimumRankSlotLabel(bonusLabel(bonus, weaponTypeId, master, 'gogma_artian'), bonus.bonusRankId, master))
                       .join('、') || 'なし'}
                   </SearchDefinitionItem>
                   <SearchDefinitionItem label="余剰">
@@ -390,31 +370,16 @@ export function CandidateCard({
             </Stack>
           </DisclosureAccordion>
 
-          {/* An intermediate state belongs to this very Route, so it is shown
-              on the Candidate that owns it rather than as a separate result
-              (`docs/UI_FLOW.md` 9). */}
-          <IntermediateStateSelector
-            candidate={candidate}
-            weaponTypeId={weaponTypeId}
-            master={master}
-            selection={intermediateStateSelection}
-            onChange={onIntermediateStateSelectionChange}
-            disabled={intermediateStateSelectionDisabled}
-            headingLevel={sectionLevel}
-            selectionContext={intermediateStateSelectionContext}
-          />
-
           <Divider />
           <Stack spacing={1.5}>
             <Typography variant="body2" color="text.secondary" className="tabular-nums">
               理想品の完成: {candidate.estimatedOperationCount}手目（この候補の最終状態）
             </Typography>
             {/* State-derived, permanent guidance for an already-added Candidate
-                (`docs/UI_FLOW.md` 9): the Build List owns its selection, and
-                this screen's draft never overwrites it. */}
+                (`docs/UI_FLOW.md` 9): a re-add never rewrites its Entry. */}
             {buildListStatus === 'added' && (
               <Alert severity="info">
-                この候補は作成リストに追加済みです。途中採用する状態と改善優先は作成リストで変更してください。
+                この候補は作成リストに追加済みです。
               </Alert>
             )}
             {onAdd && (

@@ -6,7 +6,7 @@
  * `rng_replayed`): the source's initial state (an owned weapon as persisted, or the Production Normal
  * result at the forge position), then the required Skill unit(s) (conversion / Reset Skills), then the
  * required Bonus unit(s) (Reset / Keep), re-predicted with the Engine's public API, and the final state
- * judged with `satisfiesIdealTarget()`.
+ * judged with `satisfiesCompletionTarget()`.
  *
  * Before any prediction the option itself is checked against the PlannerInput: the source exists and is
  * eligible for the requested units (a protected Normal is never converted, a protected Gogma accepts no
@@ -24,7 +24,7 @@
  */
 import type { OwnedWeapon, RestorationBonusSet, TargetWeapon } from '../../models/publicTypes'
 import type { NormalizedSeed, RngEngine } from '../../rng/rngEngine'
-import { satisfiesIdealTarget } from '../../target/targetEvaluator'
+import { satisfiesCompletionTarget } from '../../target/completionCondition'
 import { BuildListOptimizationInvariantError, type BuildListOptimizationContext, type ReachOption, type ReachOptionFinalState, type StreamEnd } from './buildListOptimizationTypes'
 
 export interface ReachOptionReplayResult {
@@ -201,8 +201,8 @@ export function replayReachOptionRequiredOnly(option: ReachOption, context: Buil
     scope = 'gogma_artian'
   }
 
-  // 7. The final state must satisfy the Ideal (the same authority the scan used).
-  if (!satisfiesIdealTarget(target, bonuses, scope, seriesSkillId, groupSkillId, master)) {
+  // 7. The final state must satisfy the completion condition (the same authority the scan used).
+  if (!satisfiesCompletionTarget(target, bonuses, scope, seriesSkillId, groupSkillId, master)) {
     fail('ideal_mismatch', `Required-only replay of Target ${target.id} (${sourceDescription(option)}) does not reach the Ideal; the scan and the replay disagree.`)
   }
   return {

@@ -3,18 +3,15 @@ import type {
   BuildListEntryId,
   DomainValidationIssue,
   DomainValidationResult,
+  OwnedWeaponId,
   TargetWeapon,
   TargetWeaponId,
 } from '../models/publicTypes'
+import { collectCompletionAssignedOwnedWeaponIds } from '../target/completionAssignment'
 import {
   detectPlannerConflicts,
   type PlannerConflictDetectionResult,
 } from './plannerConflictDetection'
-import {
-  derivePlannerCheckpointRequirements,
-  intermediatePinFor,
-  type PlannerCheckpointRequirements,
-} from './plannerCheckpoints'
 import {
   remainingPlannerLaneUnits,
   splitPlannerRouteUnitsByLane,
@@ -73,10 +70,9 @@ export interface PlannerInitialContext {
   entriesById: ReadonlyMap<BuildListEntryId, BuildListEntry>
   allUnitPlans: ReadonlyMap<BuildListEntryId, readonly PlannerRouteUnit[]>
   /**
-   * The same units split into their execution lanes, with each Entry's
-   * checkpoint pin (`docs/PLANNER_SPEC.md` 7.0.4 / 7.5.2). Action
-   * expansion, fast-forward and remaining-unit conflict detection all read
-   * this one derivation.
+   * The same units split into their execution lanes (`docs/PLANNER_SPEC.md`
+   * 7.0.4). Action expansion, fast-forward and remaining-unit conflict
+   * detection all read this one derivation.
    */
   allLanePlans: ReadonlyMap<BuildListEntryId, PlannerEntryLanes>
   routeUnitCountByEntryId: ReadonlyMap<BuildListEntryId, number>
@@ -84,24 +80,23 @@ export interface PlannerInitialContext {
    * The planning Targets of this run (`derivePlannerPlanningTargets()`): the
    * unique planning-eligible Targets of the valid BuildListEntries, in stable
    * ID order. This is the run's one Target authority - completion, typed
-   * termination, scoring, Target satisfaction, conflict detection, checkpoint
-   * requirements and the Planner Alternative all read it. It is never
+   * termination, scoring, Target satisfaction, conflict detection and the
+   * Planner Alternative all read it. It is never
    * every active Target of `PlannerInput.targetWeapons`: a Target with no valid
    * Entry is not a goal of this run (`docs/PLANNER_SPEC.md` 4 / 7.2.1).
    */
   planningTargets: readonly TargetWeapon[]
   planningTargetIds: readonly TargetWeaponId[]
   planningTargetsById: ReadonlyMap<TargetWeaponId, TargetWeapon>
+  /**
+   * The completion assignments of every input Target
+   * (`collectCompletionAssignedOwnedWeaponIds()`, Issue #334, 21.4): those
+   * weapons satisfy no planning Target in this run.
+   */
+  completionAssignments: ReadonlyMap<OwnedWeaponId, TargetWeaponId>
   initialRelevantEntries: readonly BuildListEntry[]
   initialRelevantUnitPlans: ReadonlyMap<BuildListEntryId, readonly PlannerRouteUnit[]>
   initialConflictDetection: PlannerConflictDetectionResult
-  /**
-   * The Target-wide required checkpoint Entries of this run, derived from every
-   * valid BuildListEntry (`docs/PLANNER_SPEC.md` 7.5.6). Relevance, completion,
-   * scoring, termination and the Planner Alternative all read this one
-   * map; none of them re-derives it from a conflict's participants.
-   */
-  checkpointRequirements: PlannerCheckpointRequirements
 }
 
 export type PlannerInitialContextResult =
@@ -184,23 +179,8 @@ export function preparePlannerInitialContext(
   const planningTargetsById = new Map(
     planningTargets.map((target) => [target.id, target]),
   )
-  // Violations already failed the input closed in validation, so only the
-  // one-Entry-per-Target map remains here.
-  const checkpointRequirements = derivePlannerCheckpointRequirements(
-    validation.validBuildListEntries.map(({ entry }) => entry),
-  ).requirements
-  allSearchEntries.forEach((entry) => {
-    const required = checkpointRequirements.requiredEntryIdByTargetId.get(
-      entry.targetWeaponId,
-    )
-    if (required === undefined || required === entry.id) return
-    warnings.push({
-      kind: 'selected_checkpoint_fixes_target_entry',
-      message: `BuildListEntry '${entry.id}' is not used in this run: BuildListEntry '${required}' of the same TargetWeapon '${entry.targetWeaponId}' carries a selected intermediate state and is that Target's required Route.`,
-    })
-  })
   const initialRelevantEntries = allSearchEntries.filter((entry) =>
-    entryIsRelevantForState(initialSearchState, entry, checkpointRequirements),
+    entryIsRelevantForState(initialSearchState, entry),
   )
   const entriesById = new Map(
     allSearchEntries.map((entry) => [entry.id, entry]),
@@ -212,13 +192,7 @@ export function preparePlannerInitialContext(
     }),
   )
   const allLanePlans = new Map(
-    [...allUnitPlans].map(([entryId, units]) => {
-      const entry = entriesById.get(entryId)
-      return [
-        entryId,
-        splitPlannerRouteUnitsByLane(units, entry ? intermediatePinFor(entry) : null),
-      ] as const
-    }),
+    [...allUnitPlans].map(([entryId, units]) => [entryId, splitPlannerRouteUnitsByLane(units)] as const),
   )
   const routeUnitCountByEntryId = new Map(
     [...allUnitPlans].map(([entryId, units]) => [entryId, units.length]),
@@ -270,10 +244,10 @@ export function preparePlannerInitialContext(
       planningTargets,
       planningTargetIds,
       planningTargetsById,
+      completionAssignments: collectCompletionAssignedOwnedWeaponIds(input.targetWeapons),
       initialRelevantEntries,
       initialRelevantUnitPlans,
       initialConflictDetection,
-      checkpointRequirements,
     },
   }
 }

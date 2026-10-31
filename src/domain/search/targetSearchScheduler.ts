@@ -4,7 +4,7 @@ import type {
   RouteOperation,
   SkillAmendmentResult,
 } from '../models/publicTypes'
-import { evaluateSkillCondition, satisfiesIdealBonuses } from '../target'
+import { createCompletionBonusMatcher, evaluateSkillCondition } from '../target'
 import {
   bonusAmendmentOperations, bonusAmendmentResults, bonusStreamBaseKey,
   type BonusStreamBase, type UnsupportedAmendmentPrediction,
@@ -431,7 +431,7 @@ export class TargetSearchScheduler {
           runtime?.({ type: 'section_completed', section: 'skill_depth_read' })
           runtime?.({ type: 'section_started', section: 'skill_ideal_filter' })
           const ideal = reserved.solutions.filter((solution) => evaluateSkillCondition(
-            this.context.target.idealSkillCondition, solution.seriesSkillId, solution.groupSkillId,
+            this.context.target.completionSkillCondition, solution.seriesSkillId, solution.groupSkillId,
           ))
           runtime?.({ type: 'section_completed', section: 'skill_ideal_filter' })
           runtime?.({ type: 'section_started', section: 'skill_route_materialization' })
@@ -539,8 +539,9 @@ export class TargetSearchScheduler {
           // ordered and published, because the Lazy Ideal Cross composes
           // nothing else. Extent and exhaustion still follow the raw depth.
           runtime?.({ type: 'section_started', section: 'bonus_ideal_filter' })
-          const ideal = reserved.solutions.filter((solution) => satisfiesIdealBonuses(
-            this.context.target, solution.bonuses, solution.restorationBonusScope, this.context.input.master,
+          const completion = createCompletionBonusMatcher(this.context.target, this.context.input.master)
+          const ideal = reserved.solutions.filter((solution) => completion.satisfies(
+            solution.bonuses, solution.restorationBonusScope,
           ))
           runtime?.({ type: 'section_completed', section: 'bonus_ideal_filter' })
           runtime?.({ type: 'section_started', section: 'bonus_route_materialization' })

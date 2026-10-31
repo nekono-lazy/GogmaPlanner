@@ -2,6 +2,7 @@ import type {
   DomainValidationIssue,
   DomainValidationResult,
 } from '../domain/models/validation'
+import type { ProductionPlanCompletionAssignmentIssue } from '../domain/planner/productionPlanCompletionAssignmentSafety'
 
 export type RepositoryErrorCode =
   | 'validation_failed'
@@ -42,11 +43,23 @@ export type RepositoryErrorCode =
    * state would produce the same failure, so this is not retryable.
    */
   | 'planner_result_invalid'
+  /**
+   * The Planner result's Plan would make one owned weapon the completion of two
+   * Targets, or names a weapon another Target was completed with (Issue #334,
+   * `docs/PLANNER_SPEC.md` 21.4 / 21.4.1) - under the current Planner, two
+   * zero-operation Candidates on one owned Gogma. Nothing was written and the
+   * previous Draft stays; the error carries the typed issues so the screen can
+   * name the Targets and the weapon. The user resolves it in the Build List
+   * (one Candidate removed) or by completing one Target directly.
+   */
+  | 'plan_completion_assignment_conflict'
   | 'transaction_failed'
 
 export class RepositoryError extends Error {
   readonly code: RepositoryErrorCode
   readonly validationIssues: readonly DomainValidationIssue[]
+  /** The typed issues of a `plan_completion_assignment_conflict`; empty otherwise. */
+  readonly completionAssignmentIssues: readonly ProductionPlanCompletionAssignmentIssue[]
 
   constructor(
     code: RepositoryErrorCode,
@@ -54,12 +67,14 @@ export class RepositoryError extends Error {
     options?: {
       cause?: unknown
       validationIssues?: readonly DomainValidationIssue[]
+      completionAssignmentIssues?: readonly ProductionPlanCompletionAssignmentIssue[]
     },
   ) {
     super(message, { cause: options?.cause })
     this.name = 'RepositoryError'
     this.code = code
     this.validationIssues = options?.validationIssues ?? []
+    this.completionAssignmentIssues = options?.completionAssignmentIssues ?? []
   }
 }
 

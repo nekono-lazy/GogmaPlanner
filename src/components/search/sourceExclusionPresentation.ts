@@ -46,7 +46,7 @@ export function sourceExclusionDisclosureTitle(count: number): string {
 }
 
 /**
- * Follows 「現在の探索範囲では理想品が見つかりませんでした…」 when a search that excluded weapons found no Ideal. It
+ * Follows 「現在の探索範囲では完成条件を満たす候補が見つかりませんでした…」 when a search that excluded weapons found no Ideal. It
  * never says an Ideal does not exist and never searches the excluded weapons again on its own.
  */
 export function sourceExclusionNotFoundNote(count: number): string {

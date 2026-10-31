@@ -10,9 +10,7 @@ import {
   stableStringify,
 } from '../models/publicTypes'
 import type { RngEngine } from '../rng/rngEngine'
-import { entryIntermediateSelection } from './plannerCheckpoints'
 import {
-  isPlannerLaneUnitFastForwardable,
   routeOperationLane,
   type PlannerEntryLanes,
   type PlannerRouteLane,
@@ -268,20 +266,15 @@ export function createPlannerPhysicalActionIdentity(
  * Bonus amendments reads nothing the first Bonus amendment wrote, so it does
  * not make that amendment observed.
  *
- * A unit that ends one of this Entry's selected intermediate states is never
- * skippable either, whatever the operation types say: the whole point of
- * selecting it is that the player holds that exact intermediate weapon, so the
- * state is observed rather than immediately overwritten
- * (`docs/PLANNER_SPEC.md` 7.5.1). Earlier units whose entire output the next
- * lane operation rewrites stay skippable, because skipping them leaves the
- * selected state itself unchanged.
+ * Calculation schema 11..18 also kept the unit that ended a selected
+ * compromise checkpoint unskippable; Issue #100 removed the selection
+ * (`docs/PLANNER_SPEC.md` 20.7 / 20.10).
  */
 function canSkipWhenCounterPassed(
   operations: readonly RouteOperation[],
   operationIndex: number,
   unitIndex: number,
   unitCount: number,
-  selectedEndpointOperationIndexes: ReadonlySet<number>,
 ): boolean {
   const operation = operations[operationIndex]
   if (operation.type === 'create_normal_artian') {
@@ -289,7 +282,6 @@ function canSkipWhenCounterPassed(
     return unitIndex < unitCount - 1
   }
   if (unitIndex !== unitCount - 1) return false
-  if (selectedEndpointOperationIndexes.has(operationIndex)) return false
   const lane = routeOperationLane(operation)
   const next = operations
     .slice(operationIndex + 1)
@@ -385,33 +377,12 @@ function rejection(
   }
 }
 
-/**
- * The Route operation indexes that end this Entry's selected intermediate
- * states. A selected lane start is held from the beginning and has no ending
- * operation.
- */
-function selectedEndpointOperationIndexes(entry: BuildListEntry): Set<number> {
-  const selection = entryIntermediateSelection(entry)
-  const indexes = new Set<number>()
-  for (const selected of [selection.skill, selection.bonus]) {
-    if (
-      selected !== null &&
-      selected.opportunity.lanePosition > 0 &&
-      selected.opportunity.operationIndex !== null
-    ) {
-      indexes.add(selected.opportunity.operationIndex)
-    }
-  }
-  return indexes
-}
-
 function createEntryUnitPlan(
   entry: BuildListEntry,
   engine: RngEngine,
 ): { units: PlannerRouteUnit[] | null; rejection: PlannerSearchRejection | null } {
   const units: PlannerRouteUnit[] = []
   const operations = entry.candidateSnapshot.route.operations
-  const checkpointEndpoints = selectedEndpointOperationIndexes(entry)
   const laneCounts: Record<PlannerRouteLane, number> = { base: 0, bonus: 0, skill: 0 }
   for (
     let operationIndex = 0;
@@ -485,7 +456,6 @@ function createEntryUnitPlan(
           operationIndex,
           unitIndex,
           unitCount,
-          checkpointEndpoints,
         ),
       })
       laneCounts[lane] += 1
@@ -614,9 +584,7 @@ export function currentPlannerCounterValue(
  * `canSkipWhenCounterPassed` is never passed here, so a past required unit
  * still fails closed in the ordinary counter precondition. Each lane is passed
  * on its own - the base lane only through the Counter-advance forges of a
- * predicted Normal creation (Issue #129), which the checkpoint pin never gates
- * - and a stream lane never beyond the Entry's checkpoint pin while the other
- * lane has not reached its own pin (7.5.2).
+ * predicted Normal creation (Issue #129).
  */
 export function fastForwardPlannerRouteProgress(
   state: PlannerSearchState,
@@ -630,7 +598,7 @@ export function fastForwardPlannerRouteProgress(
       while (progress[lane] < lanes[lane].length) {
         const unit = lanes[lane][progress[lane]]
         if (unit.counterBefore === null) break
-        if (!isPlannerLaneUnitFastForwardable(unit, progress, lanes.pin)) break
+        if (!unit.canSkipWhenCounterPassed) break
         const current = currentPlannerCounterValue(state, unit)
         if (current === null || current <= unit.counterBefore) break
         progress = { ...progress, [lane]: progress[lane] + 1 }

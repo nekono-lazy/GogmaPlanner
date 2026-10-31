@@ -14,7 +14,8 @@ import { PageShell } from '../components/PageShell'
 import { ActualResultDifferentForm } from '../components/execution/ActualResultDifferentForm'
 import { emptyActualResultDraft, type ActualResultDraft } from '../components/execution/actualResultDraft'
 import { BlindObservationForm } from '../components/execution/BlindObservationForm'
-import { CompromiseCheckpointPanel } from '../components/execution/CompromiseCheckpointPanel'
+import { CompletionAssignmentConflictAlert } from '../components/execution/CompletionAssignmentConflictAlert'
+import { COMPLETION_ASSIGNMENT_REPLAN_NOTE, completionAssignmentNamesOf } from '../components/execution/completionAssignmentConflictPresentation'
 import { ExecutionDivergenceRecovery } from '../components/execution/ExecutionDivergenceRecovery'
 import { ExecutionProgress } from '../components/execution/ExecutionProgress'
 import { ExecutionStateControls } from '../components/execution/ExecutionStateControls'
@@ -25,6 +26,7 @@ import {
   createExecutionStepPresentation,
   executionDivergenceView,
   executionErrorMessage,
+  EXECUTION_HISTORY_UNCONVERTIBLE_MESSAGE,
   isRecalculationRequiredError,
   offersOperationUncertain,
   ownedWeaponLabel,
@@ -39,9 +41,8 @@ import { OperationUncertainRecovery } from '../components/execution/OperationUnc
 import { WeaponSwitchPrompt } from '../components/execution/WeaponSwitchPrompt'
 import { RepositoryError } from '../db/repositoryError'
 import {
+  evaluateProductionPlanContinuation,
   ExecutionRuntimeError,
-  listCurrentCompromiseCheckpoints,
-  type CurrentCompromiseCheckpoint,
   type ExecutionActualResultObservation,
   type ExecutionNormalRestorationBonusObservation,
   type ExecutionReidentificationReminder,
@@ -53,7 +54,6 @@ import {
 } from '../domain/execution'
 import { loadMasterData } from '../domain/master/loadMasterData'
 import type {
-  BuildListEntryId,
   ExecutionHistory,
   PlanStep,
   PlanStepId,
@@ -82,6 +82,17 @@ type LoadState =
   | { status: 'error'; message: string }
   | { status: 'loaded'; snapshot: ExecutionNavigatorSnapshot }
 
+/**
+ * The success notices of the latest transaction. Presentation only: never
+ * persisted, cleared when the next operation starts, so a reload, an Undo or a
+ * save point restore never shows an earlier one again.
+ */
+interface NavigatorNotices {
+  messages: string[]
+}
+
+const NO_NOTICES: NavigatorNotices = { messages: [] }
+
 type ActionState =
   | { status: 'idle' }
   | { status: 'submitting' }
@@ -99,6 +110,18 @@ function failureFrom(caught: unknown): Extract<ActionState, { status: 'failed' }
     }
   }
   return { status: 'failed', code: null, message: '操作を確定できませんでした。状態は変更されていません。' }
+}
+
+/**
+ * Why the Plan could not be read. A record the database upgrade could not
+ * convert is named as such (`docs/DATA_MODEL.md` 14.2), never shown as an empty
+ * history; every other failure is the ordinary read failure.
+ */
+function loadFailureMessage(caught: unknown): string {
+  if (caught instanceof ExecutionRuntimeError && caught.code === 'execution_history_unconvertible') {
+    return EXECUTION_HISTORY_UNCONVERTIBLE_MESSAGE
+  }
+  return '生産計画を読み込めませんでした。'
 }
 
 const buttonSx = { minHeight: 44, width: { xs: '100%', sm: 'auto' } } as const
@@ -308,11 +331,10 @@ function ExecutionNavigator({
   const debugMode = useSettingsStore((state) => state.debugMode)
   const [load, setLoad] = useState<LoadState>({ status: 'loading' })
   const [action, setAction] = useState<ActionState>({ status: 'idle' })
-  const [notices, setNotices] = useState<string[]>([])
-  // Presentation-only acknowledgements (UI_FLOW 12.3 / 12.6): never persisted,
-  // so a reload shows the prompt or the panel again.
+  const [notices, setNotices] = useState<NavigatorNotices>(NO_NOTICES)
+  // Presentation-only acknowledgement (UI_FLOW 12.6): never persisted, so a
+  // reload shows the prompt again.
   const [acknowledgedSwitchStepId, setAcknowledgedSwitchStepId] = useState<PlanStepId | null>(null)
-  const [dismissedCheckpointEntryIds, setDismissedCheckpointEntryIds] = useState<BuildListEntryId[]>([])
   const aliveRef = useRef(false)
   const loadSequenceRef = useRef(0)
   const submittingRef = useRef(false)
@@ -324,18 +346,25 @@ function ExecutionNavigator({
     }
   }, [])
 
-  /** Re-reads the persisted state; an older or unmounted read never lands. */
-  const reload = useCallback(async () => {
+  /**
+   * Re-reads the persisted state; an older or unmounted read never lands. It
+   * resolves to the snapshot it showed, or `null` when it showed none - a
+   * failed, missing, superseded or unmounted read - so a caller never takes the
+   * React state for what was read.
+   */
+  const reload = useCallback(async (): Promise<ExecutionNavigatorSnapshot | null> => {
     loadSequenceRef.current += 1
     const sequence = loadSequenceRef.current
     const isCurrent = () => aliveRef.current && loadSequenceRef.current === sequence
     try {
       const snapshot = await dependencies.loadSnapshot(planId)
-      if (!isCurrent()) return
+      if (!isCurrent()) return null
       setLoad(snapshot === null ? { status: 'not_found' } : { status: 'loaded', snapshot })
-    } catch {
-      if (!isCurrent()) return
-      setLoad({ status: 'error', message: '生産計画を読み込めませんでした。' })
+      return snapshot
+    } catch (caught: unknown) {
+      if (!isCurrent()) return null
+      setLoad({ status: 'error', message: loadFailureMessage(caught) })
+      return null
     }
   }, [dependencies, planId])
 
@@ -348,8 +377,8 @@ function ExecutionNavigator({
       (snapshot) => {
         if (isCurrent()) setLoad(snapshot === null ? { status: 'not_found' } : { status: 'loaded', snapshot })
       },
-      () => {
-        if (isCurrent()) setLoad({ status: 'error', message: '生産計画を読み込めませんでした。' })
+      (caught: unknown) => {
+        if (isCurrent()) setLoad({ status: 'error', message: loadFailureMessage(caught) })
       },
     )
   }, [dependencies, planId])
@@ -367,13 +396,13 @@ function ExecutionNavigator({
     if (submittingRef.current) return
     submittingRef.current = true
     setAction({ status: 'submitting' })
-    setNotices([])
+    setNotices(NO_NOTICES)
     try {
       const result = await operation()
       if (!aliveRef.current) return
       await reload()
       if (!aliveRef.current) return
-      setNotices(successNotices(result))
+      setNotices({ messages: successNotices(result) })
       setAction({ status: 'idle' })
     } catch (caught: unknown) {
       if (!aliveRef.current) return
@@ -419,25 +448,6 @@ function ExecutionNavigator({
         (step.executionEffects?.targetCompletions ?? []).map(
           ({ targetWeaponId }) => `「${targetWeaponLabel(targetWeaponId, snapshot.targetWeapons)}」が完成しました`,
         ),
-    )
-  }
-
-  const finishAsCompromise = (
-    snapshot: ExecutionNavigatorSnapshot,
-    checkpoint: CurrentCompromiseCheckpoint,
-  ) => {
-    const planStepId = snapshot.plan.currentStepId
-    if (planStepId === null) return
-    void runTransaction(
-      () =>
-        dependencies.finishProductionPlanAsCompromise({
-          planId: snapshot.plan.id,
-          planStepId,
-          buildListEntryId: checkpoint.buildListEntryId,
-          targetWeaponId: checkpoint.targetWeaponId,
-          ownedWeaponId: checkpoint.ownedWeaponId,
-        }),
-      () => [],
     )
   }
 
@@ -520,7 +530,7 @@ function ExecutionNavigator({
     snapshot: ExecutionNavigatorSnapshot,
   ): Promise<ProductionPlanAbandonmentOptions | null> => {
     if (submittingRef.current) return null
-    setNotices([])
+    setNotices(NO_NOTICES)
     try {
       const options = await dependencies.inspectProductionPlanAbandonment({ planId: snapshot.plan.id })
       if (!aliveRef.current) return null
@@ -595,7 +605,7 @@ function ExecutionNavigator({
         )}
         {load.status === 'error' && <Alert severity="error">{load.message}</Alert>}
 
-        {notices.map((notice) => (
+        {notices.messages.map((notice) => (
           <Alert key={notice} severity="success" role="status">
             {notice}
           </Alert>
@@ -628,11 +638,8 @@ function ExecutionNavigator({
             debugMode={debugMode}
             submitting={submitting}
             acknowledgedSwitchStepId={acknowledgedSwitchStepId}
-            dismissedCheckpointEntryIds={dismissedCheckpointEntryIds}
             onAcknowledgeSwitch={setAcknowledgedSwitchStepId}
-            onDismissCheckpoint={(id) => setDismissedCheckpointEntryIds((current) => [...current, id])}
             onConfirm={(step, observation) => confirmStep(load.snapshot, step, observation)}
-            onFinish={(checkpoint) => finishAsCompromise(load.snapshot, checkpoint)}
             onRecordActualResult={(step, actualResult) =>
               recordActualResultDifferent(load.snapshot, step, actualResult)
             }
@@ -680,11 +687,8 @@ function LoadedNavigator({
   debugMode,
   submitting,
   acknowledgedSwitchStepId,
-  dismissedCheckpointEntryIds,
   onAcknowledgeSwitch,
-  onDismissCheckpoint,
   onConfirm,
-  onFinish,
   onRecordActualResult,
   onRecordOperationUncertain,
   onRecoverOperationCount,
@@ -697,11 +701,8 @@ function LoadedNavigator({
   debugMode: boolean
   submitting: boolean
   acknowledgedSwitchStepId: PlanStepId | null
-  dismissedCheckpointEntryIds: readonly BuildListEntryId[]
   onAcknowledgeSwitch(stepId: PlanStepId): void
-  onDismissCheckpoint(buildListEntryId: BuildListEntryId): void
   onConfirm(step: PlanStep, observation?: ExecutionNormalRestorationBonusObservation): void
-  onFinish(checkpoint: CurrentCompromiseCheckpoint): void
   onRecordActualResult(step: PlanStep, actualResult: ExecutionActualResultObservation): void
   onRecordOperationUncertain(step: PlanStep): void
   onRecoverOperationCount(observations: OperationCountRecoveryObservation[], position: number): void
@@ -740,6 +741,55 @@ function LoadedNavigator({
       />
     ) : null
 
+  // A Plan whose recorded completions would make one weapon the completion of
+  // two Targets is not continued at all (Issue #334, `docs/UI_FLOW.md` 12.11,
+  // `docs/PLANNER_SPEC.md` 21.4.1): no Step card, no game action, no switch
+  // guidance and no Current Position Recovery - the runtime refuses each of
+  // them anyway. The CalculationContext wins first, inside the one judgement.
+  // 「実行状態の管理」 stays usable, and nothing is saved by showing this.
+  const continuation = evaluateProductionPlanContinuation(plan, targetWeapons, dependencies.currentCalculationContext)
+  if ((plan.status === 'active' || plan.status === 'stale') && continuation.kind === 'completion_assignment_conflict') {
+    const divergence = executionDivergenceView(plan, latestExecutionHistory)
+    return (
+      <>
+        <ExecutionProgress progress={progress} />
+        {submitting && (
+          <Stack spacing={1} role="status" aria-live="polite">
+            <LinearProgress aria-label="操作を保存中" />
+            <Typography variant="body2">操作を保存しています。</Typography>
+          </Stack>
+        )}
+        <CompletionAssignmentConflictAlert
+          title="この生産計画は続行できません"
+          issues={continuation.issues}
+          names={completionAssignmentNamesOf(targetWeapons, ownedWeapons)}
+          debugMode={debugMode}
+          recovery={
+            <>
+              <Typography variant="body2">{COMPLETION_ASSIGNMENT_REPLAN_NOTE}</Typography>
+              <Typography variant="body2">
+                再計画できない場合は、下の「実行状態の管理」の「現在Planを破棄する」で計画を終了できます。
+              </Typography>
+            </>
+          }
+          links={[
+            { label: '作成プランを見る（再計画）', to: `/plans/${plan.id}` },
+            { label: '作成リストへ', to: '/build-list' },
+          ]}
+        />
+        {plan.status === 'stale' && divergence?.action !== 'operation_uncertain' && (
+          <EndedPlanView
+            plan={plan}
+            divergence={divergence?.action === 'actual_result_different' ? divergence : null}
+            latestExecutionHistory={latestExecutionHistory}
+            reidentificationReminder={snapshot.reidentificationReminder}
+          />
+        )}
+        {stateControls({ running: true, canRecordSavePoint: plan.status === 'active', showsSavePointRestore: true })}
+      </>
+    )
+  }
+
   if (plan.status !== 'active') {
     const divergence = executionDivergenceView(plan, latestExecutionHistory)
     const uncertainStep = divergence?.action === 'operation_uncertain'
@@ -760,6 +810,7 @@ function LoadedNavigator({
             plan={plan}
             availability={snapshot.operationCountRecovery}
             savePoint={snapshot.executionSavePoint}
+            savePointRestore={snapshot.savePointRestore}
             undoAvailable={snapshot.undo.kind === 'available'}
             master={dependencies.master}
             weaponTypeId={presentation.weaponTypeId}
@@ -815,7 +866,8 @@ function LoadedNavigator({
             />
           </Stack>
         </Alert>
-        {stateControls({ running: true, canRecordSavePoint: false, showsSavePointRestore: false })}
+        {/* The restore control says why it cannot run here (Issue #335); it never offers the restore. */}
+        {stateControls({ running: true, canRecordSavePoint: false, showsSavePointRestore: true })}
       </>
     )
   }
@@ -829,12 +881,10 @@ function LoadedNavigator({
     )
   }
 
-  const presentation = createExecutionStepPresentation(step, ownedWeapons, targetWeapons, normalCreationSources)
-  // The same still-current authority the compromise finish runtime checks.
-  const checkpoint =
-    listCurrentCompromiseCheckpoints(plan, buildListEntries).find(
-      ({ buildListEntryId }) => !dismissedCheckpointEntryIds.includes(buildListEntryId),
-    ) ?? null
+  const presentation = createExecutionStepPresentation(step, ownedWeapons, targetWeapons, normalCreationSources, {
+    buildListEntries,
+    master: dependencies.master,
+  })
   const switchWeaponId = weaponSwitchTarget(plan, step)
   /**
    * The weapon switch guidance is an interstitial placed *before* the current
@@ -843,8 +893,7 @@ function LoadedNavigator({
    * the operation name, instruction, expected result and every action stay
    * absent from the DOM and the accessibility tree, not merely hidden.
    */
-  const showsSwitchPrompt = checkpoint === null && switchWeaponId !== null && acknowledgedSwitchStepId !== step.id
-  const showsActions = checkpoint === null
+  const showsSwitchPrompt = switchWeaponId !== null && acknowledgedSwitchStepId !== step.id
 
   const header = (
     <>
@@ -879,34 +928,22 @@ function LoadedNavigator({
   return (
     <>
       {header}
-      {checkpoint !== null && (
-        <CompromiseCheckpointPanel
-          weaponLabel={ownedWeaponLabel(checkpoint.ownedWeaponId, ownedWeapons)}
-          targetLabel={targetWeaponLabel(checkpoint.targetWeaponId, targetWeapons)}
-          labelledPractical={!checkpoint.heldBeforeLabelStep}
-          finishing={submitting}
-          onContinue={() => onDismissCheckpoint(checkpoint.buildListEntryId)}
-          onFinish={() => onFinish(checkpoint)}
-        />
-      )}
       <ExecutionStepCard presentation={presentation} master={dependencies.master}>
         {presentation.actionKind === 'not_executable' ? (
           <Alert severity="warning">
             このStepは現在の実行形式ではないため、実行ナビでは確定できません。
           </Alert>
         ) : (
-          showsActions && (
-            <StepActions
-              key={step.id}
-              presentation={presentation}
-              dependencies={dependencies}
-              targetFound={presentation.target !== null}
-              submitting={submitting}
-              onConfirm={(observation) => onConfirm(step, observation)}
-              onRecordActualResult={(actualResult) => onRecordActualResult(step, actualResult)}
-              onRecordOperationUncertain={() => onRecordOperationUncertain(step)}
-            />
-          )
+          <StepActions
+            key={step.id}
+            presentation={presentation}
+            dependencies={dependencies}
+            targetFound={presentation.target !== null}
+            submitting={submitting}
+            onConfirm={(observation) => onConfirm(step, observation)}
+            onRecordActualResult={(actualResult) => onRecordActualResult(step, actualResult)}
+            onRecordOperationUncertain={() => onRecordOperationUncertain(step)}
+          />
         )}
       </ExecutionStepCard>
       {stateControls({ running: true, canRecordSavePoint: true, showsSavePointRestore: true })}

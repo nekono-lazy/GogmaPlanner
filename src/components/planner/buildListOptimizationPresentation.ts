@@ -1,13 +1,20 @@
 import type { MasterDataRoot } from '../../domain/master/masterTypes'
 import {
   isProductionPlanCalculationCompatible,
+  validateRestorationBonusSet,
+  type BuildCandidate,
   type BuildListEntry,
   type ExpectedPlanState,
-  type ImprovementPreference,
+  type GroupSkillId,
   type OwnedWeapon,
   type ProductionPlan,
+  type RestorationBonus,
+  type RestorationBonusScope,
+  type RestorationBonusSet,
+  type SeriesSkillId,
   type TargetWeapon,
   type TargetWeaponId,
+  type WeaponTypeId,
 } from '../../domain/models/publicTypes'
 import {
   BUILD_LIST_OPTIMIZATION_NON_PHYSICAL_STEP_TYPE,
@@ -23,6 +30,10 @@ import type {
   BuildListOptimizationSessionState,
 } from '../../services/planner/buildListOptimizationService'
 import type { BuildListOptimizationCancelReason } from '../../services/planner/buildListOptimizationWorkerClient'
+import {
+  describeEntryAchievedCompletionVariants,
+  type AchievedCompletionVariants,
+} from '../target/completionConditionPresentation'
 import { createProductionPlanSummary } from './productionPlanPresentation'
 
 /**
@@ -253,6 +264,157 @@ export function resolveBuildListOptimizationTargets(
 
 export const UNRESOLVED_TARGET_LABEL = '参照できない目標武器'
 
+// ------------------------------------------------------------------------------------------------ achieved completion Variants
+
+export const PLANNED_COMPLETION_VARIANTS_TITLE = '完成予定の目標武器と達成する完成構成'
+export const PLANNED_COMPLETION_VARIANTS_DESCRIPTION =
+  '各目標武器の完成時の復元ボーナスを、試算を始めた時点の目標武器の完成構成で判定しています。複数の構成を同時に満たす場合はすべて示します（構成の番号は呼び名で、優先順位ではありません）。'
+export const PLANNED_COMPLETION_VARIANTS_EMPTY = 'この計画には、完成予定の目標武器の記録がありません。'
+export const PLANNED_COMPLETION_PREDICTION_GUIDE = '各目標武器を開くと、完成時に付く予定の復元ボーナスとスキルを確認できます。'
+export const PLANNED_COMPLETION_PREDICTION_LEAD = 'この計画で完成する時点の予測結果です（目標武器に登録した完成条件ではありません）。'
+export const PLANNED_COMPLETION_PREDICTION_UNREADABLE = '試算の記録から読み取れないため確認できません'
+
+/**
+ * One part of a completing Candidate Snapshot: its value when the Snapshot holds it readably and every Master reference it names
+ * resolves, or `unreadable` otherwise.
+ */
+export type PlannedCompletionPredictionPart<T> = { kind: 'readable'; value: T } | { kind: 'unreadable' }
+
+/**
+ * What one Target finishes with in the Plan (Issue #360): the completing Entry's Candidate Snapshot - the very result its completion
+ * Variants are judged from - read as recorded, with the Target the rows are judged against naming the slots by its weapon type.
+ *
+ * Nothing is filled in: a part the Snapshot does not hold readably, or whose Master references do not resolve, is `unreadable` (never a
+ * partial name, a Master value or another Candidate's), while a recorded `null` Skill is the recorded "none". Without the Target or a
+ * completing Entry with a Candidate Snapshot nothing is shown (`unavailable`).
+ */
+export type PlannedCompletionPrediction =
+  | { kind: 'unavailable'; reason: 'target_missing' | 'result_missing' }
+  | {
+      kind: 'predicted'
+      weaponTypeId: WeaponTypeId
+      bonuses: PlannedCompletionPredictionPart<{ slots: RestorationBonusSet; scope: RestorationBonusScope }>
+      seriesSkillId: PlannedCompletionPredictionPart<SeriesSkillId | null>
+      groupSkillId: PlannedCompletionPredictionPart<GroupSkillId | null>
+    }
+
+/** The Master tables a completion prediction names its slots and Skills from. */
+export type PlannedCompletionPredictionMaster = Pick<MasterDataRoot, 'weaponTypes' | 'bonusTypes' | 'bonusRanks' | 'seriesSkills' | 'groupSkills'>
+
+/** Why a whole prediction cannot be shown, in words (the reasons match those of the achieved Variants of the same row). */
+export function plannedCompletionPredictionUnavailableText(reason: 'target_missing' | 'result_missing'): string {
+  return reason === 'target_missing'
+    ? '目標武器が見つからないため確認できません'
+    : '完成時の予測結果が見つからないため確認できません'
+}
+
+/** Whether an Entry holds a Candidate Snapshot at all (an object); its fields are read defensively by the caller. */
+function hasCandidateSnapshot(entry: Pick<BuildListEntry, 'candidateSnapshot'>): boolean {
+  const snapshot: unknown = entry.candidateSnapshot
+  return snapshot !== null && typeof snapshot === 'object'
+}
+
+/** A Skill as recorded: `null` is the recorded "none"; an ID is readable only when the Master names it. */
+function readableSkillId(value: unknown, known: ReadonlySet<string>): PlannedCompletionPredictionPart<string | null> {
+  if (value === null) return { kind: 'readable', value }
+  return typeof value === 'string' && known.has(value) ? { kind: 'readable', value } : { kind: 'unreadable' }
+}
+
+/**
+ * The completion prediction of one row (Issue #360) from the completing Entry's Candidate Snapshot as recorded: its `finalBonuses` in
+ * their stored slot order with its `restorationBonusScope`, and its `seriesSkillId` / `groupSkillId`. The Snapshot is read defensively
+ * - five slots and a known scope, a Skill as an ID or `null` - and checked against the Master so that every slot it shows has a known
+ * weapon type, bonus type and rank and every Skill a known ID. A part that is not readable is `unreadable`, never completed.
+ */
+export function describePlannedCompletionPrediction(
+  entry: Pick<BuildListEntry, 'candidateSnapshot'> | null | undefined,
+  target: Pick<TargetWeapon, 'weaponTypeId'> | null | undefined,
+  master: PlannedCompletionPredictionMaster,
+): PlannedCompletionPrediction {
+  if (target === null || target === undefined) return { kind: 'unavailable', reason: 'target_missing' }
+  if (entry === null || entry === undefined || !hasCandidateSnapshot(entry)) return { kind: 'unavailable', reason: 'result_missing' }
+  const { finalBonuses, restorationBonusScope, seriesSkillId, groupSkillId } =
+    entry.candidateSnapshot as unknown as Partial<Record<keyof BuildCandidate, unknown>>
+  const bonusTypeIds = new Set(master.bonusTypes.map(({ id }) => id))
+  const bonusRankIds = new Set(master.bonusRanks.map(({ id }) => id))
+  const bonusesReadable =
+    Array.isArray(finalBonuses) &&
+    validateRestorationBonusSet(finalBonuses as RestorationBonus[]).isValid &&
+    (finalBonuses as RestorationBonus[]).every(({ bonusTypeId, bonusRankId }) => bonusTypeIds.has(bonusTypeId) && bonusRankIds.has(bonusRankId)) &&
+    (restorationBonusScope === 'normal_artian' || restorationBonusScope === 'gogma_artian') &&
+    master.weaponTypes.some(({ id }) => id === target.weaponTypeId)
+  return {
+    kind: 'predicted',
+    weaponTypeId: target.weaponTypeId,
+    bonuses: bonusesReadable
+      ? { kind: 'readable', value: { slots: finalBonuses as RestorationBonusSet, scope: restorationBonusScope } }
+      : { kind: 'unreadable' },
+    seriesSkillId: readableSkillId(seriesSkillId, new Set(master.seriesSkills.map(({ id }) => id))),
+    groupSkillId: readableSkillId(groupSkillId, new Set(master.groupSkills.map(({ id }) => id))),
+  }
+}
+
+/**
+ * The completion Variants a completing Entry achieves. An Entry without a Candidate Snapshot holds no result to judge, so it is judged
+ * as having none - the Target still checked first - rather than read: nothing is filled in from a Route, a PlanStep or another
+ * Candidate, and a Snapshot that is there is judged exactly as before.
+ */
+function achievedOfCompletingEntry(
+  entry: BuildListEntry | undefined,
+  target: TargetWeapon | undefined,
+  master: MasterDataRoot,
+): AchievedCompletionVariants {
+  return describeEntryAchievedCompletionVariants(entry !== undefined && hasCandidateSnapshot(entry) ? entry : undefined, target, master)
+}
+
+/**
+ * One Target a Plan completes, with the completion Variants its completing Entry achieves and what it is predicted to finish with.
+ * `key` is for React only.
+ */
+export interface PlannedCompletionVariantsRow {
+  key: TargetWeaponId
+  target: BuildListOptimizationTargetDisplay | null
+  achieved: AchievedCompletionVariants
+  /** The completing Entry's Candidate Snapshot as recorded (Issue #360): one result per Target, however many Variants it achieves. */
+  prediction: PlannedCompletionPrediction
+}
+
+/**
+ * Each Target the Plan completes - the distinct `executionEffects.targetCompletions` Targets in Step order (UI_FLOW 11.0) - with the
+ * completion Variants achieved by the completing Entry's Candidate Snapshot, judged at display time against the given Targets
+ * (`docs/REQUIREMENTS.md` 13.2 / 19.1, `docs/UI_FLOW.md` 10.4), and that same Snapshot's finished slots and Skills as the completion
+ * prediction (Issue #360). A Preview passes its start-time Entries and Targets, the state it was calculated on, never a later read.
+ * Nothing is reconstructed from a Route or a PlanStep, and nothing is persisted.
+ */
+export function createPlannedCompletionVariantRows(
+  plan: Pick<ProductionPlan, 'steps'>,
+  entries: Iterable<BuildListEntry>,
+  targetWeapons: readonly TargetWeapon[] | null,
+  resolve: BuildListOptimizationTargetResolver,
+  master: MasterDataRoot,
+): PlannedCompletionVariantsRow[] {
+  const entriesById = new Map<string, BuildListEntry>()
+  for (const entry of entries) entriesById.set(entry.id, entry)
+  const targets = new Map((targetWeapons ?? []).map((target) => [target.id, target] as const))
+  const seen = new Set<TargetWeaponId>()
+  const rows: PlannedCompletionVariantsRow[] = []
+  for (const step of plan.steps) {
+    for (const { targetWeaponId, buildListEntryId } of step.executionEffects?.targetCompletions ?? []) {
+      if (seen.has(targetWeaponId)) continue
+      seen.add(targetWeaponId)
+      const entry = entriesById.get(buildListEntryId)
+      const target = targets.get(targetWeaponId)
+      rows.push({
+        key: targetWeaponId,
+        target: resolve(targetWeaponId),
+        achieved: achievedOfCompletingEntry(entry, target, master),
+        prediction: describePlannedCompletionPrediction(entry, target, master),
+      })
+    }
+  }
+  return rows
+}
+
 // ------------------------------------------------------------------------------------------------ unsupported
 
 export interface BuildListOptimizationUnsupportedReasonPresentation {
@@ -296,7 +458,7 @@ export function presentBuildListOptimizationUnsupportedReason(
         kind: reason.kind,
         title: '作成リストに整理が必要な項目があります',
         description:
-          '同じ目標武器の候補の重複や、途中採用状態の選択の不整合などがあるため、生産計画を作成できません。作成リストで「要整理」と表示された目標武器を確認してください。',
+          '同じ目標武器の候補の重複や、以前の形式の候補に残る途中採用状態の選択の不整合などがあるため、生産計画を作成できません。作成リストで「要整理」と表示された目標武器を確認してください。',
         targets: noTargets,
         missingItems: [],
         links: [],
@@ -312,14 +474,15 @@ export function presentBuildListOptimizationUnsupportedReason(
         links: [{ to: '/search', label: '候補検索へ' }],
       }
     case 'checkpoint_selection':
+      // A legacy Entry's selection (Issue #100 abolished it, and no screen can clear it any more): never cleared or read as empty.
       return {
         kind: reason.kind,
-        title: '途中採用する状態を選択している候補があります',
+        title: '以前の形式の途中採用状態を持つ候補があります',
         description:
-          '全体最適化は、作成リストで選択した途中採用状態を自動で解除したり読み替えたりしません。全体最適化を使う場合は、作成リストで該当する目標武器の候補の選択を解除してください。',
+          '全体最適化は、以前の形式の候補に残る途中採用状態の選択を自動で解除したり読み替えたりしません。全体最適化を使う場合は、該当する目標武器を候補検索で検索し直し、現在の候補へ置き換えてください。',
         targets: resolveBuildListOptimizationTargets(reason.entries.map(({ targetWeaponId }) => targetWeaponId), resolve),
         missingItems: [],
-        links: [],
+        links: [{ to: '/search', label: '候補検索へ' }],
       }
     case 'unconfirmed_rng_state':
       return {
@@ -356,6 +519,13 @@ export function presentBuildListOptimizationUnsupportedReason(
   }
 }
 
+/** The Debug Mode line of a typed unsupported reason: its kind, and the validation issues of a whole-input fail closed. */
+export function unsupportedReasonDebugText(reason: { kind: string; issues?: readonly { path: string; code: string }[] }): string {
+  return reason.kind === 'invalid_planner_input' && reason.issues !== undefined
+    ? `${reason.kind}: ${reason.issues.map(({ path, code }) => `${path} ${code}`).join(', ')}`
+    : reason.kind
+}
+
 // ------------------------------------------------------------------------------------------------ ordinary Planner auxiliary
 
 /** The ordinary Planner auxiliary operation (`docs/UI_FLOW.md` 10.4 「通常Plannerの補助導線」); its final name is the screen PR's. */
@@ -364,7 +534,7 @@ export const ORDINARY_PLANNER_AUXILIARY_LABEL = '登録済みの候補で生産�
 export const ORDINARY_PLANNER_AUXILIARY_NOTES: readonly string[] = [
   '作成リストに登録したルートをそのまま使い、全体最適化によるルートの組み直しはしません。',
   'すべての目標武器が完成すること、競合が無いことは保証しません。',
-  '作成リストの候補・途中採用状態の選択・改善優先は変更されません。現在の下書きがある場合は、作成した計画の保存時に置き換えられます。',
+  '作成リストの候補は変更されません。現在の下書きがある場合は、作成した計画の保存時に置き換えられます。',
 ]
 
 /** U7: shown next to the auxiliary operation while the ordinary Planner setting is invalid. */
@@ -425,8 +595,6 @@ export interface BuildListOptimizationReplacementView {
   sourceChanged: boolean | null
   /** The Target's preferred owned weapon when the new Route does not start from it (17.14), else null. */
   preferredSourceNotUsed: { preferredName: string } | null
-  /** The replaced Entry's improvement preference; null when the replaced Entry is unknown. */
-  previousImprovementPreference: ImprovementPreference | null
 }
 
 export interface BuildListOptimizationOutOfScopeRow {
@@ -439,6 +607,7 @@ const outOfScopeLabels: Record<keyof BuildListOptimizationOutOfScopeTargetCounts
   noEntry: '作成リストに候補なし',
   excludedEntryOnly: '候補が計画の対象外（再検索が必要など）',
   disabled: '検索対象OFF',
+  completionConditionReview: '完成条件の再設定が必要',
   completed: '完了済み',
 }
 
@@ -456,21 +625,61 @@ export interface BuildListOptimizationPreviewModel {
   conflictCount: number
   replacements: BuildListOptimizationReplacementView[]
   unchangedTargets: BuildListOptimizationTargetList
-  /** The replacements whose improvement preference returns to `planner` (17.5). */
-  preferenceResets: BuildListOptimizationReplacementView[]
   /** The replacements that do not start from the Target's preferred owned weapon (17.14). */
   preferredSourceDifferences: BuildListOptimizationReplacementView[]
-  /** False when no start context was given: the replaced Entries' bases and preferences are then not shown. */
+  /** Each completed Target with the completion Variants it achieves (17.9, `docs/REQUIREMENTS.md` 13.2). */
+  plannedCompletionVariants: PlannedCompletionVariantsRow[]
+  /** False when no start context was given: the replaced Entries' bases and the Targets' preferred weapons are then not shown. */
   startContextAvailable: boolean
 }
 
-function routeBaseOf(entry: BuildListEntry, ownedWeapons: ReadonlyMap<string, OwnedWeapon>): BuildListOptimizationRouteBase {
+/** Where an Entry's Route starts, named from the given owned weapons only (never a guessed or a later read). */
+export function buildListOptimizationRouteBaseOf(entry: BuildListEntry, ownedWeapons: ReadonlyMap<string, OwnedWeapon>): BuildListOptimizationRouteBase {
   const sourceId = entry.candidateSnapshot.route.sourceOwnedWeaponId
   if (sourceId === null) return { kind: 'new_normal' }
   const weapon = ownedWeapons.get(sourceId)
   return weapon === undefined
     ? { kind: 'owned_unresolved' }
     : { kind: 'owned', name: weapon.name, weaponKindLabel: artianWeaponKindLabels[weapon.kind] }
+}
+
+/**
+ * The replaced Targets of an artifact's Entry changes (17.9 / 18.7): the route base before and after and the preferred owned weapon the
+ * new Route does not start from (17.14). The replaced Entries, the Targets' preferences and the owned weapons come from the start context
+ * only. Shared by the Build List optimization Preview and the running Plan replan Preview (Issue #276 PR-6A), whose artifacts carry the
+ * same `replacements` / `generatedBuildListEntries` shape.
+ */
+export function createBuildListOptimizationReplacementViews(
+  artifact: Pick<BuildListOptimizationArtifact, 'replacements' | 'generatedBuildListEntries'>,
+  startContext: BuildListOptimizationPreviewStartContext | null,
+  resolve: BuildListOptimizationTargetResolver,
+): BuildListOptimizationReplacementView[] {
+  const startEntries = new Map((startContext?.buildListEntries ?? []).map((entry) => [entry.id, entry] as const))
+  const startTargets = new Map((startContext?.targetWeapons ?? []).map((target) => [target.id, target] as const))
+  const ownedWeapons = new Map((startContext?.ownedWeapons ?? []).map((weapon) => [weapon.id, weapon] as const))
+  const generatedEntries = new Map(artifact.generatedBuildListEntries.map((entry) => [entry.id, entry] as const))
+  return artifact.replacements.map((replacement): BuildListOptimizationReplacementView => {
+    const generated = generatedEntries.get(replacement.generatedBuildListEntryId)
+    const replaced = startEntries.get(replacement.replacedBuildListEntryId)
+    const after: BuildListOptimizationRouteBase = generated === undefined ? { kind: 'unavailable' } : buildListOptimizationRouteBaseOf(generated, ownedWeapons)
+    const before: BuildListOptimizationRouteBase = replaced === undefined ? { kind: 'unavailable' } : buildListOptimizationRouteBaseOf(replaced, ownedWeapons)
+    const afterSourceId = generated?.candidateSnapshot.route.sourceOwnedWeaponId
+    const beforeSourceId = replaced?.candidateSnapshot.route.sourceOwnedWeaponId
+    const target = startTargets.get(replacement.targetWeaponId)
+    const preferredId = target?.preferredOwnedWeaponId ?? null
+    let preferredSourceNotUsed: BuildListOptimizationReplacementView['preferredSourceNotUsed'] = null
+    if (preferredId !== null && generated !== undefined && afterSourceId !== preferredId) {
+      preferredSourceNotUsed = { preferredName: ownedWeapons.get(preferredId)?.name ?? '参照できない所持武器' }
+    }
+    return {
+      key: replacement.generatedBuildListEntryId,
+      target: resolve(replacement.targetWeaponId),
+      before,
+      after,
+      sourceChanged: replaced === undefined || generated === undefined ? null : beforeSourceId !== afterSourceId,
+      preferredSourceNotUsed,
+    }
+  })
 }
 
 /**
@@ -489,34 +698,7 @@ export function createBuildListOptimizationPreviewModel(
   if (plan === null) return null
   const { summary } = artifact
   const resolve = createBuildListOptimizationTargetResolver(startContext?.targetWeapons ?? null, master)
-  const startEntries = new Map((startContext?.buildListEntries ?? []).map((entry) => [entry.id, entry] as const))
-  const startTargets = new Map((startContext?.targetWeapons ?? []).map((target) => [target.id, target] as const))
-  const ownedWeapons = new Map((startContext?.ownedWeapons ?? []).map((weapon) => [weapon.id, weapon] as const))
-  const generatedEntries = new Map(artifact.generatedBuildListEntries.map((entry) => [entry.id, entry] as const))
-
-  const replacements = artifact.replacements.map((replacement): BuildListOptimizationReplacementView => {
-    const generated = generatedEntries.get(replacement.generatedBuildListEntryId)
-    const replaced = startEntries.get(replacement.replacedBuildListEntryId)
-    const after: BuildListOptimizationRouteBase = generated === undefined ? { kind: 'unavailable' } : routeBaseOf(generated, ownedWeapons)
-    const before: BuildListOptimizationRouteBase = replaced === undefined ? { kind: 'unavailable' } : routeBaseOf(replaced, ownedWeapons)
-    const afterSourceId = generated?.candidateSnapshot.route.sourceOwnedWeaponId
-    const beforeSourceId = replaced?.candidateSnapshot.route.sourceOwnedWeaponId
-    const target = startTargets.get(replacement.targetWeaponId)
-    const preferredId = target?.preferredOwnedWeaponId ?? null
-    let preferredSourceNotUsed: BuildListOptimizationReplacementView['preferredSourceNotUsed'] = null
-    if (preferredId !== null && generated !== undefined && afterSourceId !== preferredId) {
-      preferredSourceNotUsed = { preferredName: ownedWeapons.get(preferredId)?.name ?? '参照できない所持武器' }
-    }
-    return {
-      key: replacement.generatedBuildListEntryId,
-      target: resolve(replacement.targetWeaponId),
-      before,
-      after,
-      sourceChanged: replaced === undefined || generated === undefined ? null : beforeSourceId !== afterSourceId,
-      preferredSourceNotUsed,
-      previousImprovementPreference: replaced === undefined ? null : replaced.intermediateStateSelection?.improvementPreference ?? 'planner',
-    }
-  })
+  const replacements = createBuildListOptimizationReplacementViews(artifact, startContext, resolve)
 
   const outOfScopeRows = (Object.keys(outOfScopeLabels) as (keyof BuildListOptimizationOutOfScopeTargetCounts)[]).map((key) => ({
     key,
@@ -536,11 +718,51 @@ export function createBuildListOptimizationPreviewModel(
     conflictCount: plan.conflicts.length,
     replacements,
     unchangedTargets: resolveBuildListOptimizationTargets(artifact.unchangedTargetWeaponIds, resolve),
-    preferenceResets: replacements.filter(({ previousImprovementPreference }) =>
-      previousImprovementPreference !== null && previousImprovementPreference !== 'planner'),
     preferredSourceDifferences: replacements.filter(({ preferredSourceNotUsed }) => preferredSourceNotUsed !== null),
+    // The generated Entries and the start-time Build List together hold every Entry the final Plan selects.
+    plannedCompletionVariants: createPlannedCompletionVariantRows(
+      plan,
+      [...(startContext?.buildListEntries ?? []), ...artifact.generatedBuildListEntries],
+      startContext?.targetWeapons ?? null,
+      resolve,
+      master,
+    ),
     startContextAvailable: startContext !== null,
   }
+}
+
+/**
+ * The completions over this run's planning Targets in words (UI_FLOW 10.4: the planning Targets are the denominator, never every
+ * registered Target), or null for a legacy Plan whose completions are unknown. Shared by the overview and the adoption operations.
+ */
+export function buildListOptimizationCompletionDetail(model: BuildListOptimizationPreviewModel): string | null {
+  const completion = model.plannedCompletionTargetCount
+  if (completion === null) return null
+  return completion === model.planningTargetCount
+    ? `今回の計画対象${model.planningTargetCount}本すべてが完成予定`
+    : `今回の計画対象${model.planningTargetCount}本のうち${completion}本が完成予定`
+}
+
+/** The accessible name of the Preview's adoption operations (Issue #319). */
+export const BUILD_LIST_OPTIMIZATION_ADOPTION_ACTIONS_LABEL = '試算の採用'
+/** The lead of the Preview's adoption operations: which plan they adopt, and that it is checked before adopting (Issue #319). */
+export const BUILD_LIST_OPTIMIZATION_ADOPTION_ACTIONS_LEAD = `採用前の確認：${BUILD_LIST_OPTIMIZATION_PREVIEW_TITLE}`
+/** Shown in the adoption operations while 「この計画を採用」 checks the trial before its confirmation (UI_FLOW 10.4, PR-6C). */
+export const ADOPTION_INSPECTING_MESSAGE = 'この試算を採用できるか確認しています…'
+
+/**
+ * What the Preview's adoption operations ask to check before adopting (Issue #319, `docs/UI_FLOW.md` 10.4 「採用」): the completions
+ * over this run's planning Targets, the out-of-scope Targets, the Conflicts and the Build List replacement. Each is the Preview model's
+ * own figure (never recounted) in the overview's wording; the Preview body keeps every detail.
+ */
+export function buildListOptimizationAdoptionCheckItems(model: BuildListOptimizationPreviewModel): string[] {
+  const replacementCount = model.replacements.length
+  return [
+    buildListOptimizationCompletionDetail(model) ?? '完成予定の目標武器は不明',
+    model.outOfScopeTotal === 0 ? '対象外の目標武器なし' : `対象外の目標武器${model.outOfScopeTotal}件`,
+    model.conflictCount === 0 ? '競合なし' : `競合${model.conflictCount}件`,
+    replacementCount === 0 ? '候補の置き換えなし' : `候補の置き換え${replacementCount}件`,
+  ]
 }
 
 // ------------------------------------------------------------------------------------------------ current Draft comparison

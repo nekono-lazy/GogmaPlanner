@@ -112,7 +112,19 @@ export interface OwnedWeaponsPageDependencies {
   inspectDelete(id: OwnedWeapon['id']): Promise<PlanBreakingChangeInspection>
 }
 
-function referenceMessage(error: ReferencedEntityDeleteError): string {
+function referenceMessage(error: ReferencedEntityDeleteError, targets: readonly TargetWeapon[]): string {
+  // The weapon a completed Target was completed with (Issue #334,
+  // `docs/UI_FLOW.md` 8.3): named by the Target, with how to release it.
+  const completions = error.references.filter(
+    (reference) => reference.kind === 'target_weapon' && reference.path === 'completedWithOwnedWeaponId',
+  )
+  if (completions.length > 0) {
+    const names = completions.map(({ entityId }) => {
+      const name = targets.find(({ id }) => id === entityId)?.name
+      return name === undefined ? '名前を確認できない目標武器' : `「${name}」`
+    })
+    return `この所持武器は目標武器${names.join('、')}の完成に使った武器のため削除できません。削除するには、その目標武器を「未完了に戻す」か、目標武器を削除してください。`
+  }
   return `参照中のため削除できません: ${error.references
     .map(
       (reference) =>
@@ -350,7 +362,7 @@ export function OwnedWeaponsPage({
     } catch (caught: unknown) {
       setError(
         caught instanceof ReferencedEntityDeleteError
-          ? referenceMessage(caught)
+          ? referenceMessage(caught, targets)
           : caught instanceof Error
             ? caught.message
             : '削除できません。',

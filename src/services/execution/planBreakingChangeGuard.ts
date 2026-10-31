@@ -1,8 +1,11 @@
 import type { Table } from 'dexie'
 import { appDatabase, type AppDatabase } from '../../db/AppDatabase'
+import { ExecutionHistoryRepository } from '../../db/repositories/executionHistoryRepository'
 import { RepositoryError } from '../../db/repositoryError'
 import {
+  activeProductionPlanIdOf,
   ExecutionRuntimeError,
+  executionHistoryIdsAfterSavePoint,
   inspectPlanGuardedMutation,
   preparePlanGuardedMutation,
   type PlanBreakingChangeApproval,
@@ -14,7 +17,8 @@ import {
   type PlanGuardedMutationWrite,
 } from '../../domain/execution'
 import { loadMasterData } from '../../domain/master/loadMasterData'
-import type { CalculationContext, ISODateTimeString } from '../../domain/models/publicTypes'
+import type { CalculationContext, ExecutionUndoSnapshot, ISODateTimeString } from '../../domain/models/publicTypes'
+import { executionSavePointIdForPlan } from '../../domain/models/publicTypes'
 import { createBuildListCalculationContext } from '../buildList/createBuildListCalculationContext'
 
 /** The outcome of one guarded save: the mutation's own result, and how it ended the Plan if it did. */
@@ -101,8 +105,8 @@ export class PlanBreakingChangeGuard implements PlanGuardedPersistence {
 
   inspect<R>(mutation: PlanGuardedMutation<R>): Promise<PlanBreakingChangeInspection> {
     return this.run('r', async () => {
-      const state = await this.readState()
-      return this.prepare(() => inspectPlanGuardedMutation(state, mutation))
+      const state = await this.readState(mutation, null)
+      return this.prepare(() => inspectPlanGuardedMutation(state, mutation, this.dependencies.currentCalculationContext))
     })
   }
 
@@ -112,7 +116,7 @@ export class PlanBreakingChangeGuard implements PlanGuardedPersistence {
     options: PlanGuardedApplyOptions<R> = {},
   ): Promise<PlanGuardedMutationOutcome<R>> {
     return this.run('rw', async () => {
-      const state = await this.readState()
+      const state = await this.readState(mutation, approval)
       const write = this.prepare(() => preparePlanGuardedMutation({
         state,
         mutation,
@@ -135,8 +139,41 @@ export class PlanBreakingChangeGuard implements PlanGuardedPersistence {
     }
   }
 
-  private async readState(): Promise<PlanGuardPersistedState> {
+  /**
+   * The whole persisted state the guard decides from (`docs/DATA_MODEL.md`
+   * 14.6): every ExecutionHistory metadata record, judged for the `active` Plan
+   * (or for every record when the mutation reads every Undo body), and Undo
+   * bodies only when they are needed - all of them for a mutation that declares
+   * `readsExecutionUndoSnapshots` (the OwnedWeapon delete reference check), the
+   * `active` Plan's records after its save point when the approval restores it.
+   */
+  private async readState<R>(
+    mutation: PlanGuardedMutation<R>,
+    approval: PlanBreakingChangeApproval | null,
+  ): Promise<PlanGuardPersistedState> {
     const { database } = this.dependencies
+    const history = new ExecutionHistoryRepository(database)
+    const productionPlans = await database.productionPlans.toArray()
+    const executionSavePoints = await database.executionSavePoints.toArray()
+    const readsAllBodies = mutation.readsExecutionUndoSnapshots === true
+    const activePlanId = activeProductionPlanIdOf(productionPlans)
+    const executionHistory = await history.getAllExecutionHistory(
+      readsAllBodies ? { kind: 'all' } : { kind: 'plan', planId: activePlanId },
+    )
+    let executionUndoSnapshots: ExecutionUndoSnapshot[] | null = null
+    if (readsAllBodies) {
+      executionUndoSnapshots = await history.getAllExecutionUndoSnapshots()
+    } else if (approval?.savePointDecision?.kind === 'restore_save_point' && activePlanId !== null) {
+      const activePlan = { id: activePlanId }
+      const savePoint = executionSavePoints.find(({ id }) => id === executionSavePointIdForPlan(activePlanId)) ?? null
+      executionUndoSnapshots = await history.getExecutionUndoSnapshots(
+        executionHistoryIdsAfterSavePoint(
+          activePlan,
+          savePoint,
+          executionHistory.filter(({ planId }) => planId === activePlanId),
+        ),
+      )
+    }
     return {
       rngState: (await database.rngState.get('current')) ?? null,
       normalCounters: await database.normalArtianCounters.toArray(),
@@ -144,9 +181,10 @@ export class PlanBreakingChangeGuard implements PlanGuardedPersistence {
       targetWeapons: await database.targetWeapons.toArray(),
       buildListEntries: await database.buildListEntries.toArray(),
       buildCandidates: await database.buildCandidates.toArray(),
-      productionPlans: await database.productionPlans.toArray(),
-      executionHistory: await database.executionHistory.toArray(),
-      executionSavePoints: await database.executionSavePoints.toArray(),
+      productionPlans,
+      executionHistory,
+      executionUndoSnapshots,
+      executionSavePoints,
     }
   }
 
@@ -170,9 +208,8 @@ export class PlanBreakingChangeGuard implements PlanGuardedPersistence {
     const termination = write.planTermination
     if (termination === null) return
     await database.productionPlans.put(termination.plan)
-    if (termination.deletedExecutionHistoryIds.length > 0) {
-      await database.executionHistory.bulkDelete(termination.deletedExecutionHistoryIds)
-    }
+    // The restored-away records' metadata and Undo bodies are deleted together (12.2).
+    await new ExecutionHistoryRepository(database).deleteExecutionRecords(termination.deletedExecutionHistoryIds)
     if (termination.deletesExecutionSavePoint) {
       await database.executionSavePoints.where('productionPlanId').equals(termination.plan.id).delete()
     }
@@ -212,6 +249,7 @@ export class PlanBreakingChangeGuard implements PlanGuardedPersistence {
           database.buildCandidates,
           database.productionPlans,
           database.executionHistory,
+          database.executionUndoSnapshots,
           database.executionSavePoints,
         ],
         operation,

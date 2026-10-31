@@ -14,6 +14,8 @@ import type {
   ProductionPlanReplanAdoptionOptions,
 } from '../../domain/execution'
 import { ExecutionSavePointRestoreDialog } from './ExecutionSavePointRestoreDialog'
+import { SAVE_POINT_RESTORE_UNAVAILABLE_GUIDANCE } from './savePointRestoreUnavailablePresentation'
+import { SavePointRestoreUnavailableNotice } from './SavePointRestoreUnavailableNotice'
 
 type Phase = 'decide' | 'restore_confirm'
 
@@ -33,7 +35,9 @@ export const REPLAN_RESTORE_NOTE =
  * - Choice: 「現在地点を維持」 / 「最後のゲーム内セーブ地点へ戻す」 / 「キャンセル」.
  *   The restore first needs the user's confirmation that the game itself went
  *   back (the shared save point dialog); the runtime then restores only and
- *   adopts nothing.
+ *   adopts nothing. When the inspection says the restore cannot run for the
+ *   running Plan (Issue #335), that choice is disabled with its reason and
+ *   「現在地点を維持」 stays the decision.
  * 「キャンセル」 never calls anything.
  */
 export function ProductionPlanReplanAdoptionDialog({
@@ -54,6 +58,7 @@ export function ProductionPlanReplanAdoptionDialog({
   const [phase, setPhase] = useState<Phase>('decide')
   const titleId = useId()
   const descriptionId = useId()
+  const restoreUnavailableId = useId()
   const close = () => {
     if (submitting) return
     setPhase('decide')
@@ -65,8 +70,12 @@ export function ProductionPlanReplanAdoptionDialog({
     onConfirm(decision)
   }
   const choiceRequired = options !== null && options.savePointChoiceRequired
+  const restoreUnavailable =
+    options !== null && options.savePointChoiceRequired && !options.savePointRestore.restorable
+      ? options.savePointRestore.reason
+      : null
 
-  if (options !== null && options.savePointChoiceRequired && phase === 'restore_confirm') {
+  if (options !== null && options.savePointChoiceRequired && options.savePointRestore.restorable && phase === 'restore_confirm') {
     return (
       <ExecutionSavePointRestoreDialog
         open
@@ -101,9 +110,17 @@ export function ProductionPlanReplanAdoptionDialog({
                   最後のゲーム内セーブ地点: {savePointPositionLabel}
                 </Typography>
               )}
-              <Typography component="p" variant="body2" sx={{ mt: 1 }}>
-                「現在地点を維持」は現在のアプリ状態のままこの再計画を採用します。「最後のゲーム内セーブ地点へ戻す」はアプリ側をセーブ地点へ戻すだけで、この試算は採用せず、復元後にもう一度試算します。
-              </Typography>
+              {restoreUnavailable === null ? (
+                <Typography component="p" variant="body2" sx={{ mt: 1 }}>
+                  「現在地点を維持」は現在のアプリ状態のままこの再計画を採用します。「最後のゲーム内セーブ地点へ戻す」はアプリ側をセーブ地点へ戻すだけで、この試算は採用せず、復元後にもう一度試算します。
+                </Typography>
+              ) : (
+                <SavePointRestoreUnavailableNotice
+                  id={restoreUnavailableId}
+                  reason={restoreUnavailable}
+                  guidance={SAVE_POINT_RESTORE_UNAVAILABLE_GUIDANCE.replanAdoption}
+                />
+              )}
             </>
           )}
         </DialogContentText>
@@ -126,8 +143,11 @@ export function ProductionPlanReplanAdoptionDialog({
             <Button
               variant="outlined"
               color="warning"
-              disabled={submitting}
-              onClick={() => setPhase('restore_confirm')}
+              disabled={submitting || restoreUnavailable !== null}
+              aria-describedby={restoreUnavailable === null ? undefined : restoreUnavailableId}
+              onClick={() => {
+                if (restoreUnavailable === null) setPhase('restore_confirm')
+              }}
               sx={{ minHeight: 44 }}
             >
               最後のゲーム内セーブ地点へ戻す

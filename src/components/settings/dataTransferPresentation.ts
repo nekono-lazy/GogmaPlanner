@@ -1,14 +1,15 @@
-import type { DomainValidationIssue } from '../../domain/models/publicTypes'
+import type { DomainValidationIssue, ISODateTimeString } from '../../domain/models/publicTypes'
 import {
   DataTransferError,
+  type ExportSummary,
   type ImportPreparationResult,
 } from '../../services/dataTransfer/importExportService'
 
 /*
  * Presentation of the Settings screen's data management (`docs/UI_FLOW.md` 14):
  * the Japanese feedback for Export / Import / clear outcomes, the backup
- * filename, and the browser side of the Export JSON (file download and
- * clipboard write). It decides nothing about the data: every validation,
+ * filename, the Export summary rows, and the browser side of the Export JSON
+ * (file download and clipboard write). It decides nothing about the data: every validation,
  * migration and write decision stays in `ImportExportService`, and this module
  * only turns its typed outcomes into sentences.
  */
@@ -55,6 +56,71 @@ export function backupFilename(at: Date): string {
   return `${EXPORT_DOWNLOAD_FILENAME_PREFIX}_${stamp}.json`
 }
 
+const exportedAtFormat = new Intl.DateTimeFormat('ja-JP', {
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hourCycle: 'h23',
+})
+
+/**
+ * The Export root's `exportedAt` in the viewer's local time. A value that is
+ * not a parseable date is shown as stored rather than replaced by a guess.
+ */
+export function formatExportedAt(exportedAt: ISODateTimeString): string {
+  const date = new Date(exportedAt)
+  return Number.isNaN(date.getTime()) ? exportedAt : exportedAtFormat.format(date)
+}
+
+const BYTE_UNITS = ['KB', 'MB', 'GB'] as const
+
+/**
+ * A byte count for reading at a glance: bytes below 1 KB, otherwise one
+ * decimal of the largest fitting 1024-based unit followed by the exact count,
+ * e.g. 「1.2 MB（1,234,567 バイト）」.
+ */
+export function formatDataSize(bytes: number): string {
+  const exact = `${bytes.toLocaleString('ja-JP')} バイト`
+  if (bytes < 1024) return exact
+  let value = bytes / 1024
+  let unit = 0
+  while (value >= 1024 && unit < BYTE_UNITS.length - 1) {
+    value /= 1024
+    unit += 1
+  }
+  const rounded = value.toLocaleString('ja-JP', { minimumFractionDigits: 1, maximumFractionDigits: 1 })
+  return `${rounded} ${BYTE_UNITS[unit]}（${exact}）`
+}
+
+function formatCount(count: number): string {
+  return `${count.toLocaleString('ja-JP')}件`
+}
+
+export interface ExportSummaryRow {
+  label: string
+  value: string
+}
+
+/**
+ * The rows the Export Dialog shows in place of the JSON text
+ * (`docs/UI_FLOW.md` 14): when the backup was made, how large it is, and the
+ * main counts, all from the one summary the Export produced.
+ */
+export function exportSummaryRows(summary: ExportSummary): ExportSummaryRow[] {
+  return [
+    { label: '作成日時', value: formatExportedAt(summary.exportedAt) },
+    { label: 'データ量', value: formatDataSize(summary.jsonByteLength) },
+    { label: '目標武器', value: formatCount(summary.counts.targetWeapons) },
+    { label: '所持武器', value: formatCount(summary.counts.ownedWeapons) },
+    { label: '作成リスト', value: formatCount(summary.counts.buildListEntries) },
+    { label: '生産計画', value: formatCount(summary.counts.productionPlans) },
+    { label: '実行履歴', value: formatCount(summary.counts.executionHistory) },
+  ]
+}
+
 export const dataTransferSuccessMessages = {
   exportFile: 'バックアップファイルを出力しました。',
   exportCopy: 'クリップボードにコピーしました。',
@@ -82,9 +148,13 @@ export function exportFileSavedFeedback(): DataTransferFeedback {
   return success(dataTransferSuccessMessages.exportFile)
 }
 
-/** The browser refused the download before it started; the JSON stays on screen. */
+/**
+ * The browser refused the download before it started. The Dialog keeps the
+ * same JSON, so 「ファイルに保存」 can simply be pressed again; 「コピー」 is the
+ * other way out. There is no JSON field to copy from by hand.
+ */
 export function exportFileSaveFailedFeedback(): DataTransferFeedback {
-  return failure(`バックアップファイルを出力できませんでした。JSON欄から手動でコピーするか、再度お試しください。${UNCHANGED_NOTE}`)
+  return failure(`バックアップファイルを出力できませんでした。もう一度「ファイルに保存」を押すか、「コピー」をお使いください。${UNCHANGED_NOTE}`)
 }
 
 /** The Export Dialog's JSON was written to the clipboard. */
@@ -94,10 +164,10 @@ export function exportCopiedFeedback(): DataTransferFeedback {
 
 /**
  * The clipboard write was refused or is unavailable. The browser error is never
- * shown; the user is sent to the JSON field, which stays selectable.
+ * shown; the user is sent to 「ファイルに保存」, which needs no clipboard.
  */
 export function exportCopyFailedFeedback(): DataTransferFeedback {
-  return failure('クリップボードにコピーできませんでした。JSON欄から手動でコピーしてください。')
+  return failure('クリップボードにコピーできませんでした。「ファイルに保存」を使ってください。')
 }
 
 /** Export never writes, so every failure leaves the data as it was. */

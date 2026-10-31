@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react'
-import { useId } from 'react'
+import { Fragment, useId } from 'react'
 import { Alert, AlertTitle, Box, Divider, Paper, Stack, Typography } from '@mui/material'
 import type { MasterDataRoot } from '../../domain/master/masterTypes'
 import {
@@ -8,9 +8,86 @@ import {
 } from '../../presentation/labels'
 import { RestorationBonusSlots } from '../RestorationBonusSlots'
 import { ExecutionEntityName } from './ExecutionWeaponDetailDialog'
+import { ExecutionFocusFrame } from './ExecutionFocusFrame'
 import { StatusChip } from '../StatusChip'
 import { groupSkillLabel, seriesSkillLabel } from '../search/searchPresentation'
+import { AchievedCompletionVariants } from '../target/AchievedCompletionVariants'
 import type { ExecutionNormalCreationGuidance, ExecutionStepPresentation } from './executionStepPresentation'
+
+/** Which part of a Step's expected result is the result to compare (Issue #318). */
+type ExpectedResultFocus = 'skills' | 'restoration_bonuses' | null
+
+/**
+ * The lottery result a Step's own game operation yields, from the typed
+ * operation and the recorded Normal creation role only (Issue #318). The
+ * conversion assigns the initial Skills and Reset Skills redraws them; Reset /
+ * Keep Bonuses draw the five slots, and so does the forge of a recorded
+ * production-target Normal. A Counter-advance forge, a Normal creation whose
+ * role was never recorded (never inferred, Issue #275), an owned Ideal
+ * confirmation and a legacy Step frame nothing.
+ */
+function expectedResultFocus({ step, normalCreationRole }: ExecutionStepPresentation): ExpectedResultFocus {
+  switch (step.operationType) {
+    case 'convert_normal_to_gogma':
+    case 'reset_skills':
+      return 'skills'
+    case 'reset_bonuses':
+    case 'keep_bonuses':
+      return 'restoration_bonuses'
+    case 'create_normal_artian':
+      return normalCreationRole === 'production_target' ? 'restoration_bonuses' : null
+    case 'confirm_owned_ideal':
+    case 'reserve_weapon':
+    case 'confirm_result':
+      return null
+  }
+}
+
+/**
+ * The predicted Series / Group Skills of a Skill lottery Step's expected result
+ * (Issue #318), framed as the part the user compares with the game screen.
+ * Each Skill is its own term / definition row, so the two are never read as
+ * one line, and the Skill names are larger and bolder than the labels and the
+ * surrounding instructions. Presentation only: a `null` Skill still reads
+ * 「なし」 through the shared label functions.
+ */
+function ExpectedSkillsSection({
+  seriesSkillId,
+  groupSkillId,
+  master,
+}: {
+  seriesSkillId: string | null
+  groupSkillId: string | null
+  master: MasterDataRoot
+}) {
+  const rows = [
+    { term: 'シリーズスキル', name: seriesSkillLabel(seriesSkillId, master) },
+    { term: 'グループスキル', name: groupSkillLabel(groupSkillId, master) },
+  ]
+  return (
+    <ExecutionFocusFrame heading="想定されるスキル">
+      <Box
+        component="dl"
+        sx={{ m: 0, display: 'grid', gridTemplateColumns: 'auto minmax(0, 1fr)', columnGap: 1.5, rowGap: 0.75, alignItems: 'baseline' }}
+      >
+        {rows.map(({ term, name }) => (
+          <Fragment key={term}>
+            <Typography component="dt" variant="body2" sx={{ color: 'text.secondary', fontWeight: 600 }}>
+              {term}
+            </Typography>
+            <Typography
+              component="dd"
+              variant="h2"
+              sx={{ m: 0, minWidth: 0, color: 'text.primary', fontWeight: 700, overflowWrap: 'anywhere' }}
+            >
+              {name}
+            </Typography>
+          </Fragment>
+        ))}
+      </Box>
+    </ExecutionFocusFrame>
+  )
+}
 
 function ExpectedResultSection({
   presentation,
@@ -32,29 +109,45 @@ function ExpectedResultSection({
   }
   const { result } = expected
   const hasSkills = result.seriesSkillId !== null || result.groupSkillId !== null
+  // The result this Step's operation draws is framed; what it only carries
+  // along stays outside the frame, in the same order on every Step: the five
+  // slots and their scope first, the Skills after them.
+  const focus = expectedResultFocus(presentation)
+  const restorationBonuses = result.restorationBonuses === null ? null : (
+    <>
+      <RestorationBonusSlots
+        bonuses={result.restorationBonuses}
+        weaponTypeId={presentation.weaponTypeId}
+        master={master}
+        scope={result.restorationBonusScope}
+        variant="outlined"
+        label="想定される復元ボーナス5枠"
+      />
+      <Typography variant="caption" color="text.secondary">
+        {restorationBonusScopeFieldLabel}:{' '}
+        {result.restorationBonusScope === null
+          ? '記録なし'
+          : restorationBonusScopeLabels[result.restorationBonusScope]}
+      </Typography>
+    </>
+  )
   return (
-    <Stack spacing={0.75}>
+    <Stack spacing={1}>
       <Typography component="p" variant="subtitle2">想定結果</Typography>
-      {result.restorationBonuses !== null && (
-        <>
-          <RestorationBonusSlots
-            bonuses={result.restorationBonuses}
-            weaponTypeId={presentation.weaponTypeId}
-            master={master}
-            scope={result.restorationBonusScope}
-            variant="outlined"
-            label="想定される復元ボーナス5枠"
-          />
-          <Typography variant="caption" color="text.secondary">
-            {restorationBonusScopeFieldLabel}:{' '}
-            {result.restorationBonusScope === null
-              ? '記録なし'
-              : restorationBonusScopeLabels[result.restorationBonusScope]}
-          </Typography>
-        </>
+      {restorationBonuses !== null && (
+        focus === 'restoration_bonuses'
+          ? <ExecutionFocusFrame heading="想定される復元ボーナス5枠">{restorationBonuses}</ExecutionFocusFrame>
+          : restorationBonuses
       )}
-      {hasSkills && (
-        <Typography variant="body2" sx={{ overflowWrap: 'anywhere' }}>
+      {hasSkills && focus === 'skills' && (
+        <ExpectedSkillsSection
+          seriesSkillId={result.seriesSkillId}
+          groupSkillId={result.groupSkillId}
+          master={master}
+        />
+      )}
+      {hasSkills && focus !== 'skills' && (
+        <Typography variant="body2" sx={{ color: 'text.secondary', overflowWrap: 'anywhere' }}>
           シリーズ: {seriesSkillLabel(result.seriesSkillId, master)} ／ グループ:{' '}
           {groupSkillLabel(result.groupSkillId, master)}
         </Typography>
@@ -192,14 +285,14 @@ export function ExecutionStepCard({
           )}
         </Box>
 
-        {presentation.completionTargetLabels.map((label, index) => (
-          <Alert key={`${label}:${index}`} severity="success">
+        {presentation.completionTargets.map(({ label, achieved }, index) => (
+          <Alert key={`${label}:${index}`} severity="success" sx={{ '& .MuiAlert-message': { minWidth: 0 } }}>
             このStepで「{label}」が完成します
+            {/* Re-judged at display time from the completion result the Step
+                confirms and the current Target (`docs/REQUIREMENTS.md` 13.2). */}
+            {achieved !== null && <AchievedCompletionVariants achieved={achieved} layout="line" />}
           </Alert>
         ))}
-        {presentation.reachesCheckpoint && (
-          <Alert severity="info">このStepで作成リストの途中採用状態に到達します</Alert>
-        )}
 
         {!isOwnedIdeal && (
           <>

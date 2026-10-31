@@ -11,11 +11,12 @@ import {
   inspectProductionPlanStartTargetLinkChanges,
   type ProductionPlanStartTargetLinkChange,
 } from '../planner/productionPlanStartEffects'
-import { validateTargetPreferredOwnedWeapons } from '../target/preferredOwnedWeapon'
+import { validateTargetOwnedWeaponCollections } from '../target/preferredOwnedWeapon'
 import { executionFailure } from './executionRuntimeError'
 import {
   assertExecutableProductionPlan,
   assertPlanDependenciesUnchanged,
+  assertProductionPlanCompletionAssignmentSafe,
   createActualExecutionState,
   executionStateMatches,
   requireCurrentPlanStep,
@@ -27,7 +28,8 @@ export interface ProductionPlanStartInput {
   plan: ProductionPlan
   /** Every persisted Plan whose status is `active` or `stale`. */
   runningPlans: readonly ProductionPlan[]
-  state: ExecutionPersistedState
+  /** A Plan start reads no Undo body (`docs/DATA_MODEL.md` 14.6). */
+  state: Omit<ExecutionPersistedState, 'undoSnapshotsAfterSavePoint'>
   currentCalculationContext: CalculationContext
   now: ISODateTimeString
 }
@@ -86,6 +88,11 @@ export function prepareProductionPlanStart(input: ProductionPlanStartInput): Pro
     )
   }
   assertExecutableProductionPlan(plan, input.currentCalculationContext)
+  // A Plan whose recorded completions could make one weapon the completion of
+  // two Targets never starts (Issue #334, `docs/PLANNER_SPEC.md` 21.4 /
+  // 21.4.1): a selected Entry whose Route starts from a completion-assigned
+  // weapon completes that weapon, so it is refused here too.
+  assertProductionPlanCompletionAssignmentSafe(plan, state.targetWeapons)
   const otherRunning = input.runningPlans.filter(({ id }) => id !== plan.id)
   if (otherRunning.length > 0) {
     executionFailure(
@@ -119,9 +126,9 @@ export function prepareProductionPlanStart(input: ProductionPlanStartInput): Pro
       executionFailure('entity_validation_failed', `TargetWeapon '${target.id}' fails Domain validation after the Plan start.`, validation.issues)
     }
   }
-  const preferences = validateTargetPreferredOwnedWeapons(nextTargets, state.ownedWeapons)
+  const preferences = validateTargetOwnedWeaponCollections(nextTargets, state.ownedWeapons)
   if (!preferences.isValid) {
-    executionFailure('collection_validation_failed', 'The Target preferred owned weapon collection is invalid after the Plan start.', preferences.issues)
+    executionFailure('collection_validation_failed', 'The Target preferred owned weapon or completion assignment collection is invalid after the Plan start.', preferences.issues)
   }
 
   const started: ProductionPlan = { ...structuredClone(plan), status: 'active', updatedAt: now }

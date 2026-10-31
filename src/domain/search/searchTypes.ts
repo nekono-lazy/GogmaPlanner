@@ -126,6 +126,16 @@ export type SkippedRouteReason =
    * exclusion keeps its ordinary reason.
    */
   | 'source_excluded_for_other_targets'
+  /**
+   * `docs/SEARCH_SPEC.md` 5.5.1 (Issue #334): the RouteKind had at least one
+   * owned source under the existing source rules, and every one of them is the
+   * completion of another Target (`TargetWeapon.completedWithOwnedWeaponId`),
+   * which is never a Route base - its zero-operation current Route included -
+   * whatever its protection. A RouteKind with no source at all keeps its
+   * ordinary reason, and the request's own source exclusion keeps
+   * `source_excluded_for_other_targets`.
+   */
+  | 'source_completion_assigned'
 
 export interface SkippedRoute {
   route: RouteKind

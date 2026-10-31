@@ -2,7 +2,7 @@ import { isTargetWeaponPlanningEligible } from '../models/domainRules'
 import { TargetSearchScheduler } from './targetSearchScheduler'
 import type { BuildCandidate, OwnedWeaponId, RestorationBonusSet, RouteKind, TargetWeapon } from '../models/publicTypes'
 import type { RngEngine } from '../rng/rngEngine'
-import { validateTargetIdealImpliesPractical } from '../target'
+import { collectCompletionAssignedOwnedWeaponIds, validateTargetCompletionConditions } from '../target'
 import { selectCanonicalIdealCandidate } from './candidateRetention'
 import { compareStableKeys } from './semanticKeys'
 import { searchExistingGogmaRoutes } from './existingGogmaRouteSearch'
@@ -96,20 +96,22 @@ function selectedTarget(
       warnings: [{
         targetWeaponId: target.id,
         severity: 'warning',
-        message: target.lifecycleStatus === 'active'
-          ? `TargetWeapon '${target.id}' is disabled and was not searched.`
-          : `TargetWeapon '${target.id}' is completed and was not searched.`,
+        message: target.lifecycleStatus !== 'active'
+          ? `TargetWeapon '${target.id}' is completed and was not searched.`
+          : !target.isEnabled
+            ? `TargetWeapon '${target.id}' is disabled and was not searched.`
+            : `TargetWeapon '${target.id}' needs its completion condition reviewed and saved before it can be searched.`,
       }],
     }
   }
-  const containment = validateTargetIdealImpliesPractical(target, input.master)
-  if (!containment.isValid) {
+  const completionConditions = validateTargetCompletionConditions(target, input.master)
+  if (!completionConditions.isValid) {
     return {
       target: null,
       warnings: [{
         targetWeaponId: target.id,
         severity: 'warning',
-        message: `TargetWeapon '${target.id}' violates the Ideal implies Practical containment invariant and was not searched: ${containment.issues
+        message: `TargetWeapon '${target.id}' has an invalid completion condition and was not searched: ${completionConditions.issues
           .map((issue) => `${issue.path}: ${issue.message}`)
           .join(' / ')}`,
       }],
@@ -159,6 +161,9 @@ async function searchTarget(
     searchInput: input,
     // The ordinary request alone carries a source exclusion (SEARCH_SPEC 3.3).
     excludedSourceOwnedWeaponIds: new Set(input.excludedSourceOwnedWeaponIds ?? []),
+    // A weapon another Target was completed with is never a Route base here
+    // (SEARCH_SPEC 5.5.1, Issue #334), derived from this input's own Targets.
+    completionAssignedOwnedWeaponIds: collectCompletionAssignedOwnedWeaponIds(input.targetWeapons),
     engine,
     execution,
     predictionSupport,

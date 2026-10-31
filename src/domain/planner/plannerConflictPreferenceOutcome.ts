@@ -35,18 +35,17 @@ import type {
  *   waited on each other or a Counter stream stalled
  * - `execution_precondition_failed`: a Counter it needs was passed, its source
  *   weapon was gone, protected or changed, or its RNG input was unavailable
- * - `checkpoint_not_reached`: its selected compromise checkpoint was not reached
- * - `satisfied_by_other_entry`: another Entry's weapon satisfied its Target, so
- *   it was released (no completion effect of its own)
  * - `inconsistent_completion_record`: the Plan records it as selected but not
  *   as completing its Target, or the reverse (fail closed)
+ *
+ * Calculation schema 18..19 also had `satisfied_by_other_entry` (another
+ * Entry's weapon satisfied its Target, so it was released). Since Issue #334
+ * PR-3 no Entry is released (`docs/PLANNER_SPEC.md` 21.5), so it cannot arise.
  */
 export type PlannerPreferredEntryIncompleteCause =
   | { kind: 'preferred_entries_conflict'; conflictId: string; otherBuildListEntryId: BuildListEntryId }
   | { kind: 'deadlock_or_stall' }
   | { kind: 'execution_precondition_failed' }
-  | { kind: 'checkpoint_not_reached' }
-  | { kind: 'satisfied_by_other_entry' }
   | { kind: 'inconsistent_completion_record' }
   | { kind: 'unknown' }
 
@@ -133,7 +132,6 @@ function incompleteCause(
 ): PlannerPreferredEntryIncompleteCause {
   const evidence = routeCommitment?.entries.find((entry) => entry.buildListEntryId === buildListEntryId)
   if (evidence === undefined) return { kind: 'unknown' }
-  if (evidence.status === 'released') return { kind: 'satisfied_by_other_entry' }
   if (evidence.status !== 'dropped') return { kind: 'unknown' }
   const outcome = evidence.provisionalOutcome
   if (outcome !== null) {
@@ -149,11 +147,9 @@ function incompleteCause(
   }
   const reasons = evidence.rejectionReasons
   if (reasons.includes('conflict_not_committed')) return { kind: 'deadlock_or_stall' }
-  if (reasons.includes('selected_checkpoint_not_reached')) return { kind: 'checkpoint_not_reached' }
   if (reasons.some((reason) => EXECUTION_PRECONDITION_REASONS.includes(reason))) {
     return { kind: 'execution_precondition_failed' }
   }
-  if (reasons.includes('candidate_already_satisfied')) return { kind: 'satisfied_by_other_entry' }
   return { kind: 'unknown' }
 }
 

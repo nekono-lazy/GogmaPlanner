@@ -430,7 +430,6 @@ function guidanceSeverity(conflict: ConflictCardDisplay): 'info' | 'warning' | n
     case 'selected':
     case 'undecided':
       return null
-    case 'checkpoint_change_required':
     case 'not_compared':
       return 'warning'
     case 'dynamic':
@@ -463,7 +462,7 @@ function ConflictCard({
       color="inherit"
       sx={{ minHeight: 44, alignSelf: { xs: 'stretch', sm: 'flex-start' } }}
     >
-      {conflict.buildListAction === 'change_checkpoint' ? 'ビルドリストで途中採用する状態を変更' : 'ビルドリストを開く'}
+      ビルドリストを開く
     </Button>
   )
   return (

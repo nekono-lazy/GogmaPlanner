@@ -2,6 +2,23 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+// Every Guide image the published app imports, by source base name. Vite emits
+// each one once as assets/<name>-<8-character hash>.webp; a new, renamed or
+// removed image changes this list only after review.
+export const guideAssetNames = Object.freeze([
+  'build-list',
+  'build-list-optimization-preview',
+  'dashboard',
+  'execution-navigator',
+  'execution-weapon-switch',
+  'production-plan',
+  'rng-identification',
+  'rng-setup',
+  'search',
+  'settings-backup',
+  'target-weapons',
+])
+
 function check(condition, message) {
   if (!condition) throw new Error(message)
 }
@@ -74,7 +91,11 @@ export function verifyDist(root, expectedBuildId) {
   check(bodies.every((body) => !body.includes('sourceMappingURL=')), 'Source map reference in distribution')
   const workers = ['search', 'planner', 'skillIdentification', 'gogmaCounterIdentification', 'normalArtianCounterIdentification', 'buildListOptimization']
   for (const worker of workers) check(scripts.some((file) => file.includes(`${worker}.worker.entry-`)), `Missing built Worker: ${worker}`)
-  check(files.filter((file) => file.endsWith('.webp')).length === 10, 'Guide asset inventory changed; review required')
+  const images = files.filter((file) => file.endsWith('.webp'))
+  for (const name of guideAssetNames) {
+    check(images.filter((file) => file.startsWith(`assets/${name}-`) && /^[A-Za-z0-9_-]{8}\.webp$/u.test(file.slice(`assets/${name}-`.length))).length === 1, `Guide asset inventory changed; review required: ${name}`)
+  }
+  check(images.length === guideAssetNames.length, 'Guide asset inventory changed; review required')
   const html = safeFile(path.join(dist, 'index.html')).toString('utf8')
   check(html.includes('/GogmaPlanner/assets/'), 'GitHub Pages base path changed')
   const textFiles = [['index.html', html], ...scripts.map((file, i) => [file, bodies[i]]), ...files.filter((file) => file.endsWith('.css')).map((file) => [file, safeFile(path.join(dist, file)).toString('utf8')])]
@@ -88,7 +109,7 @@ export function verifyDist(root, expectedBuildId) {
       check(files.includes(ref), `Missing emitted asset: ${file} -> ${ref}`)
     }
   }
-  return { files: files.length, scripts: scripts.length, workers: workers.length, guideAssets: 10, buildId: expectedBuildId, licenses: ['licenses.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md'], sourceMaps: 0 }
+  return { files: files.length, scripts: scripts.length, workers: workers.length, guideAssets: guideAssetNames.length, buildId: expectedBuildId, licenses: ['licenses.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md'], sourceMaps: 0 }
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

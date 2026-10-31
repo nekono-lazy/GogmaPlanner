@@ -1,12 +1,11 @@
 import type {
   BuildListEntry,
   BuildListEntryId,
+  OwnedWeaponId,
   PlanConflict,
-  PlanConflictCheckpointParticipant,
   TargetWeapon,
 } from '../models/publicTypes'
 import { createPlanConflictId } from './conflictKey'
-import { selectedIntermediateStateAtOperationIndex } from './plannerCheckpoints'
 import { recommendPlannerEntry } from './plannerEntryPriority'
 import type { PlannerRouteUnit } from './plannerRouteProgress'
 import type {
@@ -28,48 +27,13 @@ export interface PlannerConflictDetectionResult {
   resolutionRefusals: readonly PlannerConflictResolutionRefusal[]
 }
 
-/** The fields one explicit decision is judged against: identity, participants and checkpoint participants. */
-export type PlannerResolvableConflict = Pick<
-  PlanConflict,
-  'id' | 'buildListEntryIds' | 'checkpointParticipants'
->
+/** The fields one explicit decision is judged against: identity and participants. */
+export type PlannerResolvableConflict = Pick<PlanConflict, 'id' | 'buildListEntryIds'>
 
 /** One resolution that could not be applied, and why. */
 export interface PlannerConflictResolutionRefusal {
   readonly resolution: PlannerConflictResolution
   readonly reason: string
-}
-
-const NO_EXCLUDED_ENTRIES: ReadonlySet<BuildListEntryId> = new Set()
-
-/**
- * Whether this conflict involves a selected compromise checkpoint.
- *
- * Such a conflict is out of scope for a winner-picking
- * `PlannerConflictResolution` (`docs/PLANNER_SPEC.md` 9.5): applying one would
- * make the losing Entry give up the very Counter position its selected
- * checkpoint needs, which silently drops a hard constraint. The only
- * resolution is a Build List checkpoint change followed by a new Planner run.
- */
-export function conflictInvolvesSelectedCheckpoint(
-  conflict: Pick<PlanConflict, 'checkpointParticipants'>,
-): boolean {
-  return (conflict.checkpointParticipants?.length ?? 0) > 0
-}
-
-/**
- * The checkpoint participants of `conflict` that still run in this run: those
- * no other explicit decision excludes (`docs/PLANNER_SPEC.md` 9.6.2, effective
- * checkpoint participants). An excluded Entry runs no unit of its Route, so its
- * checkpoint is not imposed on the run at all.
- */
-export function effectiveCheckpointParticipants(
-  conflict: Pick<PlanConflict, 'checkpointParticipants'>,
-  excludedBuildListEntryIds: ReadonlySet<BuildListEntryId> = NO_EXCLUDED_ENTRIES,
-): PlanConflictCheckpointParticipant[] {
-  return (conflict.checkpointParticipants ?? []).filter(
-    ({ buildListEntryId }) => !excludedBuildListEntryIds.has(buildListEntryId),
-  )
 }
 
 /**
@@ -82,31 +46,20 @@ export function effectiveCheckpointParticipants(
  * fixed-constraint preparation - so a refused resolution is refused the same
  * way everywhere and can never reach a Planner run through another door.
  *
- * `excludedBuildListEntryIds` are the Entries the other applied decisions of
- * the same input exclude (`docs/PLANNER_SPEC.md` 9.5.1 / 9.6.4). A conflict
- * whose checkpoint participants are all excluded is an ordinary conflict among
- * the rest; one with an effective checkpoint participant, and a decision that
- * selects a checkpoint participant itself, stay refused. Without the set every
- * conflict a selected checkpoint takes part in is refused, as before.
+ * Calculation schema 11..18 also refused a conflict a selected compromise
+ * checkpoint took part in (`docs/PLANNER_SPEC.md` 9.5.1 / 9.6.2). Issue #100
+ * removed the selection, so no detected conflict carries a checkpoint
+ * participant any more (20.7 / 20.10).
  */
 export function conflictResolutionRefusalReason(
   resolution: PlannerConflictResolution,
   conflict: PlannerResolvableConflict | undefined,
-  excludedBuildListEntryIds: ReadonlySet<BuildListEntryId> = NO_EXCLUDED_ENTRIES,
 ): string | null {
   if (!conflict) {
     return `Conflict resolution '${resolution.conflictKey}' does not match a currently detected conflict.`
   }
   if (!conflict.buildListEntryIds.includes(resolution.selectedBuildListEntryId)) {
     return `BuildListEntry '${resolution.selectedBuildListEntryId}' is not a participant in conflict '${resolution.conflictKey}'.`
-  }
-  if (
-    (conflict.checkpointParticipants ?? []).some(
-      ({ buildListEntryId }) => buildListEntryId === resolution.selectedBuildListEntryId,
-    ) ||
-    effectiveCheckpointParticipants(conflict, excludedBuildListEntryIds).length > 0
-  ) {
-    return `Conflict '${resolution.conflictKey}' involves a selected intermediate state, so it cannot be resolved by preferring BuildListEntry '${resolution.selectedBuildListEntryId}'; change or clear the selection in the Build List instead.`
   }
   return null
 }
@@ -117,18 +70,19 @@ export interface PlannerConflictResolutionApplication {
   readonly appliedSelections: ReadonlyMap<string, BuildListEntryId>
   /** Every non-selected participant of an applied resolution (the excluded Entries). */
   readonly excludedBuildListEntryIds: ReadonlySet<BuildListEntryId>
-  /** The resolutions not applied, in input order, judged against the final excluded set. */
+  /** The resolutions not applied, in input order. */
   readonly refusals: readonly PlannerConflictResolutionRefusal[]
 }
 
 /**
- * Applies explicit resolutions to `conflicts` as one monotone fixpoint
- * (`docs/PLANNER_SPEC.md` 9.6.4): a resolution is applied once
- * `conflictResolutionRefusalReason()` accepts it against the Entries the
- * resolutions applied so far exclude, and its own non-selected participants
- * then join the excluded set. It repeats until nothing more applies. The
- * excluded set only grows and each check is monotone in it, so the result does
- * not depend on the resolution order.
+ * Applies explicit resolutions to `conflicts` (`docs/PLANNER_SPEC.md` 9.6.4): a
+ * resolution is applied when `conflictResolutionRefusalReason()` accepts it and
+ * no earlier resolution of the input already decided its conflict, and its own
+ * non-selected participants join the excluded set.
+ *
+ * Calculation schema 11..18 repeated this to a monotone fixpoint, because a
+ * checkpoint refusal depended on the excluded set; no refusal does now, so one
+ * pass in input order reaches the same fixpoint.
  *
  * It decides applicability only. Whether the applied set is consistent - no
  * Entry both selected and excluded - is the caller's fail-closed check.
@@ -140,23 +94,19 @@ export function applyPlannerConflictResolutions(
   const conflictsById = new Map(conflicts.map((conflict) => [conflict.id, conflict]))
   const appliedSelections = new Map<string, BuildListEntryId>()
   const excluded = new Set<BuildListEntryId>()
-  for (let changed = true; changed;) {
-    changed = false
-    for (const resolution of resolutions) {
-      if (appliedSelections.has(resolution.conflictKey)) continue
-      const conflict = conflictsById.get(resolution.conflictKey)
-      if (conflictResolutionRefusalReason(resolution, conflict, excluded) !== null) continue
-      appliedSelections.set(resolution.conflictKey, resolution.selectedBuildListEntryId)
-      ;(conflict as PlannerResolvableConflict).buildListEntryIds.forEach((entryId) => {
-        if (entryId !== resolution.selectedBuildListEntryId) excluded.add(entryId)
-      })
-      changed = true
-    }
+  for (const resolution of resolutions) {
+    if (appliedSelections.has(resolution.conflictKey)) continue
+    const conflict = conflictsById.get(resolution.conflictKey)
+    if (conflict === undefined || conflictResolutionRefusalReason(resolution, conflict) !== null) continue
+    appliedSelections.set(resolution.conflictKey, resolution.selectedBuildListEntryId)
+    conflict.buildListEntryIds.forEach((entryId) => {
+      if (entryId !== resolution.selectedBuildListEntryId) excluded.add(entryId)
+    })
   }
   const refusals = resolutions.flatMap((resolution) => {
     if (appliedSelections.get(resolution.conflictKey) === resolution.selectedBuildListEntryId) return []
     const reason =
-      conflictResolutionRefusalReason(resolution, conflictsById.get(resolution.conflictKey), excluded) ??
+      conflictResolutionRefusalReason(resolution, conflictsById.get(resolution.conflictKey)) ??
       `Conflict resolution '${resolution.conflictKey}' repeats a conflict another resolution already decided.`
     return [{ resolution, reason }]
   })
@@ -169,12 +119,6 @@ function compareStableStrings(left: string, right: string): number {
 
 export function plannerRouteUnitKey(unit: PlannerRouteUnit): string {
   return `${unit.entryId}\u0000${unit.position.operationIndex}\u0000${unit.position.unitIndex}`
-}
-
-function sortedEntryIds(units: readonly PlannerRouteUnit[]): BuildListEntryId[] {
-  return [...new Set(units.map(({ entryId }) => entryId))].sort(
-    compareStableStrings,
-  )
 }
 
 function allOneShareablePhysicalAction(
@@ -203,7 +147,27 @@ function appendUnitConflict(
 interface ConflictGroup {
   key: string
   kind: PlanConflict['kind']
+  /** The participants: the Entries of `units`, plus the Entries a weapon group names directly. */
+  entryIds: Set<BuildListEntryId>
   units: PlannerRouteUnit[]
+  /** The weapon of a `same_owned_weapon_consumed` group; `null` for a Counter group. */
+  ownedWeaponId: OwnedWeaponId | null
+}
+
+/**
+ * The owned weapon an Entry's Route completes its Target with, or `null` for a
+ * Route that forges a new weapon (Issue #334 PR-3, `docs/PLANNER_SPEC.md` 16.3 /
+ * 21.5): an existing Gogma Route - the zero-operation `existing_gogma_current`
+ * included - completes its source, and an owned Normal Route completes the
+ * weapon it converts (the same OwnedWeapon ID, `docs/PLANNER_SPEC.md` 16.3).
+ * Read from the saved Route alone; never from the Planner state.
+ */
+export function plannerEntryCompletionWeaponId(entry: BuildListEntry): OwnedWeaponId | null {
+  const route = entry.candidateSnapshot.route
+  if (route.kind.startsWith('existing_gogma') || route.kind === 'owned_normal_artian_to_gogma') {
+    return route.sourceOwnedWeaponId
+  }
+  return null
 }
 
 /**
@@ -239,41 +203,68 @@ function counterGroups(
         unit.counterStream === 'normal'
           ? `${kind}\u0000${unit.counterId}\u0000${unit.counterBefore}`
           : `${kind}\u0000${unit.counterBefore}`
-      const group = groups.get(key) ?? { key, kind, units: [] }
+      const group = groups.get(key) ?? { key, kind, entryIds: new Set<BuildListEntryId>(), units: [], ownedWeaponId: null }
+      group.entryIds.add(unit.entryId)
       group.units.push(unit)
       groups.set(key, group)
     })
   })
   return [...groups.values()].filter(
-    ({ units }) =>
-      sortedEntryIds(units).length > 1 &&
+    ({ entryIds, units }) =>
+      entryIds.size > 1 &&
       !allOneShareablePhysicalAction(units),
   )
 }
 
+/**
+ * One OwnedWeapon completes at most one Target (Issue #334 PR-3,
+ * `docs/PLANNER_SPEC.md` 21.5): two Entries whose completed weapon is the same
+ * owned weapon (`plannerEntryCompletionWeaponId()`) always collide - the
+ * degenerate pair whose every unit is one shareable physical action, two
+ * zero-operation Candidates on one weapon, and a zero-operation Candidate
+ * beside a Route on its weapon included. A Route that exclusively consumes a
+ * weapon (`exclusiveConsumedOwnedWeaponId`) joins the same group. Every
+ * remaining unit of a participant is registered on the conflict, so a
+ * resolution selecting one participant blocks every unit of the others that is
+ * not the selected Entry's own shareable action, and route commitment excludes
+ * them Route-level (`docs/PLANNER_SPEC.md` 9.6.2). Calculation schema 11..19
+ * excluded the degenerate pair and knew no zero-operation participant.
+ */
 function consumedWeaponGroups(
+  entries: readonly BuildListEntry[],
   unitPlans: ReadonlyMap<BuildListEntryId, readonly PlannerRouteUnit[]>,
 ): ConflictGroup[] {
   const groups = new Map<string, ConflictGroup>()
+  const groupOf = (id: OwnedWeaponId): ConflictGroup => {
+    const key = `same_owned_weapon_consumed\u0000${id}`
+    const group = groups.get(key) ?? {
+      key,
+      kind: 'same_owned_weapon_consumed' as const,
+      entryIds: new Set<BuildListEntryId>(),
+      units: [],
+      ownedWeaponId: id,
+    }
+    groups.set(key, group)
+    return group
+  }
+  entries.forEach((entry) => {
+    const completionWeaponId = plannerEntryCompletionWeaponId(entry)
+    if (completionWeaponId === null) return
+    const group = groupOf(completionWeaponId)
+    group.entryIds.add(entry.id)
+    group.units.push(...(unitPlans.get(entry.id) ?? []))
+  })
   unitPlans.forEach((units) => {
     units.forEach((unit) => {
       const id = unit.exclusiveConsumedOwnedWeaponId
       if (id === null) return
-      const key = `same_owned_weapon_consumed\u0000${id}`
-      const group = groups.get(key) ?? {
-        key,
-        kind: 'same_owned_weapon_consumed' as const,
-        units: [],
-      }
+      const group = groupOf(id)
+      if (group.units.includes(unit)) return
+      group.entryIds.add(unit.entryId)
       group.units.push(unit)
-      groups.set(key, group)
     })
   })
-  return [...groups.values()].filter(
-    ({ units }) =>
-      sortedEntryIds(units).length > 1 &&
-      !allOneShareablePhysicalAction(units),
-  )
+  return [...groups.values()].filter(({ entryIds }) => entryIds.size > 1)
 }
 
 function conflictId(group: ConflictGroup, entryIds: BuildListEntryId[]): string {
@@ -301,44 +292,10 @@ function conflictId(group: ConflictGroup, entryIds: BuildListEntryId[]): string 
     case 'same_owned_weapon_consumed':
       return createPlanConflictId({
         kind: group.kind,
-        ownedWeaponId: first.exclusiveConsumedOwnedWeaponId as never,
+        ownedWeaponId: group.ownedWeaponId as never,
         buildListEntryIds: entryIds,
       })
   }
-}
-
-/**
- * Which participants of this conflict are competing for a unit that ends one of
- * their own selected compromise checkpoints (`docs/PLANNER_SPEC.md` 9.5).
- *
- * Typed metadata so the UI can tell the user that this conflict can only be
- * resolved by changing a checkpoint selection in the Build List, rather than by
- * picking a winning Entry. It deliberately does not enter `PlanConflict.id`,
- * whose generation rule is unchanged.
- */
-function checkpointParticipants(
-  group: ConflictGroup,
-  entriesById: ReadonlyMap<BuildListEntryId, BuildListEntry>,
-): PlanConflictCheckpointParticipant[] {
-  const participants = new Map<string, PlanConflictCheckpointParticipant>()
-  group.units.forEach((unit) => {
-    if (unit.position.unitIndex !== unit.position.unitCount - 1) return
-    const entry = entriesById.get(unit.entryId)
-    if (!entry) return
-    const selected = selectedIntermediateStateAtOperationIndex(
-      entry,
-      unit.position.operationIndex,
-    )
-    if (!selected) return
-    participants.set(selected.opportunityId, {
-      buildListEntryId: entry.id,
-      axis: selected.axis,
-      opportunityId: selected.opportunityId,
-    })
-  })
-  return [...participants.values()].sort((left, right) =>
-    compareStableStrings(left.opportunityId, right.opportunityId),
-  )
 }
 
 function conflictReason(group: ConflictGroup): string {
@@ -351,7 +308,7 @@ function conflictReason(group: ConflictGroup): string {
     case 'same_normal_counter':
       return `BuildListEntries require the same Normal Counter '${first.counterId}' position ${first.counterBefore}.`
     case 'same_owned_weapon_consumed':
-      return `BuildListEntries exclusively consume OwnedWeapon '${first.exclusiveConsumedOwnedWeaponId}'.`
+      return `BuildListEntries complete their Targets with, or exclusively consume, the same OwnedWeapon '${group.ownedWeaponId}'.`
   }
 }
 
@@ -366,9 +323,9 @@ export function detectPlannerConflicts(
   const targetsById = new Map(targets.map((target) => [target.id, target]))
   const conflictIdsByUnitKey = new Map<string, string[]>()
   const selectedPhysicalActionKeysByConflictId = new Map<string, string[]>()
-  const detected = [...counterGroups(unitPlans), ...consumedWeaponGroups(unitPlans)]
+  const detected = [...counterGroups(unitPlans), ...consumedWeaponGroups(entries, unitPlans)]
     .map((group) => {
-      const buildListEntryIds = sortedEntryIds(group.units)
+      const buildListEntryIds = [...group.entryIds].sort(compareStableStrings)
       const conflict: PlanConflict = {
         id: conflictId(group, buildListEntryIds),
         kind: group.kind,
@@ -382,16 +339,18 @@ export function detectPlannerConflicts(
         ),
         selectedBuildListEntryId: null,
         resolutionNote: null,
-        checkpointParticipants: checkpointParticipants(group, entriesById),
+        // The schema 19 persisted shape keeps the legacy field, always empty:
+        // no selected intermediate state takes part in a conflict any more
+        // (`docs/DATA_MODEL.md` 11.8, `docs/PLANNER_SPEC.md` 20.7).
+        checkpointParticipants: [],
       }
       return { group, conflict }
     })
     .sort((left, right) => compareStableStrings(left.conflict.id, right.conflict.id))
 
-  // A resolution is applied only when the shared refusal authority accepts it
-  // against the Entries the other applied resolutions exclude: a
-  // non-participant selection and a conflict with an effective checkpoint
-  // participant both leave the conflict unresolved, never half-applied.
+  // A resolution is applied only when the shared refusal authority accepts it:
+  // a non-participant selection leaves the conflict unresolved, never
+  // half-applied.
   const application = applyPlannerConflictResolutions(
     detected.map(({ conflict }) => conflict),
     resolutions,
@@ -436,6 +395,40 @@ export function plannerConflictResolutionRefusalWarnings(
   refusals: readonly PlannerConflictResolutionRefusal[],
 ): PlannerWarning[] {
   return refusals.map(({ reason }) => ({ kind: 'invalid_conflict_resolution' as const, message: reason }))
+}
+
+/**
+ * The Entries an applied explicit resolution of a `same_owned_weapon_consumed`
+ * conflict excludes: every participant the resolution did not select
+ * (`docs/PLANNER_SPEC.md` 9.6.2 / 21.5, Issue #334 PR-3; the PR #341 review).
+ *
+ * A decision on a weapon conflict is Route-level: the non-selected
+ * participants would complete their Targets with the very weapon the selected
+ * Entry completes its Target with, so none of them runs a unit, is progressed
+ * by a shared physical action, or reserves in the run - whether or not it has
+ * a unit at all (a zero-operation Candidate) and whether or not its units are
+ * the selected Entry's own shareable actions. It is derived from the applied
+ * selections the detection recorded (`applyPlannerConflictResolutions()`), so
+ * a refused resolution excludes nobody, and it is read from the initial
+ * detection once: a conflict that later leaves the per-state detection (its
+ * selected Entry completed) never revives a loser. The deterministic
+ * scheduler excludes the same Entries at its Route commitment
+ * (`plannerRouteCommitmentRejection()`); the Beam Search oracle reads this
+ * set. Counter conflicts keep their unit-level blocking
+ * (`isUnitBlockedByConflictResolution()`), where the selected Entry's own
+ * shareable physical action may still be shared.
+ */
+export function plannerEntriesExcludedByWeaponDecision(
+  conflicts: readonly PlanConflict[],
+): ReadonlySet<BuildListEntryId> {
+  const excluded = new Set<BuildListEntryId>()
+  conflicts.forEach(({ kind, buildListEntryIds, selectedBuildListEntryId }) => {
+    if (kind !== 'same_owned_weapon_consumed' || selectedBuildListEntryId === null) return
+    buildListEntryIds.forEach((entryId) => {
+      if (entryId !== selectedBuildListEntryId) excluded.add(entryId)
+    })
+  })
+  return excluded
 }
 
 export function isUnitBlockedByConflictResolution(

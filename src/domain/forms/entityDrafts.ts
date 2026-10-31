@@ -11,6 +11,7 @@ import type {
   RestorationBonusScope,
 } from '../models/publicTypes'
 import { V1_NORMAL_ARTIAN_RARITY } from '../models/publicTypes'
+import { completionBonusVariantFromBonuses } from '../target/completionCondition'
 import type { OwnedWeaponDraft, TargetWeaponDraft } from '../../services/crud/entityCrudServices'
 
 export class MasterOptionsUnavailableError extends Error {
@@ -162,11 +163,12 @@ export function createTargetWeaponDraft(master: MasterDataRoot): TargetWeaponDra
     lifecycleStatus: 'active',
     completedAt: null,
     completedByProductionPlanId: null,
-    idealBonuses: createDefaultBonusSet(master, base.weaponTypeId, base.elementId),
-    practicalBonusConditions: [],
-    alternativeBonusRules: [],
-    idealSkillCondition: { seriesSkillId: null, groupSkillId: null, matchMode: 'all' },
-    practicalSkillCondition: { seriesSkillId: null, groupSkillId: null, matchMode: 'all' },
+    completedWithOwnedWeaponId: null,
+    completionBonusVariants: [
+      completionBonusVariantFromBonuses(createDefaultBonusSet(master, base.weaponTypeId, base.elementId)),
+    ],
+    completionSkillCondition: { seriesSkillId: null, groupSkillId: null, matchMode: 'all' },
+    completionConditionReview: [],
     memo: null,
   }
 }

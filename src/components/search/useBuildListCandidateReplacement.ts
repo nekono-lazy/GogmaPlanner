@@ -2,7 +2,10 @@ import { useCallback, useState } from 'react'
 import type { PlanBreakingChangeApproval, PlanBreakingChangeInspection } from '../../domain/execution'
 import type { BuildListEntry, BuildListEntryId } from '../../domain/models/publicTypes'
 import type { BuildListCandidateReplacementRequest } from '../../services/buildList/buildListService'
-import type { PlanBreakingChangeApprovalController } from '../execution/usePlanBreakingChangeApproval'
+import type {
+  PlanBreakingChangeApprovalController,
+  PlanBreakingReplanExclusionRequest,
+} from '../execution/usePlanBreakingChangeApproval'
 import {
   BUILD_LIST_REPLACEMENT_PLAN_BREAKING_NOTE,
   buildListCardinalityRefusalMessage,
@@ -56,6 +59,13 @@ export interface UseBuildListCandidateReplacementOptions {
    * the screen reports the refusal; nothing is retried or guessed.
    */
   onRefused(message: string): void
+  /**
+   * The user chose 「保存せずに再計画を開く」 in the breaking-change warning
+   * (Issue #276 PR-6B): nothing was replaced, the confirmation closed, and the
+   * screen opens the replan with the Target left out. Without it, the warning
+   * never offers that choice for a replacement.
+   */
+  onReplanExclusion?(request: PlanBreakingReplanExclusionRequest): void
 }
 
 /**
@@ -72,6 +82,7 @@ export function useBuildListCandidateReplacement({
   planGuard,
   onApplied,
   onRefused,
+  onReplanExclusion,
 }: UseBuildListCandidateReplacementOptions): BuildListCandidateReplacementController {
   const [pending, setPending] = useState<BuildListCandidateReplacementPending | null>(null)
   const [submitting, setSubmitting] = useState(false)
@@ -100,10 +111,19 @@ export function useBuildListCandidateReplacement({
         inspect: () => api.inspectCandidateReplacement(request),
         apply: (approval) => api.replaceCandidate(request, approval),
         note: BUILD_LIST_REPLACEMENT_PLAN_BREAKING_NOTE,
+        ...(onReplanExclusion === undefined ? {} : { replanExclusionTargetWeaponId: request.target.id }),
       })
-      // A cancelled warning saved nothing; the replacement confirmation stays
-      // open, exactly as it was, for the user to cancel or confirm again.
-      if (outcome.status === 'cancelled') return
+      if (outcome.status === 'cancelled') {
+        // 「保存せずに再計画を開く」: nothing was replaced either; the
+        // confirmation closes before the screen leaves for the replan.
+        if (outcome.replanExclusion !== undefined && onReplanExclusion !== undefined) {
+          setPending(null)
+          onReplanExclusion(outcome.replanExclusion)
+        }
+        // A cancelled warning saved nothing; the replacement confirmation stays
+        // open, exactly as it was, for the user to cancel or confirm again.
+        return
+      }
       if (outcome.status === 'refused') {
         setError(outcome.message)
         return
@@ -121,7 +141,7 @@ export function useBuildListCandidateReplacement({
     } finally {
       setSubmitting(false)
     }
-  }, [api, onApplied, onRefused, pending, planGuard, submitting])
+  }, [api, onApplied, onRefused, onReplanExclusion, pending, planGuard, submitting])
 
   return { pending, submitting, error, begin, cancel, confirm }
 }

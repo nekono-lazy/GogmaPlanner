@@ -8,7 +8,8 @@ import {
   restorationBonusScopeLabels,
 } from '../../presentation/labels'
 import { BonusSlotList } from '../ManagementListItem'
-import { groupSkillLabel, seriesSkillLabel, skillConditionSummary } from '../search/searchPresentation'
+import { groupSkillLabel, seriesSkillLabel } from '../search/searchPresentation'
+import { CompletionConditionSummary } from '../target/CompletionConditionSummary'
 
 /**
  * What the Execution Navigator lets the user look up beside a name (Issue #76).
@@ -95,35 +96,25 @@ function OwnedWeaponDetail({ weapon, master }: { weapon: OwnedWeapon; master: Ma
 }
 
 /**
- * The read-only Ideal condition of one Target weapon: what this Plan is
+ * The read-only completion condition of one Target weapon: what this Plan is
  * ultimately aiming at.
  *
- * The compromise definition (practical / alternative bonus conditions, the
- * practical Skill condition), the priority, the enablement, the preferred
- * owned weapon, the lifecycle and the technical ID stay out: the Execution
- * Navigator answers 「最終的に何を目指しているのか」, and the Target Weapons
- * screen remains the place to inspect or change a whole definition.
+ * The priority, the enablement, the preferred owned weapon, the lifecycle and
+ * the technical ID stay out: the Execution Navigator answers
+ * 「最終的に何を目指しているのか」, and the Target Weapons screen remains the
+ * place to inspect or change a whole definition.
  */
 function TargetWeaponDetail({ target, master }: { target: TargetWeapon; master: MasterDataRoot }) {
   return (
     <Stack spacing={1.5}>
       <Typography variant="subtitle2" color="text.secondary">
-        理想条件
+        完成条件
       </Typography>
       <Box component="dl" sx={detailListSx}>
         <DetailRow term="武器種">{masterLabel(master.weaponTypes, target.weaponTypeId)}</DetailRow>
         <DetailRow term="属性">{masterLabel(master.elements, target.elementId)}</DetailRow>
       </Box>
-      <BonusSlotList
-        heading="理想ボーナス"
-        bonuses={target.idealBonuses}
-        weaponTypeId={target.weaponTypeId}
-        master={master}
-        scope="gogma_artian"
-      />
-      <Typography variant="body2" sx={{ overflowWrap: 'anywhere' }}>
-        理想スキル: {skillConditionSummary(target.idealSkillCondition, master)}
-      </Typography>
+      <CompletionConditionSummary target={target} master={master} />
     </Stack>
   )
 }

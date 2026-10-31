@@ -16,10 +16,26 @@ import { hasDeeperHeadingLevel, nextHeadingLevel, type SectionHeadingLevel } fro
 import { RestorationBonusSlots } from '../RestorationBonusSlots'
 import { StatusChip } from '../StatusChip'
 import { groupSkillLabel, seriesSkillLabel } from '../search/searchPresentation'
+import { describeCheckpointMilestones, type CheckpointMilestoneView } from './checkpointMilestonePresentation'
 import {
   isSharedPlanStep,
   type TargetWeaponLookup,
 } from './productionPlanPresentation'
+
+/**
+ * The text of one legacy milestone after its Target name: the two-axis
+ * judgement only where the record carries a readable one (schema 11..18), the
+ * remaining operation count only where the record carries one, and nothing at
+ * all otherwise. Nothing is inferred for a schema 10 record.
+ */
+function checkpointMilestoneDetail(milestone: Extract<CheckpointMilestoneView, { kind: 'milestone' }>): string {
+  const parts: string[] = []
+  if (milestone.conditionMatch !== null) {
+    parts.push(`ボーナス判定: ${compromiseBonusMatchLabels[milestone.conditionMatch.bonus]} ／ スキル判定: ${compromiseSkillMatchLabels[milestone.conditionMatch.skill]}`)
+  }
+  if (milestone.remainingOperationCount !== null) parts.push(`理想まで残り${milestone.remainingOperationCount}操作`)
+  return parts.length === 0 ? '' : `（${parts.join('、')}）`
+}
 
 /**
  * A Target reference that may no longer resolve.
@@ -136,8 +152,10 @@ export function ProductionPlanStepCard({
 }) {
   // `undefined` means the Plan predates the field: nothing is inferred for it
   // from a Candidate or Entry, and no section is shown. `[]` means this Step
-  // reaches no selected checkpoint (`docs/PLANNER_SPEC.md` 7.5.4).
-  const milestones = step.checkpointMilestones ?? []
+  // reaches no selected checkpoint (`docs/PLANNER_SPEC.md` 7.5.4, historical).
+  // A legacy Plan's value is read defensively, whichever calculation schema
+  // wrote it (`checkpointMilestonePresentation.ts`).
+  const milestones = describeCheckpointMilestones(step.checkpointMilestones)
   // The only completion authority (UI_FLOW 11.0). A legacy Step without
   // `executionEffects` shows none: `shouldSecure` is never read as one.
   const completions = step.executionEffects?.targetCompletions ?? []
@@ -220,11 +238,22 @@ export function ProductionPlanStepCard({
             </Box>
           </Box>
         )}
-        {milestones.length > 0 && (
-          // Persisted milestone metadata on the physical Step that reaches the
-          // selected checkpoint: every stored entry is listed in stored order,
-          // a shared Step included, and nothing else changes - no extra Step,
-          // no stop, no reservation.
+        {milestones.kind === 'unreadable' && (
+          // A persisted value of no readable shape (not an array): the page
+          // says so instead of failing, and reinterprets nothing.
+          <Box>
+            <Typography component="p" variant="subtitle2">チェックポイント到達</Typography>
+            <Typography variant="body2" color="text.secondary">
+              この手順のチェックポイント到達の記録は、保存されている形式を読み取れません。
+            </Typography>
+          </Box>
+        )}
+        {milestones.kind === 'listed' && (
+          // Persisted milestone metadata of a legacy Plan on the physical Step
+          // that reached the selected checkpoint (Issue #100 abolished them):
+          // every stored entry is listed in stored order, a shared Step
+          // included, and nothing else changes - no extra Step, no stop, no
+          // reservation.
           <Box>
             <Typography component="p" variant="subtitle2">チェックポイント到達</Typography>
             <Box
@@ -232,30 +261,35 @@ export function ProductionPlanStepCard({
               aria-label={`ステップ ${step.order} のチェックポイント到達`}
               sx={{ m: 0, mt: 0.25, pl: 2.5, display: 'grid', gap: 0.25 }}
             >
-              {milestones.map((milestone, index) => (
+              {milestones.milestones.map((milestone, index) => (
                 <Typography
                   component="li"
                   variant="body2"
-                  key={`${milestone.buildListEntryId}:${index}`}
+                  key={index}
                   className="tabular-nums"
                   sx={{ overflowWrap: 'anywhere' }}
                 >
-                  <TargetWeaponReference
-                    targetWeaponId={milestone.targetWeaponId}
-                    lookup={lookup}
-                    hideUnresolvedId={hideUnresolvedTargetIds}
-                  />
-                  （ボーナス判定: {compromiseBonusMatchLabels[milestone.conditionMatch.bonus]} ／ スキル判定:{' '}
-                  {compromiseSkillMatchLabels[milestone.conditionMatch.skill]}、理想まで残り{milestone.remainingOperationCount}操作）
-                  {debugMode && (
-                    <Typography
-                      component="span"
-                      variant="caption"
-                      color="text.secondary"
-                      sx={{ display: 'block', overflowWrap: 'anywhere' }}
-                    >
-                      BuildListEntry ID: {milestone.buildListEntryId} ／ skill: {milestone.skillOpportunityId ?? 'ideal'} ／ bonus: {milestone.bonusOpportunityId ?? 'ideal'}
-                    </Typography>
+                  {milestone.kind === 'unreadable' ? (
+                    '形式を読み取れない到達記録'
+                  ) : (
+                    <>
+                      <TargetWeaponReference
+                        targetWeaponId={milestone.targetWeaponId}
+                        lookup={lookup}
+                        hideUnresolvedId={hideUnresolvedTargetIds}
+                      />
+                      {checkpointMilestoneDetail(milestone)}
+                      {debugMode && milestone.identifiers.length > 0 && (
+                        <Typography
+                          component="span"
+                          variant="caption"
+                          color="text.secondary"
+                          sx={{ display: 'block', overflowWrap: 'anywhere' }}
+                        >
+                          {milestone.identifiers.map(({ label, value }) => `${label}: ${value}`).join(' ／ ')}
+                        </Typography>
+                      )}
+                    </>
                   )}
                 </Typography>
               ))}

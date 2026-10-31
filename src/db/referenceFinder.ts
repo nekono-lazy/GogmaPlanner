@@ -2,13 +2,16 @@ import type {
   BuildCandidate,
   BuildListEntry,
   ExecutionHistory,
+  ExecutionUndoSnapshot,
   OwnedWeaponId,
   ProductionPlan,
   TargetWeapon,
   TargetWeaponId,
 } from '../domain/models/publicTypes'
+import { requireCompleteExecutionRecords } from '../domain/execution/executionHistoryRecords'
 import { collectReferencedOwnedWeaponIds } from '../domain/models/hashing'
 import { appDatabase, type AppDatabase } from './AppDatabase'
+import { ExecutionHistoryRepository } from './repositories/executionHistoryRepository'
 
 export type PersistenceReferenceKind =
   | 'owned_weapon'
@@ -38,13 +41,12 @@ function sortReferences(
 function findOwnedWeaponReferencesInPlan(
   plan: ProductionPlan,
   ownedWeaponId: OwnedWeaponId,
-  kind: 'production_plan' | 'execution_history',
-  entityId: string,
-  prefix = '',
 ): PersistenceReference[] {
   const references: PersistenceReference[] = []
+  const kind = 'production_plan'
+  const entityId = plan.id
   plan.steps.forEach((step, index) => {
-    const path = `${prefix}steps[${index}]`
+    const path = `steps[${index}]`
     if (step.ownedWeaponId === ownedWeaponId) {
       references.push({ kind, entityId, path: `${path}.ownedWeaponId` })
     }
@@ -68,18 +70,28 @@ export interface PersistenceReferenceCollections {
   buildCandidates: readonly BuildCandidate[]
   buildListEntries: readonly BuildListEntry[]
   productionPlans: readonly ProductionPlan[]
+  /** The metadata of every ExecutionHistory record. */
   executionHistory: readonly ExecutionHistory[]
+  /** Every ExecutionHistory Undo body (`docs/DATA_MODEL.md` 14.6). */
+  executionUndoSnapshots: readonly ExecutionUndoSnapshot[]
 }
 
 /**
  * Every persisted reference to an OwnedWeapon, found in the given collections.
  * Pure, so a transaction that decides a delete before any write - the Plan
  * breaking-change guard - applies exactly the policy `ReferenceFinder` does.
+ *
+ * The ExecutionHistory references sit in the metadata and the Undo bodies, so
+ * every metadata record and every Undo body must first form complete records
+ * (`requireCompleteExecutionRecords()`, `docs/DATA_MODEL.md` 14.6): a missing or
+ * broken body could hold a reference, so the check refuses with
+ * `execution_history_record_invalid` rather than report what is left.
  */
 export function findOwnedWeaponReferencesIn(
   collections: PersistenceReferenceCollections,
   ownedWeaponId: OwnedWeaponId,
 ): PersistenceReference[] {
+  requireCompleteExecutionRecords(collections.executionHistory, collections.executionUndoSnapshots, collections.productionPlans)
   const references: PersistenceReference[] = []
   // A Target that prefers this weapon as its Route origin is an ordinary
   // reference, so the existing referenced-entity delete protection applies
@@ -90,6 +102,17 @@ export function findOwnedWeaponReferencesIn(
         kind: 'target_weapon',
         entityId: target.id,
         path: 'preferredOwnedWeaponId',
+      })
+    }
+    // The weapon a completed Target was completed with is its completion
+    // assignment (Issue #334, `docs/DATA_MODEL.md` 8.7): the same delete
+    // protection, told apart from a preference by its path. Reopening or
+    // deleting that Target releases it.
+    if (target.completedWithOwnedWeaponId === ownedWeaponId) {
+      references.push({
+        kind: 'target_weapon',
+        entityId: target.id,
+        path: 'completedWithOwnedWeaponId',
       })
     }
   })
@@ -116,17 +139,13 @@ export function findOwnedWeaponReferencesIn(
     }
   })
   collections.productionPlans.forEach((plan) =>
-    references.push(
-      ...findOwnedWeaponReferencesInPlan(
-        plan,
-        ownedWeaponId,
-        'production_plan',
-        plan.id,
-      ),
-    ),
+    references.push(...findOwnedWeaponReferencesInPlan(plan, ownedWeaponId)),
   )
+  // The Plan body the former Undo snapshots copied is the content of the same
+  // persisted Plan (`docs/DATA_MODEL.md` 12.2 / 14.6), so its references are
+  // the `productionPlans` references above; the metadata and the Undo bodies
+  // add only what they hold of their own.
   collections.executionHistory.forEach((entry) => {
-    const snapshot = entry.undoSnapshot
     if (entry.actualResult?.securedOwnedWeaponId === ownedWeaponId) {
       references.push({
         kind: 'execution_history',
@@ -134,36 +153,29 @@ export function findOwnedWeaponReferencesIn(
         path: 'actualResult.securedOwnedWeaponId',
       })
     }
+    if (entry.addedOwnedWeaponIds.includes(ownedWeaponId)) {
+      references.push({
+        kind: 'execution_history',
+        entityId: entry.id,
+        path: 'addedOwnedWeaponIds',
+      })
+    }
+  })
+  collections.executionUndoSnapshots.forEach((snapshot) => {
     if (snapshot.affectedOwnedWeaponsBefore.some(({ id }) => id === ownedWeaponId)) {
       references.push({
         kind: 'execution_history',
-        entityId: entry.id,
-        path: 'undoSnapshot.affectedOwnedWeaponsBefore',
-      })
-    }
-    if (snapshot.addedOwnedWeaponIds.includes(ownedWeaponId)) {
-      references.push({
-        kind: 'execution_history',
-        entityId: entry.id,
-        path: 'undoSnapshot.addedOwnedWeaponIds',
+        entityId: snapshot.executionHistoryId,
+        path: 'executionUndoSnapshot.affectedOwnedWeaponsBefore',
       })
     }
     if (snapshot.removedOwnedWeaponsBefore.some(({ id }) => id === ownedWeaponId)) {
       references.push({
         kind: 'execution_history',
-        entityId: entry.id,
-        path: 'undoSnapshot.removedOwnedWeaponsBefore',
+        entityId: snapshot.executionHistoryId,
+        path: 'executionUndoSnapshot.removedOwnedWeaponsBefore',
       })
     }
-    references.push(
-      ...findOwnedWeaponReferencesInPlan(
-        snapshot.productionPlanBefore,
-        ownedWeaponId,
-        'execution_history',
-        entry.id,
-        'undoSnapshot.productionPlanBefore.',
-      ),
-    )
   })
   return sortReferences(references)
 }
@@ -226,19 +238,33 @@ export class ReferenceFinder {
     this.database = database
   }
 
+  /**
+   * Every persisted reference to an OwnedWeapon. It reads every ExecutionHistory
+   * record and every Undo body (`docs/DATA_MODEL.md` 14.6) in one read-only
+   * transaction, so a record the Dexie version 11 upgrade could not convert
+   * (`execution_history_unconvertible`) and records whose bodies do not pair
+   * up (`execution_history_record_invalid`) refuse the check instead of being
+   * left out.
+   */
   async findOwnedWeaponReferences(
     ownedWeaponId: OwnedWeaponId,
   ): Promise<PersistenceReference[]> {
-    const [targetWeapons, buildCandidates, buildListEntries, productionPlans, executionHistory] = await Promise.all([
-      this.database.targetWeapons.toArray(),
-      this.database.buildCandidates.toArray(),
-      this.database.buildListEntries.toArray(),
-      this.database.productionPlans.toArray(),
-      this.database.executionHistory.toArray(),
-    ])
-    return findOwnedWeaponReferencesIn(
-      { targetWeapons, buildCandidates, buildListEntries, productionPlans, executionHistory },
-      ownedWeaponId,
+    const database = this.database
+    return database.transaction(
+      'r',
+      [database.targetWeapons, database.buildCandidates, database.buildListEntries, database.productionPlans, database.executionHistory, database.executionUndoSnapshots],
+      async () => {
+        const history = new ExecutionHistoryRepository(database)
+        const collections: PersistenceReferenceCollections = {
+          targetWeapons: await database.targetWeapons.toArray(),
+          buildCandidates: await database.buildCandidates.toArray(),
+          buildListEntries: await database.buildListEntries.toArray(),
+          productionPlans: await database.productionPlans.toArray(),
+          executionHistory: await history.getAllExecutionHistory({ kind: 'all' }),
+          executionUndoSnapshots: await history.getAllExecutionUndoSnapshots(),
+        }
+        return findOwnedWeaponReferencesIn(collections, ownedWeaponId)
+      },
     )
   }
 

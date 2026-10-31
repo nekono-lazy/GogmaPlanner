@@ -124,6 +124,19 @@ const PLANNER_INPUT_RECORD_FIELDS = ['rngState', 'calculationContext', 'options'
 const PLANNER_INPUT_ARRAY_FIELDS = ['normalCounters', 'ownedWeapons', 'targetWeapons', 'buildListEntries', 'conflictResolutions'] as const
 
 /**
+ * The shape issues of the PlannerInput a run request carries at `path` (empty when it has every field a run needs). Shared by both
+ * run requests of this Worker (the running Plan replan request of Issue #276 PR-4 carries the same fresh input); the content is the
+ * calculation's own validation.
+ */
+export function plannerInputShapeIssues(input: unknown, path: string): string[] {
+  if (!isRecord(input)) return [`${path} must be a PlannerInput object.`]
+  const issues: string[] = []
+  for (const field of PLANNER_INPUT_RECORD_FIELDS) if (!isRecord(input[field])) issues.push(`${path}.${field} must be an object.`)
+  for (const field of PLANNER_INPUT_ARRAY_FIELDS) if (!Array.isArray(input[field])) issues.push(`${path}.${field} must be an array.`)
+  return issues
+}
+
+/**
  * The issues of one received run request (empty when it is a well-formed request of this protocol). The PlannerInput is checked
  * for its shape only: its content is validated by the calculation's own Stage 0 (`validatePlannerInput()`).
  */
@@ -135,13 +148,7 @@ export function buildListOptimizationRunRequestIssues(value: unknown): string[] 
     issues.push(`request.protocolVersion must be ${BUILD_LIST_OPTIMIZATION_WORKER_PROTOCOL_VERSION}.`)
   }
   if (!isNonEmptyString(value.requestId)) issues.push('request.requestId must be a non-empty string.')
-  const input = value.input
-  if (!isRecord(input)) {
-    issues.push('request.input must be a PlannerInput object.')
-  } else {
-    for (const field of PLANNER_INPUT_RECORD_FIELDS) if (!isRecord(input[field])) issues.push(`request.input.${field} must be an object.`)
-    for (const field of PLANNER_INPUT_ARRAY_FIELDS) if (!Array.isArray(input[field])) issues.push(`request.input.${field} must be an array.`)
-  }
+  issues.push(...plannerInputShapeIssues(value.input, 'request.input'))
   return issues
 }
 

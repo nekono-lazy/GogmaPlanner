@@ -21,7 +21,6 @@ import type {
   ISODateTimeString,
   TargetWeapon,
 } from '../../models/publicTypes'
-import { extractIntermediateStateGroups } from '../../search'
 import type {
   ConstrainedCandidate,
   ConstrainedSearchOrigin,
@@ -208,17 +207,8 @@ export function createDeterministicMaterializer<TSource extends DeterministicMat
         createBuildCandidateMeaningFingerprint(withoutId),
       ),
     }
-    // Derived from the finished Route, its observational traces (when the
-    // source carries them) and the Route base OwnedWeapon only, so it adds no
-    // RNG prediction call (`docs/SEARCH_SPEC.md` 5.8.1). A B8
-    // `ConstrainedCandidate` carries no trace, so only a lane start an existing
-    // source weapon already holds can be offered for it, never an invented
-    // amendment result (`docs/PLANNER_SPEC.md` 9.2.13).
-    candidate.intermediateStateGroups = extractIntermediateStateGroups(candidate, {
-      target,
-      master: context.origin.master,
-      ownedWeapons: context.origin.ownedWeapons,
-    })
+    // No intermediate state is extracted (Issue #100, `docs/PLANNER_SPEC.md`
+    // 20.5): a generated Candidate carries no `intermediateStateGroups`.
     const valid = validateBuildCandidate(candidate, context.origin.ownedWeapons)
     if (!valid.isValid) {
       throw new ConstrainedMaterializationError(

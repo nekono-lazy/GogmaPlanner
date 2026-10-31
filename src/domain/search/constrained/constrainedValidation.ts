@@ -12,7 +12,7 @@ import {
   validateRngState,
   validateTargetWeapon,
 } from '../../models/publicTypes'
-import { validateTargetIdealImpliesPractical } from '../../target'
+import { validateTargetCompletionConditions } from '../../target'
 import {
   ConstrainedSearchError,
   type ConstrainedCandidateSearchInput,
@@ -84,7 +84,7 @@ function collect(
  * snapshot must never reach an Engine prediction. No new Domain constraint is
  * introduced here: every issue comes from `validateRngState`,
  * `validateNormalArtianCounter`, `validateOwnedWeapon`, `validateTargetWeapon`,
- * `validateCalculationContext`, or `validateTargetIdealImpliesPractical`, and
+ * `validateCalculationContext`, or `validateTargetCompletionConditions`, and
  * no Master Data or persistence validation is added.
  *
  * Shared by the constrained enumerator (SEARCH_SPEC 5.6.7) and Planner
@@ -120,8 +120,8 @@ export function collectConstrainedSearchOriginIssues(
   })
   // The whole snapshot is re-checked, not just the selected Target, because
   // `ConstrainedSearchOrigin` is a public Search Domain boundary. Only the
-  // structural `validateTargetWeapon()` runs for every Target; the Ideal implies
-  // Practical containment stays scoped to the selected Target below.
+  // structural `validateTargetWeapon()` runs for every Target; the completion
+  // condition invariants stay scoped to the selected Target below.
   origin.targetWeapons.forEach((weapon, index) => {
     issues.push(
       ...collect(`origin.targetWeapons[${index}]`, validateTargetWeapon(weapon)),
@@ -139,20 +139,21 @@ export function collectConstrainedSearchOriginIssues(
   } else if (!isTargetWeaponPlanningEligible(target)) {
     issues.push({
       path: 'targetWeaponId',
-      message: target.lifecycleStatus === 'active'
-        ? `TargetWeapon '${targetWeaponId}' is disabled.`
-        : `TargetWeapon '${targetWeaponId}' is completed.`,
+      message: target.lifecycleStatus !== 'active'
+        ? `TargetWeapon '${targetWeaponId}' is completed.`
+        : !target.isEnabled
+          ? `TargetWeapon '${targetWeaponId}' is disabled.`
+          : `TargetWeapon '${targetWeaponId}' needs its completion condition reviewed.`,
     })
   } else {
     // The structural check already ran over every Target above, so only the
-    // selection-scoped rule is left here. The SEARCH_SPEC 5.6.1
-    // Ideal-already-satisfied continuation rule depends on this containment, so
-    // a violating Target is rejected rather than repaired.
-    const containment = validateTargetIdealImpliesPractical(target, origin.master)
-    if (!containment.isValid) {
+    // selection-scoped rule is left here: the Master-dependent completion
+    // condition invariants (resolvable ranks, no included Variant).
+    const completionConditions = validateTargetCompletionConditions(target, origin.master)
+    if (!completionConditions.isValid) {
       issues.push({
         path: 'targetWeaponId',
-        message: `TargetWeapon '${targetWeaponId}' violates the Ideal implies Practical containment invariant: ${containment.issues
+        message: `TargetWeapon '${targetWeaponId}' has an invalid completion condition: ${completionConditions.issues
           .map((issue) => `${issue.path}: ${issue.message}`)
           .join(' / ')}`,
       })

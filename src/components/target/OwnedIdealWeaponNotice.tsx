@@ -8,6 +8,8 @@ import {
   OWNED_IDEAL_NOTICE_MESSAGE,
   ownedIdealWeaponSummary,
 } from './ownedIdealPresentation'
+import { AchievedCompletionVariants } from './AchievedCompletionVariants'
+import { describeAchievedCompletionVariants } from './completionConditionPresentation'
 
 export interface OwnedIdealWeaponNoticeProps {
   target: TargetWeapon
@@ -38,7 +40,7 @@ export function OwnedIdealWeaponNotice({ target, weapons, master, onComplete, di
       <Typography component="p" variant="body2" sx={{ mt: 0.5 }}>
         {OWNED_IDEAL_NOTICE_GUIDANCE}
       </Typography>
-      <Box component="ul" aria-label={`${target.name}の理想条件を満たす所持武器`} sx={{ m: 0, mt: 1, p: 0, listStyle: 'none', display: 'grid', gap: 1 }}>
+      <Box component="ul" aria-label={`${target.name}の完成条件を満たす所持武器`} sx={{ m: 0, mt: 1, p: 0, listStyle: 'none', display: 'grid', gap: 1 }}>
         {weapons.map((weapon) => {
           const nameId = `${baseId}-${weapon.id}`
           return (
@@ -56,6 +58,12 @@ export function OwnedIdealWeaponNotice({ target, weapons, master, onComplete, di
                 <Typography component="p" variant="caption" color="text.secondary" sx={{ overflowWrap: 'anywhere' }}>
                   {ownedIdealWeaponSummary(weapon, master)}
                 </Typography>
+                {/* The weapon's own current slots against the Target as it is now
+                    (`docs/REQUIREMENTS.md` 13.2) - never its status. */}
+                <AchievedCompletionVariants
+                  achieved={describeAchievedCompletionVariants(target, weapon.restorationBonuses, weapon.restorationBonusScope, master)}
+                  layout="line"
+                />
               </Box>
               <Button
                 variant="contained"

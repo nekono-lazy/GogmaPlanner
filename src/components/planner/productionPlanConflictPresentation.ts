@@ -11,6 +11,7 @@ import type { PlannerWarningKind } from '../../domain/planner'
 import {
   productionPlanRejectionCauseBreakdownOf,
   summarizeProductionPlanCompletion,
+  type ProductionPlanCompletionSummary,
   type ProductionPlanRejectionCauseBreakdown,
 } from '../../domain/planner/productionPlanCompletionSummary'
 import {
@@ -24,7 +25,6 @@ import type {
   ProductionPlanParticipantUnavailableReason,
   ProductionPlanParticipantViewModel,
 } from '../../services/planner/prepareProductionPlanInteraction'
-import { CHECKPOINT_CONFLICT_MESSAGE } from '../../services/planner/prepareProductionPlanInteraction'
 import type { PlannerInteractionPreparationResult } from '../../workers/plannerWorkerContracts'
 import type { StatusTone } from '../StatusChip'
 import {
@@ -80,12 +80,10 @@ export type ConflictNameSource =
     }
 
 export type ConflictDisplayStatus =
-  /** No decision, a current initial Conflict, no effective checkpoint participant: choose here. */
+  /** No decision and a current initial Conflict: choose here. */
   | 'pending'
   /** A persisted explicit decision. */
   | 'selected'
-  /** An effective checkpoint participant: the Build List selection must change (11.1). */
-  | 'checkpoint_change_required'
   /** Found while planning; never choosable, and recalculating the same input finds it again (9.6.7). */
   | 'dynamic'
   /** The input changed since the Plan was calculated; this Conflict cannot be reproduced now. */
@@ -152,8 +150,8 @@ export interface ConflictCardDisplay {
   status: ConflictDisplayStatus
   statusChip: ConflictStatusChip
   guidance: string[]
-  /** A link to the Build List: to change a checkpoint selection, or to review the Entries. */
-  buildListAction: 'change_checkpoint' | 'review' | null
+  /** A link to the Build List, to review the Entries. */
+  buildListAction: 'review' | null
   participants: ConflictParticipantDisplay[]
   debug: ConflictDebugDetails
 }
@@ -216,6 +214,15 @@ export interface ConflictTargetOutcome {
 }
 
 export interface ConflictSectionDisplay {
+  /**
+   * Whether the section has anything to say (Issue #359, `docs/UI_FLOW.md` 11.6.8). `false` only for a Plan that recorded no Conflict
+   * and no rejected Entry, whose completion figure is determined (`ratio_determined`: a Plan with completion effects, of a calculation
+   * version whose records keep their meaning), and whose current preparation did not fail closed. Such a Plan leaves no Target out and
+   * offers nothing to choose: the overview already says 「競合なし」 and the completion figure, and the Target routes name every Target it
+   * makes. Anything else - a Conflict in any state, a rejection, a legacy or undeterminable completion, an invalid preparation - keeps
+   * the section. It reads the exact persisted Plan and the typed preparation status only, never the Planner method that made the Plan.
+   */
+  needed: boolean
   /** Persisted Conflict records; never a Target or weapon count. */
   conflictCount: number
   /** Records without a persisted selection. */
@@ -228,9 +235,9 @@ export interface ConflictSectionDisplay {
   undecidedLabel: string
   /**
    * The breakdown under the Conflict count: 判断待ち / 選択済み, plus the
-   * undecided records that cannot be chosen here (a Build List checkpoint
-   * change, a dynamic or no longer reproducible Conflict) when the current
-   * judgement is known; 未選択 / 選択済み otherwise.
+   * undecided records that cannot be chosen here (a dynamic or no longer
+   * reproducible Conflict) when the current judgement is known; 未選択 / 選択済み
+   * otherwise.
    */
   countDetail: string
   /** 「まだ判断が必要な競合があります（N件）」 for a draft, counting the 判断待ち Conflicts only. */
@@ -304,6 +311,8 @@ export function plannerExclusionText(kind: PlannerWarningKind | null): string {
       return 'この候補は以前の計算方式で作成されたため、今回の計画には使えません。候補を検索し直してください。'
     case 'protected_weapon_required':
       return 'この候補は保護中の所持武器を変更する必要があるため、今回の計画には使えません。'
+    case 'completion_assigned_weapon_required':
+      return 'この候補は別の目標武器の完成に使った所持武器を起点にするため、今回の計画には使えません。候補を検索し直してください。'
     case 'rng_state_missing':
       return 'この候補に必要なRNG状態が確定していないため、今回の計画には使えません。'
     case 'rng_prediction_unsupported':
@@ -316,13 +325,12 @@ export function plannerExclusionText(kind: PlannerWarningKind | null): string {
 /**
  * The participant-specific reason a participant cannot be preferred, or `null`
  * when the reason belongs to the whole section (not a draft, an invalid
- * preparation) or to the whole Conflict (not current, an effective checkpoint),
- * which say it once instead.
+ * preparation) or to the whole Conflict (not current), which say it once
+ * instead.
  */
 export function participantUnavailableText(
   reason: ProductionPlanParticipantUnavailableReason | null,
   exclusionKind: PlannerWarningKind | null,
-  conflictInvolvesCheckpoint: boolean,
 ): string | null {
   // `excluded_by_other_decision` is said with the other Conflict's number and
   // preferred name instead (`excludedByOtherDecisionText()`).
@@ -340,10 +348,6 @@ export function participantUnavailableText(
       return plannerExclusionText(exclusionKind)
     case 'not_current_conflict_participant':
       return '現在の作成リストでは、この候補はこの競合に含まれません。'
-    case 'checkpoint_conflict':
-      return conflictInvolvesCheckpoint
-        ? null
-        : 'この候補を優先すると、この候補の途中採用する状態の選択がこの競合に関係するため、ここでは優先できません。作成リストで途中採用する状態を変更または解除してください。'
   }
 }
 
@@ -479,9 +483,7 @@ function entryNotCreatedReason(
         ? '競合があるため、この計画では作成しません。'
         : status === 'dynamic'
           ? '計画の途中で生じた競合のため、今回は作成しません。'
-          : status === 'checkpoint_change_required'
-            ? '途中採用する状態の選択が関係する競合のため、今回は作成しません。'
-            : '競合の選択待ちのため、今回は作成しません。'
+          : '競合の選択待ちのため、今回は作成しません。'
       best = bestReason(best, { rank: 2, text, winners: [] })
     }
   }
@@ -624,12 +626,11 @@ function causeGroupsOf(
 
 function createTargetOutcome(
   plan: ProductionPlan,
+  summary: ProductionPlanCompletionSummary,
   lookup: NameLookup,
   isDraft: boolean,
   statusByConflictId: ReadonlyMap<string, ConflictDisplayStatus>,
 ): ConflictTargetOutcome {
-  // The one Domain authority the overview reads too (PLANNER_SPEC 9.6.9.1).
-  const summary = summarizeProductionPlanCompletion(plan)
   const hasCompletionAuthority = summary.status !== 'completion_unknown'
   const completed = completedTargetIds(plan)
   const createdCount = summary.status === 'completion_unknown' ? null : summary.completedCount
@@ -728,8 +729,6 @@ function statusChipOf(status: ConflictDisplayStatus, undecidedLabel: string): Co
       return { label: '判断待ち', tone: 'caution' }
     case 'selected':
       return { label: '選択済み', tone: 'positive' }
-    case 'checkpoint_change_required':
-      return { label: '途中採用状態の変更が必要', tone: 'caution' }
     case 'dynamic':
       return { label: '計画の途中で生じた競合', tone: 'neutral' }
     case 'input_changed':
@@ -748,7 +747,6 @@ function readyConflictStatus(
   preparationReady: boolean,
 ): ConflictDisplayStatus {
   if (!isDraft || !preparationReady) return conflict.selectedBuildListEntryId === null ? 'undecided' : 'selected'
-  if (current.currency === 'current' && current.involvesSelectedCheckpoint) return 'checkpoint_change_required'
   if (conflict.selectedBuildListEntryId !== null) return 'selected'
   switch (current.currency) {
     case 'current':
@@ -791,8 +789,6 @@ function guidanceOf(
       }
       return lines
     }
-    case 'checkpoint_change_required':
-      return [CHECKPOINT_CONFLICT_MESSAGE]
     case 'dynamic':
       return [
         'この競合は、計画を立てる途中（候補を外した後など）で生じたもので、ここでは優先する候補を選べません。',
@@ -815,8 +811,6 @@ function guidanceOf(
 
 function buildListActionOf(status: ConflictDisplayStatus): ConflictCardDisplay['buildListAction'] {
   switch (status) {
-    case 'checkpoint_change_required':
-      return 'change_checkpoint'
     case 'dynamic':
     case 'input_changed':
     case 'not_compared':
@@ -911,15 +905,11 @@ function participantDisplays(
       const text = participantUnavailableText(
         source.current.unavailableReason,
         source.current.exclusionKind,
-        current?.involvesSelectedCheckpoint ?? false,
       )
       if (text !== null && text !== UNRESOLVED_PARTICIPANT_NOTE) {
         notes.push(text)
         needsBuildListReview = true
       }
-    }
-    if (source.current?.checkpointOpportunityId != null) {
-      notes.push('この候補の途中採用する状態の選択が、この競合に関係しています。')
     }
 
     // Only a participant the current preparation allows gets the action
@@ -1089,7 +1079,14 @@ export function createProductionPlanConflictSectionDisplay(input: {
   const unchoosableUndecidedCount = plan.conflicts.filter((conflict, index) =>
     conflict.selectedBuildListEntryId === null && conflicts[index].status !== 'pending').length
   const invalidPreparationReasons = invalidPreparationReasonsOf(source)
+  // The one Domain authority the overview reads too (PLANNER_SPEC 9.6.9.1).
+  const completion = summarizeProductionPlanCompletion(plan)
   return {
+    needed:
+      plan.conflicts.length > 0 ||
+      plan.rejectedBuildListEntries.length > 0 ||
+      completion.status !== 'ratio_determined' ||
+      invalidPreparationReasons !== null,
     conflictCount: plan.conflicts.length,
     undecidedCount,
     selectedCount,
@@ -1104,7 +1101,7 @@ export function createProductionPlanConflictSectionDisplay(input: {
     sectionNotices: sectionNoticesOf(source, plan),
     invalidPreparationReasons,
     conflicts,
-    targets: createTargetOutcome(plan, lookup, isDraft, statusByConflictId),
+    targets: createTargetOutcome(plan, completion, lookup, isDraft, statusByConflictId),
     // A stale Plan's own page-level notice already links to the Build List.
     showBuildListLink:
       source.status === 'ready' &&

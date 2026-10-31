@@ -35,13 +35,13 @@ export const productionPlannerDetailSettingsTitle = '詳細設定（通常Planne
 
 /**
  * The Build List detail settings description (U7, `docs/UI_FLOW.md` 10.0): which operations use the bound - the one valid Entry
- * 「生産計画を作成」, the ordinary Planner auxiliary operation and the replan Preview - that the global optimization (two or more valid
+ * 「生産計画を作成」, the ordinary Planner auxiliary operation and the replan's explicit auxiliary (Issue #276 PR-6A) - that the global optimization (two or more valid
  * Entries) does not, and the existing rules. The Build List's default is the recommended bound for the Entries it holds
  * (`recommendedBuildListMaxPlanSteps()`, Issue #130), so it says how that default is sized instead of naming a fixed number.
  */
 export const productionPlannerDetailSettingsDescriptionLines: readonly string[] = [
   '通常Plannerで生産計画を作るときの安全上限です。',
-  '有効な候補が1件のときの「生産計画を作成」、「登録済みの候補で生産計画を作成」、「現在地点から再計画を試算」で使います。',
+  '有効な候補が1件のときの「生産計画を作成」、「登録済みの候補で生産計画を作成」、「登録済みの候補で再計画を試算」で使います。',
   '有効な候補が2件以上のときの「生産計画を作成」（全体最適化）には適用されません。全体最適化の上限はアプリが決めます。',
   '1以上の整数だけが有効で、この画面を再読み込みすると既定値へ戻ります。既定値は登録候補の必要操作数に応じて500刻みで補正されます（最低1,000）。',
 ]

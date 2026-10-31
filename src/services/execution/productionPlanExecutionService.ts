@@ -1,18 +1,21 @@
 import { appDatabase, type AppDatabase } from '../../db/AppDatabase'
+import { ExecutionHistoryRepository } from '../../db/repositories/executionHistoryRepository'
 import { RepositoryError } from '../../db/repositoryError'
 import { validateOwnedWeaponMasterReferences } from '../../domain/artian/entityMasterValidation'
 import {
   ExecutionRuntimeError,
   executionFailure,
+  executionHistoryIdsAfterSavePoint,
   prepareActualResultDifferent,
-  prepareCompromiseFinish,
   prepareExecutionSavePointRecord,
   prepareExecutionSavePointRestore,
   prepareExecutionUndo,
   prepareExpectedStepConfirmation,
   inspectProductionPlanAbandonment,
   inspectProductionPlanReplanAdoption,
+  evaluateProductionPlanContinuation,
   inspectProductionPlanStartTargetLinks,
+  type ProductionPlanContinuation,
   deriveOperationCountRecovery,
   prepareOperationCountRecovery,
   prepareOperationUncertain,
@@ -37,6 +40,14 @@ import {
   type ProductionPlanReplanAdoptionWrite,
   type ProductionPlanReplanPreview,
 } from '../../domain/execution'
+import {
+  inspectRunningPlanReplanAdoption,
+  prepareRunningPlanReplanAdoption,
+  type RunningPlanReplanAdoptionInspection,
+  type RunningPlanReplanAdoptionPreview,
+  type RunningPlanReplanAdoptionReadState,
+  type RunningPlanReplanAdoptionWrite,
+} from '../../domain/execution/runningPlanReplanAdoption'
 import type { MasterDataRoot } from '../../domain/master/masterTypes'
 import type { ProductionPlanStartTargetLinkChange } from '../../domain/planner/productionPlanStartEffects'
 import type {
@@ -45,19 +56,19 @@ import type {
   ExecutionHistory,
   ExecutionHistoryId,
   ExecutionSavePoint,
+  ExecutionUndoSnapshot,
   ISODateTimeString,
   OwnedWeapon,
-  OwnedWeaponId,
   PlanStepId,
   ProductionPlan,
   ProductionPlanId,
   TargetWeapon,
-  TargetWeaponId,
 } from '../../domain/models/publicTypes'
 import { executionSavePointIdForPlan } from '../../domain/models/publicTypes'
 import { productionRngEngine } from '../../domain/rng/production/productionRngRuntime'
 import { createBuildListCalculationContext } from '../buildList/createBuildListCalculationContext'
 import { writeExecutionSavePointRestore } from './executionSavePointRestoreWrite'
+import { runningPlanReplanPreviewIssues } from './runningPlanReplanResultCheck'
 
 /** Runtime ID source of ExecutionHistory records. */
 export interface ExecutionIdFactory {
@@ -89,6 +100,21 @@ export interface ProductionPlanExecutionServiceDependencies {
 export interface ProductionPlanStartInspection {
   planId: ProductionPlanId
   changes: ProductionPlanStartTargetLinkChange[]
+  ownedWeapons: OwnedWeapon[]
+  targetWeapons: TargetWeapon[]
+}
+
+/**
+ * Whether a saved or started Plan can be continued, read in one read-only
+ * transaction for the Production Plan page, the Production Plan list and the
+ * Build List's running Plan guidance (Issue #334, `docs/UI_FLOW.md` 12.11). Never
+ * write authority: start and every Step confirmation re-judge in their own
+ * transaction. `targetWeapons` / `ownedWeapons` are the records the judgement's
+ * issues name, for display only.
+ */
+export interface ProductionPlanContinuationInspection {
+  planId: ProductionPlanId
+  continuation: ProductionPlanContinuation
   ownedWeapons: OwnedWeapon[]
   targetWeapons: TargetWeapon[]
 }
@@ -136,28 +162,6 @@ export interface RecoverOperationCountRequest {
   observations: OperationCountRecoveryObservation[]
   /** The Window position the user confirmed. */
   recoveredPosition: number
-}
-
-/**
- * "この武器を妥協品として確定して終了" (`docs/PLANNER_SPEC.md` 16.12). Every ID
- * is what the user saw when the offer was shown; none of them is taken as
- * authority, and each is re-verified against the Plan's own checkpoint
- * projection inside the transaction.
- */
-export interface FinishProductionPlanAsCompromiseRequest {
-  planId: ProductionPlanId
-  /** The Plan's current Step at the moment the offer was shown. */
-  planStepId: PlanStepId
-  /** The Entry whose selected compromise checkpoint is being finished at. */
-  buildListEntryId: BuildListEntryId
-  targetWeaponId: TargetWeaponId
-  ownedWeaponId: OwnedWeaponId
-}
-
-/** The abandoned Plan and the `finished_as_compromise` record it added. */
-export interface FinishProductionPlanAsCompromiseResult {
-  plan: ProductionPlan
-  history: ExecutionHistory
 }
 
 export interface UndoLatestExecutionRequest {
@@ -266,6 +270,44 @@ export type AdoptProductionPlanReplanPreviewResult =
       deletedExecutionHistoryIds: ExecutionHistoryId[]
     }
 
+export interface InspectRunningPlanReplanAdoptionRequest {
+  /** The runtime-only Preview of the running Plan replan re-optimization the user reviewed (Issue #276 PR-4's session). */
+  preview: RunningPlanReplanAdoptionPreview
+}
+
+/**
+ * 「この再計画を採用」 of a running Plan replan re-optimization (`docs/PLANNER_SPEC.md` 18.8). 「キャンセル」 is not a request.
+ */
+export interface AdoptRunningPlanReplanPreviewRequest {
+  preview: RunningPlanReplanAdoptionPreview
+  /** `null` when no save point choice was offered; otherwise the user's 16.10 choice naming the `recordedAt` of the save point they saw. */
+  savePointDecision: PlanAbandonSavePointDecision
+}
+
+/**
+ * The outcome of a running Plan replan adoption request. Returning to the game save point never adopts the Preview: it restores the
+ * save point only, and a new calculation from the restored state is required (18.8 / 16.10).
+ */
+export type AdoptRunningPlanReplanPreviewResult =
+  | {
+      kind: 'adopted'
+      savePointHandling: 'no_choice' | 'keep_current'
+      /** The running Plan, now `abandoned` with `replan_adopted`. */
+      oldPlan: ProductionPlan
+      /** The Preview's Plan, now `active`. */
+      newPlan: ProductionPlan
+      /** The replaced Entries `O`, deleted. */
+      deletedBuildListEntryIds: BuildListEntryId[]
+      /** The generated Entries `G`, replacing and added, in the artifact's order. */
+      addedBuildListEntryIds: BuildListEntryId[]
+    }
+  | {
+      kind: 'save_point_restored_repreview_required'
+      restoredPlan: ProductionPlan
+      savePoint: ExecutionSavePoint
+      deletedExecutionHistoryIds: ExecutionHistoryId[]
+    }
+
 /**
  * The Execution runtime of a calculation schema 12 ProductionPlan
  * (`docs/PLANNER_SPEC.md` 16.1 / 16.2 / 16.15, `docs/DATA_MODEL.md` 14.4).
@@ -282,9 +324,12 @@ export type AdoptProductionPlanReplanPreviewResult =
  * `operation_uncertain`, the Current Position Recovery after
  * `operation_uncertain` (`operation_count_recovered`), the Undo of the latest ExecutionHistory, recording /
  * restoring the Plan's game save point, finishing as a compromise, and the
- * user's abandonment with its save point choice, and the replan adoption with
- * its save point choice. An approved breaking change ends the Plan through
- * `PlanBreakingChangeGuard` together with the change that breaks it.
+ * user's abandonment with its save point choice, the 16.8 replan adoption with
+ * its save point choice, and the adoption of a running Plan replan
+ * re-optimization (18.8, Issue #276 PR-5), which also replaces and adds the
+ * replan Targets' BuildListEntries in its one transaction. An approved breaking
+ * change ends the Plan through `PlanBreakingChangeGuard` together with the
+ * change that breaks it; neither replan adoption goes through that guard.
  */
 export class ProductionPlanExecutionService {
   private readonly dependencies: ProductionPlanExecutionServiceDependencies
@@ -315,6 +360,39 @@ export class ProductionPlanExecutionService {
         ownedWeapons: ownedWeapons.filter(({ id }) => named.has(id)),
         targetWeapons: targetWeapons.filter(({ id }) =>
           changes.some((change) => change.targetWeaponId === id || change.fromTargetWeaponId === id)),
+      }
+    }, 'r')
+  }
+
+  /**
+   * The read-only continuation judgement of one Plan (Issue #334,
+   * `docs/PLANNER_SPEC.md` 21.4.1): the CalculationContext compatibility, then the
+   * completion assignment safety against the current Targets, through
+   * `evaluateProductionPlanContinuation()` - the very judgement the runtime
+   * applies. Writes nothing and changes no status.
+   */
+  inspectProductionPlanContinuation(planId: ProductionPlanId): Promise<ProductionPlanContinuationInspection> {
+    const { database } = this.dependencies
+    return this.runExecutionTransaction(async () => {
+      const plan = await this.requirePlan(planId)
+      const [targetWeapons, ownedWeapons] = await Promise.all([
+        database.targetWeapons.toArray(),
+        database.ownedWeapons.toArray(),
+      ])
+      const continuation = evaluateProductionPlanContinuation(plan, targetWeapons, this.dependencies.currentCalculationContext)
+      const issues = continuation.kind === 'completion_assignment_conflict' ? continuation.issues : []
+      const namedWeapons = new Set<string>(issues.flatMap((issue) => ('ownedWeaponId' in issue ? [issue.ownedWeaponId] : [])))
+      const namedTargets = new Set<string>(issues.flatMap((issue) =>
+        issue.reason === 'duplicate_completion_weapon'
+          ? issue.targetWeaponIds
+          : issue.reason === 'completion_weapon_assigned_elsewhere'
+            ? [issue.targetWeaponId, issue.assignedTargetWeaponId]
+            : []))
+      return {
+        planId: plan.id,
+        continuation,
+        ownedWeapons: ownedWeapons.filter(({ id }) => namedWeapons.has(id)),
+        targetWeapons: targetWeapons.filter(({ id }) => namedTargets.has(id)),
       }
     }, 'r')
   }
@@ -428,7 +506,7 @@ export class ProductionPlanExecutionService {
       const plan = await this.requirePlan(planId)
       return deriveOperationCountRecovery(plan, {
         ownedWeapons: await database.ownedWeapons.toArray(),
-        planExecutionHistory: await database.executionHistory.where('planId').equals(plan.id).toArray(),
+        planExecutionHistory: await this.readPlanExecutionHistory(plan),
       })
     }, 'r')
   }
@@ -460,38 +538,12 @@ export class ProductionPlanExecutionService {
   }
 
   /**
-   * "この武器を妥協品として確定して終了" (16.12): the tracked weapon of a reached
-   * selected compromise checkpoint becomes `practical` with its protection
-   * untouched, every weapon in progress for the Plan stops being in progress,
-   * the Target stays `active` and keeps its preference, the Plan becomes
-   * `abandoned` with `finished_as_compromise`, and its game save point is
-   * deleted. No Counter advances and no game operation is implied.
-   */
-  finishProductionPlanAsCompromise(
-    request: FinishProductionPlanAsCompromiseRequest,
-  ): Promise<FinishProductionPlanAsCompromiseResult> {
-    return this.runExecutionTransaction(async () => {
-      const plan = await this.requirePlan(request.planId)
-      const finish = prepareCompromiseFinish({
-        plan,
-        planStepId: request.planStepId,
-        buildListEntryId: request.buildListEntryId,
-        targetWeaponId: request.targetWeaponId,
-        ownedWeaponId: request.ownedWeaponId,
-        state: await this.readState(plan),
-        currentCalculationContext: this.dependencies.currentCalculationContext,
-        executionHistoryId: this.dependencies.idFactory.executionHistoryId(),
-        now: this.dependencies.clock.now(),
-      })
-      await this.writeStep(finish)
-      return { plan: finish.plan, history: finish.history }
-    })
-  }
-
-  /**
-   * Undoes the Plan's latest ExecutionHistory (16.16): the app state is
-   * restored exactly from its `ExecutionUndoSnapshot` and the record is deleted,
-   * without adding an Undo record. The in-game operation is not reversed.
+   * Undoes the Plan's latest ExecutionHistory (16.16 / 19.5): the Plan before
+   * the record is rebuilt from the current Plan and its Undo body, the app state
+   * is restored exactly from that body, and the record's metadata and body are
+   * deleted, without adding an Undo record. The one Undo body read is the
+   * requested record's (`docs/DATA_MODEL.md` 14.6). The in-game operation is
+   * not reversed.
    */
   undoLatestExecution(request: UndoLatestExecutionRequest): Promise<UndoLatestExecutionResult> {
     const { database } = this.dependencies
@@ -504,7 +556,8 @@ export class ProductionPlanExecutionService {
           normalCounters: await database.normalArtianCounters.toArray(),
           ownedWeapons: await database.ownedWeapons.toArray(),
           targetWeapons: await database.targetWeapons.toArray(),
-          planExecutionHistory: await database.executionHistory.where('planId').equals(plan.id).toArray(),
+          planExecutionHistory: await this.readPlanExecutionHistory(plan),
+          undoSnapshot: (await this.historyRepository().getExecutionUndoSnapshot(request.executionHistoryId)) ?? null,
           executionSavePoint:
             (await database.executionSavePoints.get(executionSavePointIdForPlan(plan.id))) ?? null,
         },
@@ -551,6 +604,8 @@ export class ProductionPlanExecutionService {
     const { database } = this.dependencies
     return this.runExecutionTransaction(async () => {
       const plan = await this.requirePlan(request.planId)
+      const planExecutionHistory = await this.readPlanExecutionHistory(plan)
+      const executionSavePoint = (await database.executionSavePoints.get(executionSavePointIdForPlan(plan.id))) ?? null
       const restore = prepareExecutionSavePointRestore({
         plan,
         recordedAt: request.recordedAt,
@@ -558,9 +613,9 @@ export class ProductionPlanExecutionService {
           ownedWeapons: await database.ownedWeapons.toArray(),
           targetWeapons: await database.targetWeapons.toArray(),
           buildListEntries: await database.buildListEntries.toArray(),
-          planExecutionHistory: await database.executionHistory.where('planId').equals(plan.id).toArray(),
-          executionSavePoint:
-            (await database.executionSavePoints.get(executionSavePointIdForPlan(plan.id))) ?? null,
+          planExecutionHistory,
+          undoSnapshotsAfterSavePoint: await this.readUndoSnapshotsAfterSavePoint(plan, executionSavePoint, planExecutionHistory),
+          executionSavePoint,
         },
         currentCalculationContext: this.dependencies.currentCalculationContext,
       })
@@ -585,10 +640,10 @@ export class ProductionPlanExecutionService {
     return this.runExecutionTransaction(async () => {
       const plan = await this.requirePlan(request.planId)
       return inspectProductionPlanAbandonment(plan, {
-        planExecutionHistory: await database.executionHistory.where('planId').equals(plan.id).toArray(),
+        planExecutionHistory: await this.readPlanExecutionHistory(plan),
         executionSavePoint:
           (await database.executionSavePoints.get(executionSavePointIdForPlan(plan.id))) ?? null,
-      })
+      }, this.dependencies.currentCalculationContext)
     }, 'r')
   }
 
@@ -603,6 +658,8 @@ export class ProductionPlanExecutionService {
     const { database } = this.dependencies
     return this.runExecutionTransaction(async () => {
       const plan = await this.requirePlan(request.planId)
+      const planExecutionHistory = await this.readPlanExecutionHistory(plan)
+      const executionSavePoint = (await database.executionSavePoints.get(executionSavePointIdForPlan(plan.id))) ?? null
       const abandonment = prepareProductionPlanAbandonment({
         plan,
         observedPlan: request.observedPlan,
@@ -611,9 +668,12 @@ export class ProductionPlanExecutionService {
           ownedWeapons: await database.ownedWeapons.toArray(),
           targetWeapons: await database.targetWeapons.toArray(),
           buildListEntries: await database.buildListEntries.toArray(),
-          planExecutionHistory: await database.executionHistory.where('planId').equals(plan.id).toArray(),
-          executionSavePoint:
-            (await database.executionSavePoints.get(executionSavePointIdForPlan(plan.id))) ?? null,
+          planExecutionHistory,
+          // Only 「最後のゲーム内セーブ地点へ戻す」 reads Undo bodies (14.6).
+          undoSnapshotsAfterSavePoint: request.savePointDecision?.kind === 'restore_save_point'
+            ? await this.readUndoSnapshotsAfterSavePoint(plan, executionSavePoint, planExecutionHistory)
+            : [],
+          executionSavePoint,
         },
         currentCalculationContext: this.dependencies.currentCalculationContext,
         now: this.dependencies.clock.now(),
@@ -639,10 +699,10 @@ export class ProductionPlanExecutionService {
     return this.runExecutionTransaction(async () => {
       const plan = await this.requirePlan(request.preview.runningPlanToken.planId)
       return inspectProductionPlanReplanAdoption(request.preview, plan, {
-        planExecutionHistory: await database.executionHistory.where('planId').equals(plan.id).toArray(),
+        planExecutionHistory: await this.readPlanExecutionHistory(plan),
         executionSavePoint:
           (await database.executionSavePoints.get(executionSavePointIdForPlan(plan.id))) ?? null,
-      })
+      }, this.dependencies.currentCalculationContext)
     }, 'r')
   }
 
@@ -667,7 +727,7 @@ export class ProductionPlanExecutionService {
         runningPlan,
         savePointDecision: request.savePointDecision,
         state: {
-          ...(await this.readState(runningPlan)),
+          ...(await this.readState(runningPlan, request.savePointDecision?.kind === 'restore_save_point')),
           runningPlans: await database.productionPlans.where('status').anyOf(['active', 'stale']).toArray(),
           newPlanIdPersisted: newPlanId !== null && (await database.productionPlans.get(newPlanId)) !== undefined,
         },
@@ -689,6 +749,118 @@ export class ProductionPlanExecutionService {
             newPlan: adoption.newPlan,
           }
     })
+  }
+
+  /**
+   * Reads what adopting a running Plan replan re-optimization would write and ask (`docs/PLANNER_SPEC.md` 18.8 / 16.10), in one
+   * read-only transaction: the Preview is checked ([P1]) and re-verified against the current state ([T]) exactly as the adoption would
+   * do on 「現在地点を維持」, and refused with the same typed codes. It writes nothing and is no write authority: the adoption
+   * re-derives everything inside its own transaction.
+   */
+  async inspectRunningPlanReplanAdoption(request: InspectRunningPlanReplanAdoptionRequest): Promise<RunningPlanReplanAdoptionInspection> {
+    const preview = this.checkedRunningPlanReplanPreview(request.preview)
+    return this.runExecutionTransaction(async () => {
+      const runningPlan = await this.requirePlan(preview.runningPlanToken.planId)
+      return inspectRunningPlanReplanAdoption({
+        preview,
+        runningPlan,
+        state: await this.readRunningPlanReplanAdoptionState(runningPlan, preview, false),
+        currentCalculationContext: this.dependencies.currentCalculationContext,
+        now: this.dependencies.clock.now(),
+      })
+    }, 'r')
+  }
+
+  /**
+   * 「この再計画を採用」 of a running Plan replan re-optimization (`docs/PLANNER_SPEC.md` 18.8): re-checks the Preview ([P1]) and
+   * re-verifies it against the current persisted state ([T]) inside one read-write transaction and, only when everything holds, writes
+   * there ([W]): the running Plan becomes `abandoned` (`replan_adopted`) with its current Step, Step completions and recalculation
+   * reasons kept, each replaced Entry `O` is deleted and each generated Entry `G` added, the new Plan is added `active` with its start
+   * effect, the running Plan's in-progress marks are moved or cleared, and its save point is deleted. No ExecutionHistory is added, no
+   * Draft and no Entry outside the replan target set is written, and no Plan-breaking approval is asked. Choosing to return to the save
+   * point restores it only and adopts nothing. Any refusal or failure writes nothing.
+   */
+  async adoptRunningPlanReplanPreview(request: AdoptRunningPlanReplanPreviewRequest): Promise<AdoptRunningPlanReplanPreviewResult> {
+    const preview = this.checkedRunningPlanReplanPreview(request.preview)
+    return this.runExecutionTransaction(async () => {
+      const runningPlan = await this.requirePlan(preview.runningPlanToken.planId)
+      const adoption = prepareRunningPlanReplanAdoption({
+        preview,
+        runningPlan,
+        savePointDecision: request.savePointDecision,
+        state: await this.readRunningPlanReplanAdoptionState(
+          runningPlan,
+          preview,
+          request.savePointDecision?.kind === 'restore_save_point',
+        ),
+        currentCalculationContext: this.dependencies.currentCalculationContext,
+        now: this.dependencies.clock.now(),
+      })
+      await this.writeRunningPlanReplanAdoption(adoption)
+      return adoption.kind === 'save_point_restored'
+        ? {
+            kind: 'save_point_restored_repreview_required',
+            restoredPlan: adoption.restore.plan,
+            savePoint: adoption.restore.savePoint,
+            deletedExecutionHistoryIds: adoption.restore.deletedExecutionHistoryIds,
+          }
+        : {
+            kind: 'adopted',
+            savePointHandling: adoption.savePointHandling,
+            oldPlan: adoption.oldPlan,
+            newPlan: adoption.newPlan,
+            deletedBuildListEntryIds: [...adoption.deletedBuildListEntryIds],
+            addedBuildListEntryIds: adoption.addedBuildListEntries.map(({ id }) => id),
+          }
+    })
+  }
+
+  /**
+   * The runtime-only Preview is untrusted until its structure passes the same artifact check a Worker result passes
+   * (`runningPlanReplanPreviewIssues()`): having passed that check once in the session is no authority.
+   */
+  private checkedRunningPlanReplanPreview(preview: unknown): RunningPlanReplanAdoptionPreview {
+    const issues = runningPlanReplanPreviewIssues(preview)
+    if (issues.length > 0) {
+      executionFailure('replan_result_invalid', `The running Plan replan Preview is malformed: ${issues.join(' ')}`)
+    }
+    return preview as RunningPlanReplanAdoptionPreview
+  }
+
+  private async readRunningPlanReplanAdoptionState(
+    runningPlan: ProductionPlan,
+    preview: RunningPlanReplanAdoptionPreview,
+    restoresSavePoint: boolean,
+  ): Promise<RunningPlanReplanAdoptionReadState> {
+    const { database } = this.dependencies
+    const newPlanId = preview.artifact.plannerResult.plan?.id ?? null
+    return {
+      ...(await this.readState(runningPlan, restoresSavePoint)),
+      runningPlans: await database.productionPlans.where('status').anyOf(['active', 'stale']).toArray(),
+      newPlanIdPersisted: newPlanId !== null && (await database.productionPlans.get(newPlanId)) !== undefined,
+    }
+  }
+
+  private async writeRunningPlanReplanAdoption(write: RunningPlanReplanAdoptionWrite): Promise<void> {
+    if (write.kind === 'save_point_restored') {
+      await this.writeSavePointRestore(write.restore)
+      return
+    }
+    const { database } = this.dependencies
+    await database.productionPlans.put(write.oldPlan)
+    // Each replaced `O` is deleted before its `G` is added. Every `G` is added, never put: an Entry that already exists is a
+    // different record and is never overwritten (the transaction fails and nothing is kept).
+    if (write.deletedBuildListEntryIds.length > 0) await database.buildListEntries.bulkDelete(write.deletedBuildListEntryIds)
+    if (write.addedBuildListEntries.length > 0) await database.buildListEntries.bulkAdd(write.addedBuildListEntries)
+    await database.productionPlans.add(write.newPlan)
+    if (write.targetWeapons.length > 0) await database.targetWeapons.bulkPut(write.targetWeapons)
+    if (write.ownedWeapons.length > 0) await database.ownedWeapons.bulkPut(write.ownedWeapons)
+    if (write.deletesExecutionSavePoint) {
+      await database.executionSavePoints
+        .where('productionPlanId')
+        .equals(write.oldPlan.id)
+        .delete()
+    }
   }
 
   private async writeReplanAdoption(write: ProductionPlanReplanAdoptionWrite): Promise<void> {
@@ -724,9 +896,7 @@ export class ProductionPlanExecutionService {
     if (write.ownedWeapons.length > 0) await database.ownedWeapons.bulkPut(write.ownedWeapons)
     if (write.targetWeapons.length > 0) await database.targetWeapons.bulkPut(write.targetWeapons)
     await database.productionPlans.put(write.plan)
-    if (write.deletedExecutionHistoryIds.length > 0) {
-      await database.executionHistory.bulkDelete(write.deletedExecutionHistoryIds)
-    }
+    await this.historyRepository().deleteExecutionRecords(write.deletedExecutionHistoryIds)
     if (write.deletesExecutionSavePoint) {
       await database.executionSavePoints
         .where('productionPlanId')
@@ -760,7 +930,8 @@ export class ProductionPlanExecutionService {
       case 'keep':
         break
     }
-    await database.executionHistory.delete(undo.deletedExecutionHistoryId)
+    // The undone record's metadata and Undo body go together (12.2).
+    await this.historyRepository().deleteExecutionRecords([undo.deletedExecutionHistoryId])
   }
 
   private async writeStep(write: ExecutionStepWrite): Promise<void> {
@@ -782,8 +953,10 @@ export class ProductionPlanExecutionService {
         .equals(write.plan.id)
         .delete()
     }
-    // A history ID that already exists is a different record; never replace it.
+    // The record's metadata and Undo body are added together; a history ID that
+    // already exists is a different record and is never replaced.
     await database.executionHistory.add(write.history)
+    await database.executionUndoSnapshots.add(write.undoSnapshot)
   }
 
   private async requirePlan(planId: ProductionPlanId): Promise<ProductionPlan> {
@@ -792,22 +965,51 @@ export class ProductionPlanExecutionService {
     return plan
   }
 
-  private async readState(plan: ProductionPlan): Promise<ExecutionPersistedState> {
+  /**
+   * The persisted state an Execution transaction decides from: the Plan's
+   * metadata only, and the Undo bodies after its game save point only when the
+   * operation restores that save point (`docs/DATA_MODEL.md` 14.6).
+   */
+  private async readState(plan: ProductionPlan, restoresSavePoint = false): Promise<ExecutionPersistedState> {
     const { database } = this.dependencies
     const rngState = await database.rngState.get('current')
     if (!rngState) {
       executionFailure('execution_state_mismatch', 'No RngState is stored, so the Plan cannot be executed.')
     }
+    const planExecutionHistory = await this.readPlanExecutionHistory(plan)
+    const executionSavePoint = (await database.executionSavePoints.get(executionSavePointIdForPlan(plan.id))) ?? null
     return {
       rngState,
       normalCounters: await database.normalArtianCounters.toArray(),
       ownedWeapons: await database.ownedWeapons.toArray(),
       targetWeapons: await database.targetWeapons.toArray(),
       buildListEntries: await database.buildListEntries.toArray(),
-      planExecutionHistory: await database.executionHistory.where('planId').equals(plan.id).toArray(),
-      executionSavePoint:
-        (await database.executionSavePoints.get(executionSavePointIdForPlan(plan.id))) ?? null,
+      planExecutionHistory,
+      undoSnapshotsAfterSavePoint: restoresSavePoint
+        ? await this.readUndoSnapshotsAfterSavePoint(plan, executionSavePoint, planExecutionHistory)
+        : [],
+      executionSavePoint,
     }
+  }
+
+  private historyRepository(): ExecutionHistoryRepository {
+    return new ExecutionHistoryRepository(this.dependencies.database)
+  }
+
+  /** The metadata of the Plan's records; a record that could not be converted refuses the operation. */
+  private readPlanExecutionHistory(plan: ProductionPlan): Promise<ExecutionHistory[]> {
+    return this.historyRepository().getExecutionHistoryByPlan(plan.id)
+  }
+
+  /** The Undo bodies of the Plan's records after its game save point, and no other body. */
+  private readUndoSnapshotsAfterSavePoint(
+    plan: ProductionPlan,
+    savePoint: ExecutionSavePoint | null,
+    planExecutionHistory: readonly ExecutionHistory[],
+  ): Promise<ExecutionUndoSnapshot[]> {
+    return this.historyRepository().getExecutionUndoSnapshots(
+      executionHistoryIdsAfterSavePoint(plan, savePoint, planExecutionHistory),
+    )
   }
 
   private async runExecutionTransaction<T>(operation: () => Promise<T>, mode: 'rw' | 'r' = 'rw'): Promise<T> {
@@ -823,6 +1025,7 @@ export class ProductionPlanExecutionService {
           database.buildListEntries,
           database.productionPlans,
           database.executionHistory,
+          database.executionUndoSnapshots,
           database.executionSavePoints,
         ],
         operation,

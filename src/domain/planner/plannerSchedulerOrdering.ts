@@ -8,9 +8,13 @@ import type { PlannerRouteUnit } from './plannerRouteProgress'
  * When several safe actions exist, exactly one is applied: the first by the
  * lexicographic key below. Safe actions commute (7.9), so this order never
  * decides whether a committed Route completes; it only decides Step order,
- * which weapon consumes a passable position, weapon switches and improvement
- * preference violations. Neither `evaluationScore` nor the preferred source
- * takes part (6.7 / 11).
+ * which weapon consumes a passable position and weapon switches. Neither
+ * `evaluationScore` nor the preferred source takes part (6.7 / 11).
+ *
+ * The keys keep their design numbers. Key 2, "the action adds an improvement
+ * preference violation", never differed without an intermediate state
+ * selection and was removed with it (Issue #100, `docs/PLANNER_SPEC.md` 7.6 /
+ * 20.10).
  */
 
 /**
@@ -26,8 +30,6 @@ export type PlannerScheduleActionKind = 'holding' | 'executor' | 'blind_forge'
 export interface PlannerScheduleActionOrderKey {
   /** Key 1: the highest Target priority among the progressed Entries. */
   readonly maxTargetPriority: number
-  /** Key 2: whether the action adds an improvement preference violation. */
-  readonly addsImprovementPreferenceViolation: boolean
   /** Key 3: whether the action adds a weapon switch. */
   readonly addsWeaponSwitch: boolean
   /**
@@ -96,10 +98,6 @@ export function comparePlannerScheduleActions(
   const b = right.orderKey
   return (
     b.maxTargetPriority - a.maxTargetPriority ||
-    compareBooleansFalseFirst(
-      a.addsImprovementPreferenceViolation,
-      b.addsImprovementPreferenceViolation,
-    ) ||
     compareBooleansFalseFirst(a.addsWeaponSwitch, b.addsWeaponSwitch) ||
     a.executorHoldingDistance - b.executorHoldingDistance ||
     a.minRemainingPendingUnits - b.minRemainingPendingUnits ||

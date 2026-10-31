@@ -163,8 +163,8 @@ export type PlannerAlternativeTrialRejectionReason =
   /**
    * `G` is not selected, and its only drop was not a provisional outcome of an
    * unresolved conflict with an Entry outside the fixed Route set: a stall /
-   * deadlock drop, a precondition, validation, source, protection or
-   * checkpoint failure, a rejected action or reserve, or no commitment at all.
+   * deadlock drop, a precondition, validation, source or protection failure, a
+   * rejected action or reserve, or no commitment at all.
    */
   | 'not_selected'
 

@@ -53,7 +53,6 @@ export function SourceExclusionConditionCheckbox({
       {/* Indented to the label text so both read as this Checkbox's own text; the top margin keeps a gap under a
           label that wraps to two lines at phone width. */}
       <Stack spacing={1} sx={{ mt: 0.5, pl: checkboxLabelInset, minWidth: 0 }}>
-        {/* `sx` colour: MUI 9 Typography emits no rule for a dotted `color="text.secondary"` prop. */}
         <Typography id={descriptionId} variant="body2" sx={{ color: 'text.secondary', overflowWrap: 'anywhere' }}>
           {SOURCE_EXCLUSION_DESCRIPTION}
         </Typography>

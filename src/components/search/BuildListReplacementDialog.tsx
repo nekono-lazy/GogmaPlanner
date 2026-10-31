@@ -1,7 +1,5 @@
 import { useId } from 'react'
 import {
-  Alert,
-  AlertTitle,
   Box,
   Button,
   Dialog,
@@ -11,26 +9,26 @@ import {
   Stack,
   Typography,
 } from '@mui/material'
-import { defaultIntermediateStateSelection } from '../../domain/buildList'
 import type { MasterDataRoot } from '../../domain/master/masterTypes'
 import type {
   BuildCandidate,
-  IntermediateStateSelection,
   OwnedWeapon,
   TargetWeapon,
 } from '../../domain/models/publicTypes'
 import { DialogFormError } from '../DialogFormError'
 import { RestorationBonusSlots } from '../RestorationBonusSlots'
 import { StatusChip } from '../StatusChip'
+import { AchievedCompletionVariants } from '../target/AchievedCompletionVariants'
+import {
+  ACHIEVED_COMPLETION_VARIANTS_LABEL,
+  describeAchievedCompletionVariants,
+} from '../target/completionConditionPresentation'
 import {
   BUILD_LIST_REPLACEMENT_CONFIRM_LABEL,
   BUILD_LIST_REPLACEMENT_CURRENT_HEADING,
   BUILD_LIST_REPLACEMENT_LEAD,
   BUILD_LIST_REPLACEMENT_NEW_HEADING,
-  BUILD_LIST_REPLACEMENT_NOT_CARRIED_NOTE,
-  BUILD_LIST_REPLACEMENT_NOT_CARRIED_TITLE,
   BUILD_LIST_REPLACEMENT_TITLE,
-  summarizeIntermediateStateSelection,
 } from './buildListReplacementPresentation'
 import type { BuildListCandidateReplacementPending } from './useBuildListCandidateReplacement'
 import { SearchDefinitionItem, SearchDefinitionList } from './SearchDefinitionList'
@@ -40,35 +38,30 @@ const actionSx = { minHeight: 44, width: { xs: '100%', sm: 'auto' } } as const
 
 /**
  * The gist of one Candidate for the comparison: the Route kind, its starting
- * weapon, the finished five slots and Skills, the operation count and the
- * intermediate state selection that goes with it. Everything shown is the
- * Candidate's own recorded result; nothing is recomputed and no ID is shown.
+ * weapon, the finished five slots and Skills, the completion Variants it
+ * achieves and the operation count. Everything shown is the Candidate's own
+ * recorded result (the Variants re-judged against the Target as it is now);
+ * nothing else is recomputed and no ID is shown.
  */
 function CandidateSummary({
   heading,
   candidate,
   target,
-  selection,
   master,
   ownedWeapons,
-  selectionLabel,
   isStale,
   emphasized,
 }: {
   heading: string
   candidate: BuildCandidate
   target: TargetWeapon
-  selection: IntermediateStateSelection
   master: MasterDataRoot
   ownedWeapons: readonly OwnedWeapon[]
-  /** Whose selection this is: the registered Entry's, or the one this screen will register. */
-  selectionLabel: string
   isStale: boolean
   /** The candidate that will be registered; marked by a border in addition to its heading. */
   emphasized: boolean
 }) {
   const headingId = useId()
-  const summary = summarizeIntermediateStateSelection(candidate, selection, master)
   const sourceName = candidate.route.sourceOwnedWeaponId === null
     ? null
     : ownedWeapons.find(({ id }) => id === candidate.route.sourceOwnedWeaponId)?.name ??
@@ -111,15 +104,14 @@ function CandidateSummary({
             シリーズ: {seriesSkillLabel(candidate.seriesSkillId, master)} ／ グループ:{' '}
             {groupSkillLabel(candidate.groupSkillId, master)}
           </SearchDefinitionItem>
+          {/* Both candidates are judged against the Target as it is now (`docs/REQUIREMENTS.md` 13.2). */}
+          <SearchDefinitionItem label={ACHIEVED_COMPLETION_VARIANTS_LABEL}>
+            <AchievedCompletionVariants
+              achieved={describeAchievedCompletionVariants(target, candidate.finalBonuses, candidate.restorationBonusScope, master)}
+            />
+          </SearchDefinitionItem>
           <SearchDefinitionItem label="操作回数">
             <span className="tabular-nums">{candidate.estimatedOperationCount}回</span>
-          </SearchDefinitionItem>
-          <SearchDefinitionItem label={selectionLabel}>
-            <Box component="ul" sx={{ m: 0, pl: 2.5 }}>
-              <Typography component="li" variant="body2">スキル: {summary.skill}</Typography>
-              <Typography component="li" variant="body2">復元ボーナス: {summary.bonus}</Typography>
-              <Typography component="li" variant="body2">改善優先: {summary.improvementPreference}</Typography>
-            </Box>
           </SearchDefinitionItem>
         </SearchDefinitionList>
       </Stack>
@@ -142,9 +134,8 @@ export interface BuildListReplacementDialogProps {
  * The confirmation 「作成リストに追加」 needs when the Target already holds one
  * Entry of another Candidate (`docs/UI_FLOW.md` 9, `docs/DATA_MODEL.md` 9.4.1).
  * It shows the registered Candidate and the new one side by side (stacked on a
- * phone), and that the registered Entry's intermediate state selection and
- * improvement preference are not carried over. It is a replacement, not a
- * delete, so the action is the ordinary primary button. The breaking-change
+ * phone). It is a replacement, not a delete, so the action is the ordinary
+ * primary button. The breaking-change
  * warning, when the runtime asks for one, follows this dialog through the
  * shared controller; neither confirmation stands in for the other.
  */
@@ -195,10 +186,8 @@ export function BuildListReplacementDialog({
               heading={BUILD_LIST_REPLACEMENT_CURRENT_HEADING}
               candidate={existingEntry.candidateSnapshot}
               target={request.target}
-              selection={existingEntry.intermediateStateSelection ?? defaultIntermediateStateSelection()}
               master={master}
               ownedWeapons={ownedWeapons}
-              selectionLabel="現在の途中採用する状態・改善優先（引き継がれません）"
               isStale={existingEntry.isStale}
               emphasized={false}
             />
@@ -206,18 +195,12 @@ export function BuildListReplacementDialog({
               heading={BUILD_LIST_REPLACEMENT_NEW_HEADING}
               candidate={request.candidate}
               target={request.target}
-              selection={request.intermediateStateSelection}
               master={master}
               ownedWeapons={ownedWeapons}
-              selectionLabel="登録する途中採用する状態・改善優先"
               isStale={false}
               emphasized
             />
           </Box>
-          <Alert severity="warning">
-            <AlertTitle>{BUILD_LIST_REPLACEMENT_NOT_CARRIED_TITLE}</AlertTitle>
-            {BUILD_LIST_REPLACEMENT_NOT_CARRIED_NOTE}
-          </Alert>
         </Stack>
       </DialogContent>
       {error !== null && <DialogFormError message={error} />}

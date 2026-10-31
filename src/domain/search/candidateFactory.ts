@@ -19,8 +19,7 @@ import type {
 } from '../models/publicTypes'
 import { isBlindCreateNormalArtianOperation } from '../models/publicTypes'
 import { validateBuildCandidate } from '../models/validation'
-import { createIdealDifference, satisfiesIdealTarget } from '../target'
-import { extractIntermediateStateGroups } from './intermediateStateExtraction'
+import { createIdealDifference, satisfiesCompletionTarget } from '../target'
 import type { SearchExecutionContext } from './searchExecution'
 import { CandidateSearchError } from './searchTypes'
 import type { CandidateSearchInput } from './searchTypes'
@@ -377,12 +376,13 @@ export function createCandidateRouteEstimates(
 }
 
 /**
- * Builds one composed Search result, or `null` when it is not an Ideal result.
+ * Builds one composed Search result, or `null` when it does not satisfy the
+ * Target's completion condition (`docs/SEARCH_SPEC.md` 5.1 / 5.7).
  *
- * Only the Ideal condition is accepted now. A state that merely satisfies a
- * compromise condition is never an independent Candidate: it is offered to the
- * user as an intermediate state on a lane of an actual Ideal Route, and only
- * when it really lies on one (`docs/SEARCH_SPEC.md` 5.5.4 / 5.8).
+ * Only a completed result is a Candidate. Which Variant it satisfies is never
+ * recorded: it is re-judged at display time. No intermediate state is
+ * extracted any more (Issue #100, `docs/SEARCH_SPEC.md` 5.8 is a historical
+ * record), so the Candidate carries no `intermediateStateGroups`.
  */
 export function createCandidateFromPrediction(
   target: TargetWeapon,
@@ -391,7 +391,7 @@ export function createCandidateFromPrediction(
   execution: SearchExecutionContext,
 ): BuildCandidate | null {
   if (
-    !satisfiesIdealTarget(
+    !satisfiesCompletionTarget(
       target,
       prediction.finalBonuses,
       prediction.restorationBonusScope,
@@ -407,6 +407,7 @@ export function createCandidateFromPrediction(
     prediction.finalBonuses,
     prediction.seriesSkillId,
     prediction.groupSkillId,
+    input.master,
   )
 
   const semanticHash = hashStableValue({
@@ -469,14 +470,6 @@ export function createCandidateFromPrediction(
           ),
         }),
   }
-  // Derived from the finished Route and the Target definition alone, so it
-  // reuses the observational traces this Candidate already carries and adds no
-  // RNG prediction call (`docs/SEARCH_SPEC.md` 5.8.1).
-  candidate.intermediateStateGroups = extractIntermediateStateGroups(candidate, {
-    target,
-    master: input.master,
-    ownedWeapons: input.ownedWeapons,
-  })
   const valid = validateBuildCandidate(candidate, input.ownedWeapons)
   if (!valid.isValid) {
     throw new CandidateSearchError(

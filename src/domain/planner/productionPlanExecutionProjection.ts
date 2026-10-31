@@ -26,7 +26,6 @@ import {
   stableStringify,
   V1_NORMAL_ARTIAN_RARITY,
 } from '../models/publicTypes'
-import { isIntermediatePinHeldAtRouteStart } from './plannerCheckpoints'
 import {
   applyProductionPlanStartTargetLinks,
   deriveProductionPlanStartTargetLinks,
@@ -148,6 +147,12 @@ function knownWeapon(weapon: ExpectedPlanStateOwnedWeapon): OwnedWeapon | null {
   return weapon.restorationBonuses === null ? null : structuredClone(weapon as OwnedWeapon)
 }
 
+/**
+ * A Step's effects before the Step decides any. `compromiseLabels` stays in the
+ * schema 19 persisted shape and is always empty: no selected compromise
+ * checkpoint labels a weapon `practical` any more (Issue #100,
+ * `docs/PLANNER_SPEC.md` 20.4, `docs/DATA_MODEL.md` 11.3).
+ */
 function emptyEffects(): PlanStepExecutionEffects {
   return {
     trackedOwnedWeaponId: null,
@@ -204,7 +209,6 @@ export function projectProductionPlanExecution(
   )
   const trackedIdByEntry = new Map<BuildListEntryId, OwnedWeaponId>()
   const forgeUnitIndexByEntry = new Map<BuildListEntryId, number>()
-  const physicallyStartedEntries = new Set<BuildListEntryId>()
 
   const snapshot = (): ProjectionSnapshot => ({
     rngState: structuredClone(rngState),
@@ -240,19 +244,19 @@ export function projectProductionPlanExecution(
     })
     targetOf(entry).preferredOwnedWeaponId = weaponId
   }
-  const labelPractical = (effects: PlanStepExecutionEffects, entry: BuildListEntry, weaponId: OwnedWeaponId) => {
-    const weapon = weaponOf(weaponId)
-    if (weapon.kind !== 'gogma') {
-      fail(`the compromise checkpoint of BuildListEntry '${entry.id}' is not held by a Gogma weapon.`)
-    }
-    effects.compromiseLabels.push({ buildListEntryId: entry.id, ownedWeaponId: weaponId })
-    weapons.set(weaponId, { ...weapon, status: 'practical' })
-  }
+  const completedWeaponIds = new Set<OwnedWeaponId>()
   const complete = (effects: PlanStepExecutionEffects, entry: BuildListEntry, weaponId: OwnedWeaponId) => {
     const weapon = weaponOf(weaponId)
     if (weapon.kind !== 'gogma' || bindingTokens.has(weaponId)) {
       fail(`BuildListEntry '${entry.id}' completes a weapon that is not a known Gogma result.`)
     }
+    // One OwnedWeapon completes at most one Target in a Plan (Issue #334 PR-3,
+    // `docs/PLANNER_SPEC.md` 21.5): the Planner's reserve exclusivity and Trace
+    // Replay already refuse it, so this is the projection's own fail closed.
+    if (completedWeaponIds.has(weaponId)) {
+      fail(`BuildListEntry '${entry.id}' completes OwnedWeapon '${weaponId}', which another Step already completed a Target with.`)
+    }
+    completedWeaponIds.add(weaponId)
     const candidate = entry.candidateSnapshot
     effects.targetCompletions.push({
       buildListEntryId: entry.id,
@@ -371,7 +375,6 @@ export function projectProductionPlanExecution(
             effects.observationBinding = { kind: 'normal_restoration_bonuses' }
             bindingTokens.set(weaponId, stepId)
           }
-          physicallyStartedEntries.add(entry.id)
           link(effects, entry, weaponId)
           inventoryChange = {
             addOwnedWeapon: knownWeapon(registered),
@@ -427,23 +430,11 @@ export function projectProductionPlanExecution(
             groupSkillId: result.groupSkillId,
           })
         }
+        // An existing weapon was linked by the Plan start effect; only a
+        // registered production-target Normal is linked by a Step.
         effects.trackedOwnedWeaponId = weaponId
-        progressedEntries.forEach((entry) => {
-          if (physicallyStartedEntries.has(entry.id)) return
-          physicallyStartedEntries.add(entry.id)
-          // An existing weapon was linked by the Plan start effect; only a
-          // registered production-target Normal is linked by a Step.
-          // A checkpoint already held at Plan start is labelled on the Entry's
-          // first physical Step (`docs/PLANNER_SPEC.md` 16.12).
-          if (isIntermediatePinHeldAtRouteStart(entry)) labelPractical(effects, entry, weaponId)
-        })
       }
 
-      physical.checkpointMilestones.forEach((milestone) => {
-        const entry = entryFor(milestone.buildListEntryId)
-        if (effects.compromiseLabels.some(({ buildListEntryId }) => buildListEntryId === entry.id)) return
-        labelPractical(effects, entry, trackedIdFor(entry))
-      })
       group.reserves.forEach((reserve) => {
         const entry = entryFor(reserve.primaryBuildListEntryId ?? fail('a reserve has no Entry.'))
         const weaponId = trackedIdFor(entry)
@@ -517,7 +508,10 @@ export function projectProductionPlanExecution(
       targetWeaponId: primaryEntry.targetWeaponId,
       buildListEntryId: primaryEntry.id,
       progressedTargetWeaponIds,
-      checkpointMilestones: structuredClone(group.physical?.checkpointMilestones ?? []),
+      // The schema 19 persisted shape keeps the legacy field, always empty: no
+      // Step reaches a selected compromise checkpoint any more (Issue #100,
+      // `docs/PLANNER_SPEC.md` 20.7, `docs/DATA_MODEL.md` 11.3).
+      checkpointMilestones: [],
       candidateId: primaryEntry.candidateSnapshot.id,
       ownedWeaponId: effects.trackedOwnedWeaponId,
       expectedResult,

@@ -5,7 +5,6 @@ import type {
   TargetWeapon,
   TargetWeaponId,
 } from '../models/publicTypes'
-import type { PlannerCheckpointRequirements } from './plannerCheckpoints'
 import {
   detectPlannerConflicts,
   isUnitBlockedByConflictResolution,
@@ -51,20 +50,23 @@ import type {
 
 /**
  * - `committed`   the scheduler executes this Entry's Route
- * - `secured`     the Entry's Candidate was reserved (completed)
- * - `not_needed`  the Entry is not relevant at the start: its Target is
- *   already complete, or another Entry is the Target's required Entry
- * - `released`    the Entry's Target was satisfied by another Entry while it
- *   was committed (cross satisfaction, 6.8)
+ * - `secured`     the Entry's Candidate was reserved (completed), its
+ *   zero-operation confirmation included
  * - `dropped`     the Entry is not executed in this run: an explicit
  *   resolution selected another Entry, a provisional conflict outcome, a
- *   broken execution precondition, or a deadlock / stall. Never recommitted
+ *   broken execution precondition, a rejected confirmation or reserve, or a
+ *   deadlock / stall. Never recommitted
+ *
+ * A committed Entry stays committed until its own reserve secures it or it is
+ * dropped (Issue #334 PR-3, `docs/PLANNER_SPEC.md` 21.5): no other Entry's
+ * reserve changes it. Calculation schema 11..19 also had `not_needed` (a
+ * Target complete at Planner start through an owned weapon's performance) and
+ * `released` (a Target another Entry's secured weapon satisfied, design 6.8),
+ * both abolished with the inventory-derived satisfaction.
  */
 export type PlannerRouteCommitmentStatus =
   | 'committed'
   | 'secured'
-  | 'not_needed'
-  | 'released'
   | 'dropped'
 
 export interface PlannerRouteCommitmentRecord {
@@ -81,7 +83,6 @@ export interface PlannerRouteCommitmentContext {
   readonly entriesById: ReadonlyMap<BuildListEntryId, BuildListEntry>
   readonly planningTargets: readonly TargetWeapon[]
   readonly planningTargetsById: ReadonlyMap<TargetWeaponId, TargetWeapon>
-  readonly checkpointRequirements: PlannerCheckpointRequirements
   /** The initial conflicts, whose explicit resolutions commitment applies. */
   readonly initialConflictDetection: PlannerConflictDetectionResult
   /** The Entry set the ranking's next-Candidate distance is measured over. */
@@ -178,10 +179,8 @@ function remainingUnits(
 
 /**
  * The remaining units that hold their Counter position, judged by the one
- * holding predicate: the units that are never `canSkipWhenCounterPassed`. A
- * skippable unit its checkpoint pin blocks now is not among them - its position
- * may be consumed by another Entry and it is fast-forwarded once the pin is
- * released (design 5, `docs/PLANNER_SPEC.md` 7.5.2).
+ * holding predicate: the units that are never `canSkipWhenCounterPassed`
+ * (design 5).
  */
 function remainingHoldingUnits(
   state: PlannerSearchState,
@@ -195,9 +194,8 @@ function remainingHoldingUnits(
  * Why an Entry cannot be committed in `state`, or `null`.
  *
  * Judged over its remaining holding units (`isPlannerLaneUnitHolding()`) - the
- * units no other Entry may pass: never skippable units, every selected
- * checkpoint endpoint among them. A skippable unit is never a reason on its
- * own, pin-blocked or not: the Counter having passed it, or a resolution
+ * units no other Entry may pass: never skippable units. A skippable unit is
+ * never a reason on its own: the Counter having passed it, or a resolution
  * selecting another participant of a conflict it is part of, only means its
  * position is consumed and it is fast-forwarded when its progress may move
  * (`detectPlannerConflicts()` never lists it as a Counter conflict
@@ -226,10 +224,7 @@ export function plannerRouteCommitmentRejection(
   const holdingUnits = remainingHoldingUnits(state, entry, context.allLanePlans)
   const isSelectedEntryStillRelevant = (entryId: BuildListEntryId) => {
     const selected = context.entriesById.get(entryId)
-    return (
-      selected !== undefined &&
-      entryIsRelevantForState(state, selected, context.checkpointRequirements)
-    )
+    return selected !== undefined && entryIsRelevantForState(state, selected)
   }
   for (const unit of holdingUnits) {
     if (
@@ -320,16 +315,24 @@ function conflictActionKeysByEntry(
 
 interface PlannerCollision {
   readonly conflict: PlanConflict
-  readonly unit: PlannerRouteUnit
+  /** The unit the loser loses; `null` when the colliding Entry has no unit at all (a zero-operation Candidate). */
+  readonly unit: PlannerRouteUnit | null
 }
 
 /**
- * Whether two Routes cannot both run: some conflict both take part in has a
- * unit of one of them that is not one of the other's physical actions in it.
- * That is exactly what an explicit resolution selecting one of them blocks on
- * the other (`isUnitBlockedByConflictResolution()`), so units that are the
- * same shareable physical action are never a collision. `unit` is the unit of
- * `other` that is lost, or - when only `winner` loses one - that unit.
+ * Whether two Routes cannot both run.
+ *
+ * A `same_owned_weapon_consumed` conflict both take part in is always a
+ * collision (Issue #334 PR-3, `docs/PLANNER_SPEC.md` 21.5): the two Entries
+ * would complete their Targets with one and the same owned weapon, whether or
+ * not their units are the same shareable physical actions, and whether or not
+ * either has a unit at all. For a Counter conflict the rule is unchanged: some
+ * conflict both take part in has a unit of one of them that is not one of the
+ * other's physical actions in it - exactly what an explicit resolution
+ * selecting one of them blocks on the other
+ * (`isUnitBlockedByConflictResolution()`), so units that are the same shareable
+ * physical action are never a Counter collision. `unit` is the unit of `other`
+ * that is lost, or - when only `winner` loses one - that unit, or `null`.
  */
 function findCollision(
   winner: BuildListEntryId,
@@ -345,6 +348,9 @@ function findCollision(
     const byEntry = actionKeys.get(conflict.id)
     const winnerUnits = byEntry?.get(winner) ?? { keys: new Set<string>(), units: [] }
     const otherUnits = byEntry?.get(other) ?? { keys: new Set<string>(), units: [] }
+    if (conflict.kind === 'same_owned_weapon_consumed') {
+      return { conflict, unit: otherUnits.units[0] ?? null }
+    }
     const lost =
       otherUnits.units.find((unit) => !winnerUnits.keys.has(unit.physicalActionKey)) ??
       winnerUnits.units.find((unit) => !otherUnits.keys.has(unit.physicalActionKey))
@@ -380,7 +386,7 @@ function notCommittedRejection(
 ): PlannerSearchRejection {
   return createPlannerSearchRejection(
     loser,
-    collision.unit.operation.type,
+    collision.unit?.operation.type ?? 'reserve_weapon',
     'conflict_not_committed',
     `BuildListEntry '${loser}' was not committed: it conflicts with BuildListEntry '${winner}' (${collision.conflict.kind}) and no explicit conflict resolution chose between them.`,
   )
@@ -389,7 +395,12 @@ function notCommittedRejection(
 /**
  * The initial Route commitment of one run (6.2 - 6.6).
  *
- * `state` is the start state after the zero-operation confirmations. Each
+ * `state` is the start state before any action: every planning Target is
+ * incomplete, so every searchable Entry - a zero-operation Candidate included -
+ * is a commitment candidate (Issue #334 PR-3, `docs/PLANNER_SPEC.md` 21.5). The
+ * zero-operation confirmations follow the commitment, so a zero-operation
+ * Candidate on a weapon another Entry's Route starts from is decided by the
+ * collision below like any other Entry, never confirmed ahead of it. Each
  * planning Target contributes its relevant Entries (0..1 in an ordinary or
  * replacement input); an Entry an applied explicit resolution blocks, whose
  * holding unit the Counter already passed, or whose source weapon cannot be
@@ -454,8 +465,17 @@ export function createPlannerRouteCommitment(
       records.set(entry.id, { buildListEntryId: entry.id, status: 'secured', rejection: null })
       continue
     }
-    if (!entryIsRelevantForState(state, entry, context.checkpointRequirements)) {
-      records.set(entry.id, { buildListEntryId: entry.id, status: 'not_needed', rejection: null })
+    if (!entryIsRelevantForState(state, entry)) {
+      // Only a malformed state reaches here: the Entry's Target was completed
+      // in this run by another Entry. Nothing completes a Target at Planner
+      // start any more (21.5), so this is a fail-closed defence, never a
+      // "not needed" verdict.
+      drop(entry.id, createPlannerSearchRejection(
+        entry.id,
+        'reserve_weapon',
+        'inventory_precondition_failed',
+        `TargetWeapon '${entry.targetWeaponId}' was already completed in this run by another BuildListEntry.`,
+      ))
       continue
     }
     const rejection = plannerRouteCommitmentRejection(state, entry, context)
@@ -525,22 +545,4 @@ export function createPlannerRouteCommitment(
     records.set(entry.id, { buildListEntryId: entry.id, status: 'committed', rejection: null }),
   )
   return { status: 'ready', records, rejections, provisionalOutcomes }
-}
-
-/**
- * Whether an Entry that is not committed can join the committed set now
- * (6.8, a Target whose Ideal was lost in flight): it is executable in `state`
- * and collides with no committed Entry. It never pushes a committed Entry out.
- */
-export function canCommitPlannerRoute(
-  state: PlannerSearchState,
-  entry: BuildListEntry,
-  committed: readonly BuildListEntry[],
-  context: PlannerRouteCommitmentContext,
-): boolean {
-  if (plannerRouteCommitmentRejection(state, entry, context) !== null) return false
-  const { detection, actionKeys } = detectCollisions(state, [...committed, entry], context)
-  return committed.every(
-    (other) => findCollision(other.id, entry.id, detection, actionKeys) === null,
-  )
 }

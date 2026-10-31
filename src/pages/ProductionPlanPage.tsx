@@ -37,9 +37,11 @@ import {
 } from '../components/planner/productionPlanConflictPreferencePresentation'
 import { productionPlannerRunningTitles } from '../components/planner/productionPlannerSettingsPresentation'
 import { PlanExecutionEntry, type PlanStartPreviewState } from '../components/execution/PlanExecutionEntry'
+import { CompletionAssignmentConflictAlert } from '../components/execution/CompletionAssignmentConflictAlert'
+import { COMPLETION_ASSIGNMENT_REPLAN_NOTE, completionAssignmentNamesOf } from '../components/execution/completionAssignmentConflictPresentation'
 import { executionErrorMessage } from '../components/execution/executionStepPresentation'
-import { ProductionPlanReplanPreviewPanel } from '../components/execution/ProductionPlanReplanPreviewPanel'
-import { useProductionPlanReplanPreview } from '../components/execution/useProductionPlanReplanPreview'
+import { RunningPlanReplanPanel } from '../components/execution/RunningPlanReplanPanel'
+import { useRunningPlanReplan } from '../components/execution/useRunningPlanReplan'
 import { ExecutionRuntimeError } from '../domain/execution'
 import { loadMasterData } from '../domain/master/loadMasterData'
 import type { MasterDataRoot } from '../domain/master/masterTypes'
@@ -51,10 +53,11 @@ import type {
   ProductionPlanId,
   TargetWeapon,
 } from '../domain/models/publicTypes'
-import type {
-  PlannerConflictResolution,
-  PlannerInput,
-  PlannerResult,
+import {
+  defaultPlannerOptions,
+  type PlannerConflictResolution,
+  type PlannerInput,
+  type PlannerResult,
 } from '../domain/planner'
 import { PRODUCTION_RNG_ENGINE_VERSION } from '../domain/rng/production/productionRngEngine'
 import { appDatabase } from '../db/AppDatabase'
@@ -84,12 +87,17 @@ import {
 } from '../services/planner/plannerResultPersistenceService'
 import {
   createProductionPlanExecutionService,
+  type ProductionPlanContinuationInspection,
   type ProductionPlanStartInspection,
 } from '../services/execution/productionPlanExecutionService'
 import {
   createProductionPlanReplanDependencies,
   type ProductionPlanReplanDependencies,
 } from '../services/execution/productionPlanReplanDependencies'
+import {
+  createProductionRunningPlanReplanDependencies,
+  type RunningPlanReplanDependencies,
+} from '../services/execution/runningPlanReplanDependencies'
 import { useSettingsStore } from '../stores/settingsStore'
 import type { PlannerInteractionPreparationResult } from '../workers/plannerWorkerContracts'
 
@@ -139,18 +147,31 @@ export interface ProductionPlanPageDependencies {
    */
   inspectProductionPlanStart(planId: ProductionPlanId): Promise<ProductionPlanStartInspection>
   /**
+   * Whether the Plan can start or go on (Issue #334, `docs/UI_FLOW.md` 12.11):
+   * the CalculationContext, then the completion assignment safety, read in one
+   * read-only transaction. Never write authority.
+   */
+  inspectProductionPlanContinuation(planId: ProductionPlanId): Promise<ProductionPlanContinuationInspection>
+  /**
    * `draft -> active` and the Plan start Target links, in one Execution
    * runtime transaction (`docs/PLANNER_SPEC.md` 16.2 / 16.11).
    */
   startProductionPlan(planId: ProductionPlanId): Promise<ProductionPlan>
   /**
-   * 「現在地点から再計画を試算」 / 「この再計画を採用」 of an active or stale
-   * Plan (`docs/PLANNER_SPEC.md` 16.8, `docs/UI_FLOW.md` 16.4): the Preview
-   * input, the transient Preview, the read-only adoption inspection and the
-   * one adoption transaction. Kept apart from the Draft-only Conflict
-   * recalculation above.
+   * The ordinary Planner replan of an active or stale Plan
+   * (`docs/PLANNER_SPEC.md` 16.8, `docs/UI_FLOW.md` 16.4): the transient
+   * Preview, the read-only adoption inspection and the one adoption
+   * transaction. Since Issue #276 PR-6A it is reached only as the running Plan
+   * replan's explicit auxiliary 「登録済みの候補で再計画を試算」. Kept apart
+   * from the Draft-only Conflict recalculation above.
    */
   replan: ProductionPlanReplanDependencies
+  /**
+   * 「現在地点からの再計画」 of an active or stale Plan (`docs/PLANNER_SPEC.md`
+   * 18, `docs/UI_FLOW.md` 16.5, Issue #276 PR-6A): the target confirmation,
+   * the re-optimization session, its adoption and the auxiliary's input.
+   */
+  runningPlanReplan: RunningPlanReplanDependencies
 }
 
 function createDefaultDependencies(
@@ -176,8 +197,10 @@ function createDefaultDependencies(
         currentCalculationContext,
       ),
     inspectProductionPlanStart: (planId) => executionService.inspectProductionPlanStart(planId),
+    inspectProductionPlanContinuation: (planId) => executionService.inspectProductionPlanContinuation(planId),
     startProductionPlan: (planId) => executionService.startProductionPlan(planId),
     replan: createProductionPlanReplanDependencies(master, appDatabase, executionService),
+    runningPlanReplan: createProductionRunningPlanReplanDependencies(master, appDatabase, executionService),
   }
 }
 
@@ -368,22 +391,24 @@ export function ProductionPlanPage({
   // adoption) re-reads the exact persisted Plan through the ordinary lifecycle.
   const [planReloadSequence, setPlanReloadSequence] = useState(0)
 
-  // The 16.8 replan Preview / adoption of an active or stale Plan. Its state
-  // machine and its Planner Worker are its own: the Draft-only Conflict
-  // recalculation (`replanState`) and what-if never share them.
-  const executionReplan = useProductionPlanReplanPreview({
-    replan: dependencies?.replan ?? unavailableReplanDependencies,
-    createWorkerClient: () => {
+  // 「現在地点からの再計画」 of an active or stale Plan (UI_FLOW 16.5, Issue
+  // #276 PR-6A). Its session, its Worker and its auxiliary's ordinary Planner
+  // Worker are its own: the Draft-only Conflict recalculation (`replanState`)
+  // never shares them.
+  const executionReplan = useRunningPlanReplan({
+    dependencies: dependencies?.runningPlanReplan ?? null,
+    ordinaryReplan: dependencies?.replan ?? unavailableReplanDependencies,
+    createPlannerWorkerClient: () => {
       if (!dependencies) throw new Error('マスターデータを読み込めません。')
       return dependencies.createWorkerClient()
     },
     // The new Plan is `active` now: its Execution Navigator, never this page.
-    onAdopted: (result) => void navigate(`/plans/${result.newPlan.id}/run`),
-    onRunningPlanChanged: () => setPlanReloadSequence((sequence) => sequence + 1),
+    onAdopted: (newPlanId) => void navigate(`/plans/${newPlanId}/run`),
+    onPersistedStateChanged: () => setPlanReloadSequence((sequence) => sequence + 1),
   })
-  const discardExecutionReplan = executionReplan.discard
-  // A Preview belongs to the Plan it was started from; another route Plan drops it.
-  useEffect(() => () => discardExecutionReplan(), [planId, discardExecutionReplan])
+  const closeExecutionReplan = executionReplan.closePanel
+  // A replan belongs to the Plan it was opened from; another route Plan closes it.
+  useEffect(() => () => closeExecutionReplan(), [planId, closeExecutionReplan])
 
   // The start preview is read only for a draft that can start: never for a
   // stale or ended Plan, and never after the start, so no future-tense link
@@ -826,6 +851,37 @@ export function ProductionPlanPage({
         ? state.plan
         : null
 
+  // Whether the draft can start / the running Plan can go on, as the runtime
+  // judges it (Issue #334, `docs/UI_FLOW.md` 12.11): read for every Plan that
+  // could still advance, and re-read whenever that Plan or the persisted state
+  // changes. Display only - the start and every Step re-judge on their own.
+  const continuationPlanKey =
+    loadedPlan !== null && (loadedPlan.status === 'draft' || loadedPlan.status === 'active' || loadedPlan.status === 'stale')
+      ? `${loadedPlan.id}\u0000${loadedPlan.status}\u0000${loadedPlan.updatedAt}\u0000${planReloadSequence}`
+      : null
+  const continuationPlanId = loadedPlan?.id ?? null
+  const [continuation, setContinuation] = useState<{ key: string; inspection: ProductionPlanContinuationInspection } | null>(null)
+  useEffect(() => {
+    if (!dependencies || continuationPlanKey === null || continuationPlanId === null) return
+    let active = true
+    dependencies.inspectProductionPlanContinuation(continuationPlanId).then(
+      (inspection) => {
+        if (active) setContinuation({ key: continuationPlanKey, inspection })
+      },
+      () => {
+        // A failed read shows nothing extra; the runtime still refuses an unsafe Plan.
+        if (active) setContinuation(null)
+      },
+    )
+    return () => {
+      active = false
+    }
+  }, [dependencies, continuationPlanKey, continuationPlanId])
+  const completionAssignmentConflict =
+    continuation !== null && continuation.key === continuationPlanKey && continuation.inspection.continuation.kind === 'completion_assignment_conflict'
+      ? { ...continuation.inspection, issues: continuation.inspection.continuation.issues }
+      : null
+
   // Persisted `ProductionPlan.conflicts` is the Conflict display authority in
   // every state that holds the exact persisted Plan (UI_FLOW 11.0): the list
   // never disappears because the Worker preparation is still running or has
@@ -948,6 +1004,14 @@ export function ProductionPlanPage({
     </>
   )
 
+  // Whether 「競合と解決」 is shown at all (Issue #359, UI_FLOW 11.6.8): the
+  // display says whether the exact persisted Plan and the typed preparation
+  // leave anything to say, and a 「この候補を優先」 notice of this page keeps
+  // the section too. The preparation indicator only says whether a participant
+  // can be preferred, so it goes with the section.
+  const conflictSectionShown =
+    conflictDisplay !== null && (conflictDisplay.needed || replanState.status !== 'idle')
+
   // The Worker preparation indicator and the Conflict section. The page keeps
   // building and owning them - every preparation / preference state and
   // handler stays here - and only hands the node to the read-only Plan view,
@@ -955,14 +1019,14 @@ export function ProductionPlanPage({
   // (UI_FLOW 11.0, Issue #121). Presentation order only.
   const conflictSection = (
     <>
-      {state.status === 'preparing' && (
+      {state.status === 'preparing' && conflictSectionShown && (
         <Stack spacing={1} role="status" aria-live="polite">
           <LinearProgress aria-label="現在のPlanner入力を準備中" />
           <Typography variant="body2">現在の保存状態から操作可否を確認しています。</Typography>
         </Stack>
       )}
 
-      {conflictDisplay !== null && (
+      {conflictDisplay !== null && conflictSectionShown && (
         <PlanPageSection title="競合と解決">
           <ProductionPlanConflictSection
             display={conflictDisplay}
@@ -1039,12 +1103,36 @@ export function ProductionPlanPage({
             </Stack>
           </Alert>
         )}
+        {loadedPlan && completionAssignmentConflict !== null && (
+          // Issue #334 (`docs/UI_FLOW.md` 12.11): one weapon would complete two
+          // Targets, so a draft cannot start and a running Plan cannot go on.
+          <CompletionAssignmentConflictAlert
+            title={loadedPlan.status === 'draft' ? 'この生産計画は開始できません' : 'この生産計画は続行できません'}
+            issues={completionAssignmentConflict.issues}
+            names={completionAssignmentNamesOf(completionAssignmentConflict.targetWeapons, completionAssignmentConflict.ownedWeapons)}
+            debugMode={debugMode}
+            recovery={
+              loadedPlan.status === 'draft' ? (
+                <Typography variant="body2">作成リストで候補を見直してから、生産計画を作成し直してください。</Typography>
+              ) : (
+                <>
+                  <Typography variant="body2">{COMPLETION_ASSIGNMENT_REPLAN_NOTE}</Typography>
+                  <Typography variant="body2">
+                    再計画できない場合は、実行ナビの「実行状態の管理」の「現在Planを破棄する」で計画を終了できます。
+                  </Typography>
+                </>
+              )
+            }
+            links={loadedPlan.status === 'draft' ? [{ label: '作成リストへ', to: '/build-list' }] : []}
+          />
+        )}
         {loadedPlan && state.status !== 'stale' && (
           <PlanExecutionEntry
             plan={loadedPlan}
             starting={startState.status === 'starting'}
             startError={startState.status === 'failure' ? startState.message : null}
             startPreview={startPreviewState}
+            completionAssignmentBlocked={completionAssignmentConflict !== null}
             onRetryStartPreview={() => setStartPreviewAttempt((attempt) => attempt + 1)}
             onStart={() => void startPlan(loadedPlan)}
           />
@@ -1054,13 +1142,15 @@ export function ProductionPlanPage({
             an ended Plan offers nothing. The runtime decides every refusal. */}
         {dependencies && loadedPlan && (loadedPlan.status === 'active' || loadedPlan.status === 'stale') && (
           <PlanPageSection title="現在地点からの再計画">
-            <ProductionPlanReplanPreviewPanel
+            {/* This page has no ordinary Planner detail setting: the auxiliary
+                uses the default 「最大計画ステップ数」, as the 16.4 replan of
+                this page always did. */}
+            <RunningPlanReplanPanel
               controller={executionReplan}
-              runningPlan={loadedPlan}
-              targetWeapons={targetWeapons}
               master={dependencies.master}
               debugMode={debugMode}
-              onStart={() => executionReplan.start(loadedPlan.id)}
+              plannerOptions={defaultPlannerOptions}
+              runningPlan={loadedPlan}
             />
           </PlanPageSection>
         )}

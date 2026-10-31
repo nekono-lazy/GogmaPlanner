@@ -1,13 +1,10 @@
 import type { ArtianBonusScope, MasterDataRoot } from '../../domain/master/masterTypes'
 import type {
-  BuildCandidate,
-  IntermediateStateOpportunity,
   RestorationBonus,
   SkillCondition,
 } from '../../domain/models/publicTypes'
 import { skillMatchModeLabels } from '../../presentation/labels'
 export {
-  compromiseCheckpointBadgeLabel,
   getRouteOperationLabel as operationLabel,
   routeKindLabels,
   skippedRouteReasonLabels,
@@ -21,8 +18,7 @@ export {
  * (`docs/MASTER_DATA.md`): a normal-tier and a Gogma-tier slot of the same
  * bonus type are different `WeaponBonusDefinition`s. Callers that know the
  * scope of the slots they render - a Candidate's `restorationBonusScope`, a
- * trace step's `restorationBonusScope`, a checkpoint group's
- * `restorationBonusScope` - pass it so the matching definition's own label is
+ * trace step's `restorationBonusScope` - pass it so the matching definition's own label is
  * used. When no scope is given, the historical lookup (Gogma definition, then
  * the generic type + rank label) is kept unchanged for existing call sites.
  * No scope is ever inferred here from an ID pattern.
@@ -92,42 +88,7 @@ export function skillConditionSummary(
   if (parts.length === 0) return '指定なし'
   return parts.length > 1
     ? `${parts.join(' ／ ')}（${skillMatchModeLabels[condition.matchMode]}）`
-    : parts[0]
-}
-
-const bonusOperationLabels = {
-  reset_bonuses: '再抽選',
-  keep_bonuses: '保持して再抽選',
-} as const
-
-/** The lane position of one intermediate state, in the words of the game operation. */
-export function intermediateOpportunityLabel(
-  candidate: BuildCandidate,
-  opportunity: IntermediateStateOpportunity,
-): string {
-  const hasConversion = candidate.route.operations.some(
-    ({ type }) => type === 'convert_normal_to_gogma',
-  )
-  if (opportunity.axis === 'skill') {
-    if (opportunity.lanePosition === 0) {
-      return hasConversion
-        ? '巨戟化直後のスキル（スキルリセット0回）'
-        : '現在のスキルのまま（スキルリセット0回）'
-    }
-    return `スキルリセット${opportunity.lanePosition}回目の直後`
-  }
-  if (opportunity.lanePosition === 0) {
-    return '現在の復元ボーナスのまま（復元ボーナス操作0回）'
-  }
-  const operation =
-    opportunity.operationIndex === null
-      ? undefined
-      : candidate.route.operations[opportunity.operationIndex]
-  const operationLabel =
-    operation?.type === 'reset_bonuses' || operation?.type === 'keep_bonuses'
-      ? `（${bonusOperationLabels[operation.type]}）`
-      : ''
-  return `復元ボーナス操作${opportunity.lanePosition}回目${operationLabel}の直後`
+    : parts[0]!
 }
 
 export function materialLabel(id: string, master: MasterDataRoot): string {

@@ -14,9 +14,16 @@ import {
   type DomainValidationIssue,
 } from '../../domain/models/publicTypes'
 import {
+  serializeExportRoot,
+  summarizeExportRoot,
+  type ExportBackup,
+} from './exportBackup'
+import {
   validateExportRootForFullReplacement,
   type ImportMasterSubset,
 } from './importExportValidation'
+
+export type { ExportBackup, ExportSummary } from './exportBackup'
 
 /*
  * The Persistence / Application foundation of `docs/REQUIREMENTS.md` 4 / 30
@@ -144,7 +151,12 @@ export class ImportExportService {
         buildCandidates: sortedById(await database.buildCandidates.toArray()),
         buildListEntries: sortedById(await database.buildListEntries.toArray()),
         productionPlans: sortedById(await database.productionPlans.toArray()),
+        // The rows as stored: a record the Dexie version 11 upgrade could not
+        // convert fails the validation below (`export_state_invalid`) instead
+        // of being left out of the backup.
         executionHistory: sortedById(await database.executionHistory.toArray()),
+        executionUndoSnapshots: (await database.executionUndoSnapshots.toArray())
+          .sort((left, right) => compareIds(left.executionHistoryId, right.executionHistoryId)),
         executionSavePoints: sortedById(await database.executionSavePoints.toArray()),
         settings: await database.settings.get('settings'),
       }))
@@ -176,9 +188,21 @@ export class ImportExportService {
     return root
   }
 
-  /** The Export root as human-readable UTF-8 JSON text. */
+  /** The Export root as compact JSON text (`docs/PLANNER_SPEC.md` 19.9). */
   async serializeExport(): Promise<string> {
-    return JSON.stringify(await this.exportRoot(), null, 2)
+    return serializeExportRoot(await this.exportRoot())
+  }
+
+  /**
+   * One Export for the Settings screen: the root is built and validated once,
+   * serialized once, and summarized from that same root. The summary carries
+   * only counts, so the caller keeps the JSON text and no entity object, and
+   * never parses the text again to describe it.
+   */
+  async exportBackup(): Promise<ExportBackup> {
+    const root = await this.exportRoot()
+    const json = serializeExportRoot(root)
+    return { json, summary: summarizeExportRoot(root, json) }
   }
 
   /**
@@ -205,7 +229,7 @@ export class ImportExportService {
 
   /**
    * Import step 2 + 3 over a parsed value: the existing schema migration and
-   * current-schema validation (`prepareExportRootForImport()`, schema 6..10),
+   * current-schema validation (`prepareExportRootForImport()`, schema 6..13),
    * then the full-replacement validation. Nothing is written; the returned root
    * is the migrated, validated copy the UI shows for confirmation and later
    * hands to `applyImport()`.
@@ -252,6 +276,7 @@ export class ImportExportService {
         await database.buildListEntries.bulkAdd(root.buildListEntries)
         await database.productionPlans.bulkAdd(root.productionPlans)
         await database.executionHistory.bulkAdd(root.executionHistory)
+        await database.executionUndoSnapshots.bulkAdd(root.executionUndoSnapshots)
         await database.executionSavePoints.bulkAdd(root.executionSavePoints)
         await database.settings.add(root.settings)
       })
@@ -299,6 +324,7 @@ async function clearUserTables(database: AppDatabase): Promise<void> {
   await database.buildListEntries.clear()
   await database.productionPlans.clear()
   await database.executionHistory.clear()
+  await database.executionUndoSnapshots.clear()
   await database.executionSavePoints.clear()
   await database.settings.clear()
 }

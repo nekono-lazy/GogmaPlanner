@@ -4,6 +4,7 @@ import type { ExecutionNormalRestorationBonusObservation } from '../../domain/ex
 import type { MasterDataRoot } from '../../domain/master/masterTypes'
 import type { RestorationBonusSet } from '../../domain/models/publicTypes'
 import { BonusSetEditor } from '../forms/BonusSetEditor'
+import { ExecutionFocusFrame } from './ExecutionFocusFrame'
 
 /** Five unfilled slots: an observation never starts from a fabricated value. */
 function unfilledSlots(): RestorationBonusSet {
@@ -43,20 +44,30 @@ export function BlindObservationForm({
       <Alert severity="info">
         これは予測ではなく、ゲーム画面で確認した実際の5枠です。
       </Alert>
-      <BonusSetEditor
-        label="実際の復元ボーナス5枠"
-        master={master}
-        weaponTypeId={weaponTypeId}
-        elementId={elementId}
-        scope="normal_artian"
-        value={slots}
-        onChange={setSlots}
-      />
-      {!complete && (
-        <Typography variant="body2" color="text.secondary">
-          5枠すべてのボーナス種別とランクを入力すると確定できます。
-        </Typography>
-      )}
+      {/*
+        * Issue #318: the entry is the result this Step compares, so it takes
+        * the same frame as an expected result to compare. It is an
+        * observation, never a prediction: the editor's own heading names it,
+        * and the confirmation stays outside the frame like every other Step's.
+        */}
+      <ExecutionFocusFrame label="実際の復元ボーナス5枠の入力">
+        <Stack spacing={1.5}>
+          <BonusSetEditor
+            label="実際の復元ボーナス5枠"
+            master={master}
+            weaponTypeId={weaponTypeId}
+            elementId={elementId}
+            scope="normal_artian"
+            value={slots}
+            onChange={setSlots}
+          />
+          {!complete && (
+            <Typography variant="body2" color="text.secondary">
+              5枠すべてのボーナス種別とランクを入力すると確定できます。
+            </Typography>
+          )}
+        </Stack>
+      </ExecutionFocusFrame>
       <Button
         variant="contained"
         size="large"

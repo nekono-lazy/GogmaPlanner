@@ -5,7 +5,9 @@
  * It re-implements no scheduler, Trace Replay, Target satisfaction or Counter advance. In order:
  *
  * 1. the final input: each generated Entry replaces its Target's one persisted Entry through the replacement authority
- *    (`resolveBuildListEntryReplacement()` / `applyBuildListEntryReplacements()` / `validateBuildListEntryReplacements()`); a generated
+ *    (`resolveBuildListEntryReplacement()` / `applyBuildListEntryReplacements()` / `validateBuildListEntryReplacements()`) - or, in the
+ *    running Plan replan re-optimization (18.6, `replace_or_add`), is added for a Target that holds no Entry
+ *    (`validateBuildListEntryAdditions()`); a generated
  *    Entry that is the Target's own Entry (the deterministic materializer's same-semantic reuse) leaves it unchanged; every other
  *    Entry is kept; `conflictResolutions = []`; `options.maxPlanSteps` = the Domain's derived bound; Targets, OwnedWeapons, RNG state,
  *    Normal Counters, CalculationContext and Master are untouched;
@@ -22,7 +24,8 @@
  * Conflict, keeps a lineage or persists anything.
  */
 import {
-  applyBuildListEntryReplacements, resolveBuildListEntryReplacement, validateBuildListEntryReplacements, type BuildListEntryReplacement,
+  applyBuildListEntryReplacements, resolveBuildListEntryReplacement, validateBuildListEntryAdditions, validateBuildListEntryReplacements,
+  type BuildListEntryAddition, type BuildListEntryReplacement,
 } from '../../buildList/buildListEntryReplacement'
 import { stableStringify } from '../../models/publicTypes'
 import type { BuildListEntry, BuildListEntryId, TargetWeaponId } from '../../models/publicTypes'
@@ -69,13 +72,25 @@ export function deriveBuildListOptimizationMaxPlanSteps(structuralObjective: num
   return bound
 }
 
-/** The final input of Stage D' and what it replaced. */
+/**
+ * How Stage D' places a generated Entry in the final input.
+ *
+ * - `replace_only`: the Build List global optimization (`docs/PLANNER_SPEC.md` 17.11): every planning Target holds exactly one
+ *   persisted Entry (its valid Entry), so a generated Entry always replaces it; a Target without an Entry is an internal inconsistency
+ * - `replace_or_add`: the running Plan replan re-optimization (18.6): a replan Target's current Entry is replaced (stale or not), and a
+ *   replan Target that holds no Entry gets its generated Entry added (`BuildListEntryAddition`), never an invented replacement
+ */
+export type BuildListOptimizationEntryChangeRule = 'replace_only' | 'replace_or_add'
+
+/** The final input of Stage D' and what it replaced or added. */
 export interface BuildListOptimizationFinalInput {
   input: PlannerInput
-  /** The Entries that replace a persisted Entry, in materialization order. */
+  /** The generated Entries that replace a persisted Entry or (`replace_or_add` only) are added, in materialization order. */
   generatedBuildListEntries: BuildListEntry[]
-  /** One per generated Entry, in the same order. */
+  /** One per generated Entry that replaces a persisted Entry, in materialization order. */
   replacements: BuildListEntryReplacement[]
+  /** One per generated Entry added for a Target without an Entry, in materialization order (always empty under `replace_only`). */
+  additions: BuildListEntryAddition[]
   /** Targets whose generated Entry is their persisted Entry (same semantic content), in materialization order. */
   unchangedTargetWeaponIds: TargetWeaponId[]
   /** Every planning Target's Entry in the final input (generated and reused), in materialization order. */
@@ -90,14 +105,17 @@ function finalInputInvariant(message: string): never {
  * The final input of one candidate's generated Routes (`routes`, in materialization order, one per planning Target). The replacement
  * is the Production authority's alone: a generated Entry names the one persisted Entry of its Target it replaces, the replacement set
  * removes exactly those and adds the generated Entries once. A Route equal to the Target's persisted Entry (the materializer reused
- * it) is no replacement. Anything else is an internal inconsistency of Stage D and fails closed.
+ * it) is no replacement. Under `replace_or_add` (18.6), a generated Entry whose Target holds no persisted Entry - and only that case of
+ * the replacement authority's refusals - is an addition. Anything else is an internal inconsistency of Stage D and fails closed.
  */
-export function buildBuildListOptimizationFinalInput(original: PlannerInput, routes: readonly BuildListEntry[], maxPlanSteps: number): BuildListOptimizationFinalInput {
+export function buildBuildListOptimizationFinalInput(original: PlannerInput, routes: readonly BuildListEntry[], maxPlanSteps: number,
+  entryChanges: BuildListOptimizationEntryChangeRule = 'replace_only'): BuildListOptimizationFinalInput {
   const persisted = original.buildListEntries
   const persistedById = new Map(persisted.map(entry => [entry.id as string, entry]))
   const seenTargets = new Set<string>()
   const generated: BuildListEntry[] = []
   const replacements: BuildListEntryReplacement[] = []
+  const additions: BuildListEntryAddition[] = []
   const unchanged: TargetWeaponId[] = []
   for (const entry of routes) {
     if (seenTargets.has(entry.targetWeaponId)) finalInputInvariant(`Target ${entry.targetWeaponId} has two generated Routes.`)
@@ -112,17 +130,28 @@ export function buildBuildListOptimizationFinalInput(original: PlannerInput, rou
       continue
     }
     const resolution = resolveBuildListEntryReplacement(persisted, entry)
-    if (resolution.status !== 'ready') finalInputInvariant(`${resolution.reason}: ${resolution.detail}`)
-    generated.push(entry)
-    replacements.push(resolution.replacement)
+    if (resolution.status === 'ready') {
+      generated.push(entry)
+      replacements.push(resolution.replacement)
+      continue
+    }
+    if (entryChanges === 'replace_or_add' && resolution.reason === 'replaced_entry_missing') {
+      generated.push(entry)
+      additions.push({ targetWeaponId: entry.targetWeaponId, generatedBuildListEntryId: entry.id })
+      continue
+    }
+    finalInputInvariant(`${resolution.reason}: ${resolution.detail}`)
   }
   const finalEntries = applyBuildListEntryReplacements(persisted, replacements, generated)
   const placement = validateBuildListEntryReplacements(finalEntries, replacements, 'replaced')
   if (!placement.isValid) finalInputInvariant(placement.issues.map(issue => issue.message).join(' '))
+  const added = validateBuildListEntryAdditions(finalEntries, additions, replacements)
+  if (!added.isValid) finalInputInvariant(added.issues.map(issue => issue.message).join(' '))
   return {
     input: { ...structuredClone(original), buildListEntries: structuredClone(finalEntries), conflictResolutions: [], options: { maxPlanSteps } },
     generatedBuildListEntries: generated.map(entry => structuredClone(entry)),
     replacements,
+    additions,
     unchangedTargetWeaponIds: unchanged,
     routeEntryIds: routes.map(entry => entry.id),
   }
@@ -172,6 +201,8 @@ export interface FinalVerificationInputs {
   inputExclusions: readonly BuildListOptimizationInputExclusion[]
   /** Stage D's output for the candidate: every planning Target generated. */
   generation: StructuralCandidateRouteGeneration
+  /** How a generated Entry enters the final input; `replace_only` (17) unless the scope says otherwise (18.6: `replace_or_add`). */
+  entryChanges?: BuildListOptimizationEntryChangeRule
   /** The Production Planner's own dependencies (ID factory and Clock: the Plan's IDs and times are the Production ones). */
   dependencies: PlannerDependencies
   shouldCancel?: () => boolean
@@ -212,7 +243,7 @@ export async function verifyBuildListOptimizationCandidate(inputs: FinalVerifica
     throw new BuildListOptimizationInvariantError('stage_contract_violation', `The generated Routes cover [${[...routeTargets].sort(compareCodeUnits).join(', ')}], not the planning Targets [${planningIds.join(', ')}].`)
   }
   const maxPlanSteps = deriveBuildListOptimizationMaxPlanSteps(generation.objective, planningIds.length)
-  const final = buildBuildListOptimizationFinalInput(context.plannerInput, generation.generatedEntries, maxPlanSteps)
+  const final = buildBuildListOptimizationFinalInput(context.plannerInput, generation.generatedEntries, maxPlanSteps, inputs.entryChanges ?? 'replace_only')
   const rejected = (rejections: BuildListOptimizationVerificationRejection[], fullPlannerRuns: number): FinalVerificationOutcome => ({ kind: 'rejected', rejections, maxPlanSteps, fullPlannerRuns })
 
   // 2. The final input's validation, planning Target set and exclusions (decided before the Planner runs).

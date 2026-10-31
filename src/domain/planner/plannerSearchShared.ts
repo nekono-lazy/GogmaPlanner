@@ -10,9 +10,9 @@ import { stableStringify } from '../models/publicTypes'
 import {
   conflictResolutionRefusalReason,
   detectPlannerConflicts,
+  plannerEntryCompletionWeaponId,
   type PlannerConflictDetectionResult,
 } from './plannerConflictDetection'
-import type { PlannerCheckpointRequirements } from './plannerCheckpoints'
 import { entryIsRelevantForState } from './plannerEntryRelevance'
 import {
   initialPlannerLaneProgress,
@@ -93,11 +93,8 @@ export function detectCurrentPlannerConflicts(
   allLanePlans: ReadonlyMap<BuildListEntryId, PlannerEntryLanes>,
   targets: readonly TargetWeapon[],
   resolutions: readonly PlannerConflictResolution[],
-  requirements: PlannerCheckpointRequirements,
 ): PlannerConflictDetectionResult {
-  const entries = allSearchEntries.filter((entry) =>
-    entryIsRelevantForState(state, entry, requirements),
-  )
+  const entries = allSearchEntries.filter((entry) => entryIsRelevantForState(state, entry))
   const unitPlans = new Map(
     entries.flatMap((entry) => {
       const lanes = allLanePlans.get(entry.id)
@@ -127,8 +124,7 @@ export function plannerConflictResolutionWarnings(
   conflictsById: ReadonlyMap<string, PlanConflict>,
 ): PlannerWarning[] {
   return resolutions.flatMap((resolution) => {
-    // The same refusal authority the detection applied, so a resolution that
-    // targets a selected-checkpoint conflict is reported here too.
+    // The same refusal authority the detection applied.
     const reason = conflictResolutionRefusalReason(
       resolution,
       conflictsById.get(resolution.conflictKey),
@@ -182,7 +178,6 @@ export function pendingPlannerReserveEntries(
   state: PlannerSearchState,
   entriesById: ReadonlyMap<BuildListEntryId, BuildListEntry>,
   lanePlans: ReadonlyMap<BuildListEntryId, PlannerEntryLanes>,
-  requirements: PlannerCheckpointRequirements,
 ): BuildListEntry[] {
   let index = state.trace.length - 1
   while (index >= 0 && state.trace[index].kind === 'reserve_candidate') index -= 1
@@ -197,7 +192,7 @@ export function pendingPlannerReserveEntries(
       if (state.selectedBuildListEntryIds.includes(entryId)) return []
       const progress = state.routeProgressByEntryId[entryId] ?? initialPlannerLaneProgress()
       if (!isPlannerLaneRouteComplete(lanes, progress)) return []
-      return entryIsRelevantForState(state, entry, requirements) ? [entry] : []
+      return entryIsRelevantForState(state, entry) ? [entry] : []
     })
 }
 
@@ -216,20 +211,66 @@ export interface PlannerZeroOperationConfirmContext {
   readonly allSearchEntries: readonly BuildListEntry[]
   readonly allLanePlans: ReadonlyMap<BuildListEntryId, PlannerEntryLanes>
   readonly planningTargetsById: ReadonlyMap<TargetWeaponId, TargetWeapon>
-  readonly checkpointRequirements: PlannerCheckpointRequirements
   readonly reserveContext: PlannerReserveActionContext
+  /**
+   * Which zero-operation Entries this pass may confirm. Omitted, every one is
+   * confirmed. The deterministic scheduler confirms only the Entries its Route
+   * commitment committed; the Beam Search oracle confirms only the Entries no
+   * other Entry collides with on their weapon and explores the rest as
+   * ordinary expansions (Issue #334 PR-3, `docs/PLANNER_SPEC.md` 21.5).
+   */
+  readonly canConfirm?: (entry: BuildListEntry) => boolean
 }
 
 /**
- * A zero-operation Candidate whose owned Gogma already satisfies its active
- * Target is confirmed, not silently dropped as already satisfied: it becomes
- * one `confirm_owned_ideal` Step that advances no Counter and completes the
- * Target (`docs/PLANNER_SPEC.md` 16.3). It changes no RNG state, so it is
+ * Whether a zero-operation Candidate: an `existing_gogma_current` Route with no
+ * unit, whose confirmation is its Target's completion (`docs/PLANNER_SPEC.md`
+ * 16.3).
+ */
+export function isPlannerZeroOperationEntry(
+  entry: BuildListEntry,
+  lanes: PlannerEntryLanes | undefined,
+): boolean {
+  return (
+    lanes !== undefined &&
+    lanes.unitCount === 0 &&
+    entry.candidateSnapshot.route.kind === 'existing_gogma_current'
+  )
+}
+
+/**
+ * The Entries whose completed weapon (`plannerEntryCompletionWeaponId()`) is
+ * also another Entry's completed weapon: the participants of a
+ * `same_owned_weapon_consumed` collision of the Route commitment (Issue #334
+ * PR-3, `docs/PLANNER_SPEC.md` 21.5).
+ */
+export function plannerEntriesSharingCompletionWeapon(
+  entries: readonly BuildListEntry[],
+): ReadonlySet<BuildListEntryId> {
+  const byWeapon = new Map<string, BuildListEntryId[]>()
+  entries.forEach((entry) => {
+    const weaponId = plannerEntryCompletionWeaponId(entry)
+    if (weaponId === null) return
+    byWeapon.set(weaponId, [...(byWeapon.get(weaponId) ?? []), entry.id])
+  })
+  return new Set([...byWeapon.values()].filter((ids) => ids.length > 1).flat())
+}
+
+/**
+ * A zero-operation Candidate is confirmed as its Target's own completion: it
+ * becomes one `confirm_owned_ideal` Step that advances no Counter and completes
+ * the Target (`docs/PLANNER_SPEC.md` 16.3). It changes no RNG state, so it is
  * applied before any other action, one Entry per Target in stable ID order.
  *
+ * Whether the Entry's own weapon satisfies its Target now, is the completion of
+ * another Target, or was secured by another Entry is judged by the reserve
+ * itself (`applyPlannerReserveAction()`), the one authority shared with the
+ * Trace Replay; a confirmation it refuses is reported through `onRejection`
+ * and writes nothing. No other owned weapon's performance takes part (Issue
+ * #334 PR-3, `docs/PLANNER_SPEC.md` 21.5).
+ *
  * Returns the state after every confirmation: a new state in `clone` mode, the
- * given state itself in `in_place` mode. A rejected confirmation is reported
- * through `onRejection` and writes nothing.
+ * given state itself in `in_place` mode.
  *
  * With a `bound`, a confirmation the bound refuses is withheld and reported,
  * every one already applied is kept, and the stable order never changes: once
@@ -247,19 +288,11 @@ export function applyPlannerZeroOperationConfirms(
   let current = state
   const confirmedTargetIds = new Set<TargetWeaponId>()
   for (const entry of context.allSearchEntries) {
-    const lanes = context.allLanePlans.get(entry.id)
-    if (
-      lanes === undefined ||
-      lanes.unitCount !== 0 ||
-      entry.candidateSnapshot.route.kind !== 'existing_gogma_current'
-    ) continue
-    const required = context.checkpointRequirements.requiredEntryIdByTargetId.get(
-      entry.targetWeaponId,
-    )
-    if (required !== undefined && required !== entry.id) continue
+    if (!isPlannerZeroOperationEntry(entry, context.allLanePlans.get(entry.id))) continue
+    if (context.canConfirm !== undefined && !context.canConfirm(entry)) continue
     const target = context.planningTargetsById.get(entry.targetWeaponId)
     if (!target || confirmedTargetIds.has(target.id)) continue
-    if (current.targetSatisfaction[target.id]?.hasIdeal !== true) continue
+    if (current.selectedBuildListEntryIds.includes(entry.id)) continue
     if (bound !== undefined && !bound.canApply()) {
       bound.onWithheld(target.id)
       confirmedTargetIds.add(target.id)
