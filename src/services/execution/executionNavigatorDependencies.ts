@@ -28,6 +28,7 @@ import {
   createProductionPlanExecutionService,
   type ConfirmExpectedPlanStepRequest,
   type ConfirmExpectedPlanStepResult,
+  type ConfirmPlanStepOnAlternateWeaponRequest,
   type AbandonProductionPlanRequest,
   type AbandonProductionPlanResult,
   type ExecutionStepRecordResult,
@@ -68,6 +69,13 @@ export interface ExecutionNavigatorSnapshot {
   /** The Plan's game save point, or `null` when none was recorded. */
   executionSavePoint: ExecutionSavePoint | null
   /**
+   * The metadata of every ExecutionHistory record of the Plan, from this same
+   * read (`docs/DATA_MODEL.md` 14.6: no Undo body). Display only: the weapon
+   * switch guidance reads which completed Steps were performed on an unneeded
+   * weapon (`executed_on_alternate_weapon`, `docs/UI_FLOW.md` 12.6 / 12.12).
+   */
+  planExecutionHistory: ExecutionHistory[]
+  /**
    * Whether Current Position Recovery applies and its Recovery Window
    * (`docs/PLANNER_SPEC.md` 16.15), derived from this same read. Display only:
    * the recovery transaction derives it again.
@@ -98,6 +106,8 @@ export interface ExecutionNavigatorPageDependencies {
   /** The exact persisted Plan of the route and its display data; `null` when the Plan does not exist. */
   loadSnapshot(planId: ProductionPlanId): Promise<ExecutionNavigatorSnapshot | null>
   confirmExpectedPlanStep(request: ConfirmExpectedPlanStepRequest): Promise<ConfirmExpectedPlanStepResult>
+  /** 「スキル再付与済み・次へ」 (`docs/UI_FLOW.md` 12.12): the Skill Counter alone advances. */
+  confirmPlanStepOnAlternateWeapon(request: ConfirmPlanStepOnAlternateWeaponRequest): Promise<ExecutionStepRecordResult>
   recordActualResultDifferent(request: RecordActualResultDifferentRequest): Promise<ExecutionStepRecordResult>
   recordOperationUncertain(request: RecordOperationUncertainRequest): Promise<ExecutionStepRecordResult>
   recoverOperationCount(request: RecoverOperationCountRequest): Promise<ExecutionStepRecordResult>
@@ -150,6 +160,7 @@ export async function loadExecutionNavigatorSnapshot(
     normalCounters,
     latestExecutionHistory,
     executionSavePoint: savePoint,
+    planExecutionHistory,
     operationCountRecovery: deriveOperationCountRecovery(plan, { ownedWeapons, planExecutionHistory }),
     undo: inspectExecutionUndo(plan, latestExecutionHistory, latestUndoSnapshot, savePoint),
     savePointRestore: inspectExecutionSavePointRestore(plan, savePoint, planExecutionHistory, currentCalculationContext),
@@ -173,6 +184,7 @@ export function createExecutionNavigatorDependencies(
     currentCalculationContext,
     loadSnapshot: (planId) => loadExecutionNavigatorSnapshot(database, planId, currentCalculationContext),
     confirmExpectedPlanStep: (request) => service.confirmExpectedPlanStep(request),
+    confirmPlanStepOnAlternateWeapon: (request) => service.confirmPlanStepOnAlternateWeapon(request),
     recordActualResultDifferent: (request) => service.recordActualResultDifferent(request),
     recordOperationUncertain: (request) => service.recordOperationUncertain(request),
     recoverOperationCount: (request) => service.recoverOperationCount(request),

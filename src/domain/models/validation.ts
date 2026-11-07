@@ -2542,6 +2542,24 @@ function validateExecutionActionRecordFields(
         }
       }
       break
+    case 'executed_on_alternate_weapon':
+      if (!history.wasExpected) {
+        addIssue(issues, 'wasExpected', 'invalid_state', 'executed_on_alternate_weapon advances the Counter as expected.')
+      }
+      if (history.recalculationReason !== null) {
+        addIssue(issues, 'recalculationReason', 'invalid_state', 'executed_on_alternate_weapon has no recalculation reason.')
+      }
+      if (history.actualResult === null) {
+        addIssue(issues, 'actualResult', 'invalid_state', 'executed_on_alternate_weapon records the Skills the tracked weapon kept.')
+      } else {
+        if (history.actualResult.restorationBonuses !== null || history.actualResult.restorationBonusScope !== null) {
+          addIssue(issues, 'actualResult.restorationBonuses', 'invalid_state', 'executed_on_alternate_weapon records no five slots.')
+        }
+        if (history.actualResult.securedOwnedWeaponId !== null) {
+          addIssue(issues, 'actualResult.securedOwnedWeaponId', 'invalid_state', 'A current actual result secures no weapon.')
+        }
+      }
+      break
     default:
       break
   }
@@ -2567,8 +2585,9 @@ function validateExecutionActionEntitySets(
 ) {
   switch (action) {
     case 'operation_uncertain':
+    case 'executed_on_alternate_weapon':
       if (sets.changedEntities.some((entities) => entities.length > 0)) {
-        addIssue(issues, sets.changedEntitiesPath, 'invalid_state', 'operation_uncertain changes no OwnedWeapon or TargetWeapon.')
+        addIssue(issues, sets.changedEntitiesPath, 'invalid_state', `${action} changes no OwnedWeapon or TargetWeapon.`)
       }
       break
     case 'operation_count_recovered':

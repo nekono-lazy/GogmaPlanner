@@ -1,10 +1,12 @@
 import type {
+  GroupSkillId,
   NormalArtianCounter,
   OwnedWeaponId,
   PlanStepId,
   RestorationBonusScope,
   RestorationBonusSet,
   RngState,
+  SeriesSkillId,
   TargetWeaponId,
 } from './common'
 import { V1_NORMAL_ARTIAN_RARITY } from './common'
@@ -280,6 +282,7 @@ function compareStableIds(left: string, right: string): number {
 function normalizeExpectedOwnedWeapon(
   weapon: ExpectedPlanStateOwnedWeapon,
   token: PlanStepId | undefined,
+  skillOverride: ExpectedSkillOverride | undefined,
 ) {
   let restorationBonuses:
     | ExpectedStateObservationBindingToken
@@ -309,8 +312,8 @@ function normalizeExpectedOwnedWeapon(
     ? { ...common, rarity: weapon.rarity }
     : {
         ...common,
-        seriesSkillId: weapon.seriesSkillId,
-        groupSkillId: weapon.groupSkillId,
+        seriesSkillId: skillOverride === undefined ? weapon.seriesSkillId : skillOverride.seriesSkillId,
+        groupSkillId: skillOverride === undefined ? weapon.groupSkillId : skillOverride.groupSkillId,
       }
 }
 
@@ -381,13 +384,73 @@ export function resolveObservationBindingTokens(
 }
 
 /**
+ * One alternate-weapon Reset Skills execution still in force on a weapon
+ * (Issue #379, `docs/PLANNER_SPEC.md` 16.20): the latest completed Step that
+ * writes the weapon's Skills was performed on an unneeded weapon, so the
+ * tracked weapon kept the Skills it had (`retained*`) while the Plan's expected
+ * states assume the Step's predicted Skills (`expected*`).
+ */
+export interface RetainedSkillBinding {
+  ownedWeaponId: OwnedWeaponId
+  /** The alternate-weapon Step the binding comes from. */
+  planStepId: PlanStepId
+  retainedSeriesSkillId: SeriesSkillId | null
+  retainedGroupSkillId: GroupSkillId | null
+  expectedSeriesSkillId: SeriesSkillId | null
+  expectedGroupSkillId: GroupSkillId | null
+}
+
+/** The Skills a weapon normalizes to in an expected state (`resolveSkillRetentionOverrides()`). */
+export interface ExpectedSkillOverride {
+  seriesSkillId: SeriesSkillId | null
+  groupSkillId: GroupSkillId | null
+}
+
+/**
+ * Which actual weapons normalize their Skills to the Skills the Plan expects
+ * after an alternate-weapon Reset Skills (16.20).
+ *
+ * A weapon's Skills are replaced only when it is a Gogma weapon whose current
+ * Series / Group Skills equal exactly the Skills it retained at the binding
+ * Step. Anything else keeps its real value, so an unplanned edit of the
+ * weapon's Skills is detected as a mismatch instead of being hidden behind the
+ * expected value, exactly like an observation binding token.
+ */
+export function resolveSkillRetentionOverrides(
+  ownedWeapons: readonly OwnedWeapon[],
+  bindings: readonly RetainedSkillBinding[],
+): Map<OwnedWeaponId, ExpectedSkillOverride> {
+  const weaponById = new Map(ownedWeapons.map((weapon) => [weapon.id, weapon]))
+  const overrides = new Map<OwnedWeaponId, ExpectedSkillOverride>()
+  bindings.forEach((binding) => {
+    const weapon = weaponById.get(binding.ownedWeaponId)
+    if (
+      weapon !== undefined &&
+      weapon.kind === 'gogma' &&
+      weapon.seriesSkillId === binding.retainedSeriesSkillId &&
+      weapon.groupSkillId === binding.retainedGroupSkillId
+    ) {
+      overrides.set(binding.ownedWeaponId, {
+        seriesSkillId: binding.expectedSeriesSkillId,
+        groupSkillId: binding.expectedGroupSkillId,
+      })
+    }
+  })
+  return overrides
+}
+
+/**
  * One expected execution state (`docs/DATA_MODEL.md` 11.2).
  *
  * `observationBindingTokens` names the weapons whose five slots normalize to a
  * binding token. A Plan projection passes its still-bound weapons; an actual
  * state passes `resolveObservationBindingTokens()` so only an exact match of the
- * recorded observation is tokenized. `status`, `executionInProgress`, `name`,
- * `memo` and timestamps stay out of every hash.
+ * recorded observation is tokenized. `skillOverrides` names the weapons whose
+ * Series / Group Skills normalize to the Skills the Plan expects after an
+ * alternate-weapon Reset Skills (Issue #379, 16.20): only an actual state passes
+ * `resolveSkillRetentionOverrides()`, and a Plan projection never passes one.
+ * `status`, `executionInProgress`, `name`, `memo` and timestamps stay out of
+ * every hash.
  */
 export function createExpectedPlanState(
   rngState: RngState,
@@ -395,6 +458,7 @@ export function createExpectedPlanState(
   ownedWeapons: readonly ExpectedPlanStateOwnedWeapon[],
   targetExecution: ExpectedPlanTargetExecutionInput,
   observationBindingTokens: ReadonlyMap<OwnedWeaponId, PlanStepId> = new Map(),
+  skillOverrides: ReadonlyMap<OwnedWeaponId, ExpectedSkillOverride> = new Map(),
 ): ExpectedPlanState {
   const normalizedRngState = {
     baseSeed: normalizeKnownValue(rngState.baseSeed),
@@ -409,7 +473,7 @@ export function createExpectedPlanState(
     // A Target's preferred owned weapon is Target execution state, not
     // inventory state, so it never enters this hash.
     .map((weapon) =>
-      normalizeExpectedOwnedWeapon(weapon, observationBindingTokens.get(weapon.id)),
+      normalizeExpectedOwnedWeapon(weapon, observationBindingTokens.get(weapon.id), skillOverrides.get(weapon.id)),
     )
 
   return {

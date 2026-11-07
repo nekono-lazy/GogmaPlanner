@@ -15,6 +15,7 @@ import type {
 import { areRestorationBonusSlotsEqual } from '../models/publicTypes'
 import { executionFailure } from './executionRuntimeError'
 import {
+  collectPlanSkillRetentionBindings,
   createActualExecutionState,
   executionStateMatches,
   type ExecutableProductionPlanStep,
@@ -363,10 +364,10 @@ export function prepareExpectedStepConfirmation(
   const changes = collectEntityChanges(state, mutable)
   assertStepResultValid(changes, nextPlan)
 
-  const pendingBindings: ObservedRestorationBonusBinding[] = input.observation === null || effects.trackedOwnedWeaponId === null
-    ? bindings
+  const pendingObservations: ObservedRestorationBonusBinding[] = input.observation === null || effects.trackedOwnedWeaponId === null
+    ? [...bindings.observations]
     : [
-        ...bindings,
+        ...bindings.observations,
         {
           ownedWeaponId: effects.trackedOwnedWeaponId,
           planStepId: step.id,
@@ -383,7 +384,14 @@ export function prepareExpectedStepConfirmation(
       targetWeapons: changes.nextTargets,
       buildListEntries: state.buildListEntries,
     },
-    pendingBindings,
+    {
+      observations: pendingObservations,
+      // The confirmed Step is completed in `nextPlan`, so a retained Skill
+      // binding this ordinary confirmation closes - a Reset Skills, a
+      // conversion or a completion on the weapon - is no longer in force
+      // (`docs/PLANNER_SPEC.md` 16.20).
+      skillRetentions: collectPlanSkillRetentionBindings(nextPlan, state.planExecutionHistory),
+    },
   )
   if (!executionStateMatches(actualAfter, step.expectedStateAfter)) {
     executionFailure(

@@ -20,20 +20,25 @@ import { ExecutionDivergenceRecovery } from '../components/execution/ExecutionDi
 import { ExecutionProgress } from '../components/execution/ExecutionProgress'
 import { ExecutionStateControls } from '../components/execution/ExecutionStateControls'
 import { ExecutionStepCard } from '../components/execution/ExecutionStepCard'
+import { CounterAdvanceStepActions } from '../components/execution/CounterAdvanceStepActions'
 import {
   actualResultInputKind,
+  COUNTER_ADVANCE_REARM_MS,
   createExecutionProgress,
   createExecutionStepPresentation,
+  deriveExecutionStepView,
   executionDivergenceView,
   executionErrorMessage,
   EXECUTION_HISTORY_UNCONVERTIBLE_MESSAGE,
   isRecalculationRequiredError,
   offersOperationUncertain,
   ownedWeaponLabel,
+  planStepPositionLabel,
   targetWeaponLabel,
   weaponSwitchTarget,
   type ExecutionDivergenceView,
   type ExecutionStepPresentation,
+  type ExecutionStepRoute,
 } from '../components/execution/executionStepPresentation'
 import { PlanStepDebugDetails } from '../components/debug/PlanStepDebugDetails'
 import { OperationUncertainDialog } from '../components/execution/OperationUncertainDialog'
@@ -43,6 +48,7 @@ import { RepositoryError } from '../db/repositoryError'
 import {
   evaluateProductionPlanContinuation,
   ExecutionRuntimeError,
+  inspectAlternateWeaponExecution,
   type ExecutionActualResultObservation,
   type ExecutionNormalRestorationBonusObservation,
   type ExecutionReidentificationReminder,
@@ -92,6 +98,27 @@ interface NavigatorNotices {
 }
 
 const NO_NOTICES: NavigatorNotices = { messages: [] }
+
+/** The temporary route chosen on one Step (UI_FLOW 12.6 / 12.12); never persisted. */
+interface StepRouteChoice {
+  stepId: PlanStepId
+  route: ExecutionStepRoute
+}
+
+function currentStepIsCounterAdvanceOnly(plan: ProductionPlan): boolean {
+  return (
+    plan.status === 'active' &&
+    plan.currentStepId !== null &&
+    inspectAlternateWeaponExecution(plan, plan.currentStepId).kind === 'available'
+  )
+}
+
+interface TransactionOptions {
+  /** The current Step does not move, so its temporary route stays (only recording the game save point). */
+  keepsStepRoute?: boolean
+  /** Whether the Step this transaction leads to holds its confirmation back for a moment. */
+  rearmsConfirmation?(snapshot: ExecutionNavigatorSnapshot | null): boolean
+}
 
 type ActionState =
   | { status: 'idle' }
@@ -332,9 +359,12 @@ function ExecutionNavigator({
   const [load, setLoad] = useState<LoadState>({ status: 'loading' })
   const [action, setAction] = useState<ActionState>({ status: 'idle' })
   const [notices, setNotices] = useState<NavigatorNotices>(NO_NOTICES)
-  // Presentation-only acknowledgement (UI_FLOW 12.6): never persisted, so a
-  // reload shows the prompt again.
-  const [acknowledgedSwitchStepId, setAcknowledgedSwitchStepId] = useState<PlanStepId | null>(null)
+  // Presentation-only route of the current Step (UI_FLOW 12.6 / 12.12): never
+  // persisted, so a reload starts from the Step's default view again, and a
+  // transaction that moves or restores the Step drops it.
+  const [stepRoute, setStepRoute] = useState<StepRouteChoice | null>(null)
+  const [rearming, setRearming] = useState(false)
+  const rearmTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const aliveRef = useRef(false)
   const loadSequenceRef = useRef(0)
   const submittingRef = useRef(false)
@@ -343,7 +373,14 @@ function ExecutionNavigator({
     aliveRef.current = true
     return () => {
       aliveRef.current = false
+      clearTimeout(rearmTimerRef.current)
     }
+  }, [])
+
+  const startRearm = useCallback(() => {
+    clearTimeout(rearmTimerRef.current)
+    setRearming(true)
+    rearmTimerRef.current = setTimeout(() => setRearming(false), COUNTER_ADVANCE_REARM_MS)
   }, [])
 
   /**
@@ -387,11 +424,14 @@ function ExecutionNavigator({
    * Runs one Execution transaction. The Navigator never moves to the next Step
    * on its own: it re-reads the persisted state after the runtime accepted the
    * request, because the transaction may have registered or updated weapons and
-   * Targets too. The success notices may read the runtime's own result.
+   * Targets too. The success notices may read the runtime's own result. Everything
+   * after the read lands together, so the next Step's confirmation never shows
+   * enabled before it is held back.
    */
   const runTransaction = async <T,>(
     operation: () => Promise<T>,
     successNotices: (result: T) => string[],
+    options: TransactionOptions = {},
   ) => {
     if (submittingRef.current) return
     submittingRef.current = true
@@ -400,9 +440,11 @@ function ExecutionNavigator({
     try {
       const result = await operation()
       if (!aliveRef.current) return
-      await reload()
+      const snapshot = await reload()
       if (!aliveRef.current) return
       setNotices({ messages: successNotices(result) })
+      if (options.keepsStepRoute !== true) setStepRoute(null)
+      if (options.rearmsConfirmation?.(snapshot) === true) startRearm()
       setAction({ status: 'idle' })
     } catch (caught: unknown) {
       if (!aliveRef.current) return
@@ -448,7 +490,27 @@ function ExecutionNavigator({
         (step.executionEffects?.targetCompletions ?? []).map(
           ({ targetWeaponId }) => `「${targetWeaponLabel(targetWeaponId, snapshot.targetWeapons)}」が完成しました`,
         ),
+      { rearmsConfirmation: (next) => next !== null && currentStepIsCounterAdvanceOnly(next.plan) },
     )
+  }
+
+  /**
+   * 「スキル再付与済み・次へ」 (`docs/UI_FLOW.md` 12.12, Issues #379 / #381): the
+   * runtime judges the Step's eligibility again. The notice names the Step just
+   * confirmed, because the next Step of a run looks the same apart from its number.
+   */
+  const confirmStepOnAlternateWeapon = (snapshot: ExecutionNavigatorSnapshot, step: PlanStep) => {
+    void runTransaction(
+      () => dependencies.confirmPlanStepOnAlternateWeapon({ planId: snapshot.plan.id, planStepId: step.id }),
+      () => [`${planStepPositionLabel(snapshot.plan, step.id)}を確定しました。スキルカウンターを1進めました。`],
+      { rearmsConfirmation: () => true },
+    )
+  }
+
+  /** Going back to the default view puts its one-click confirmation on screen again, so that holds it back too. */
+  const selectStepRoute = (stepId: PlanStepId, route: ExecutionStepRoute | null) => {
+    setStepRoute(route === null ? null : { stepId, route })
+    if (route === null) startRearm()
   }
 
   const recordActualResultDifferent = (
@@ -514,6 +576,7 @@ function ExecutionNavigator({
     void runTransaction(
       () => dependencies.recordExecutionSavePoint({ planId: snapshot.plan.id }),
       () => ['ゲーム内セーブ地点を記録しました。'],
+      { keepsStepRoute: true },
     )
   }
 
@@ -637,9 +700,11 @@ function ExecutionNavigator({
             dependencies={dependencies}
             debugMode={debugMode}
             submitting={submitting}
-            acknowledgedSwitchStepId={acknowledgedSwitchStepId}
-            onAcknowledgeSwitch={setAcknowledgedSwitchStepId}
+            rearming={rearming}
+            stepRoute={stepRoute}
+            onSelectStepRoute={selectStepRoute}
             onConfirm={(step, observation) => confirmStep(load.snapshot, step, observation)}
+            onConfirmOnAlternateWeapon={(step) => confirmStepOnAlternateWeapon(load.snapshot, step)}
             onRecordActualResult={(step, actualResult) =>
               recordActualResultDifferent(load.snapshot, step, actualResult)
             }
@@ -686,9 +751,11 @@ function LoadedNavigator({
   dependencies,
   debugMode,
   submitting,
-  acknowledgedSwitchStepId,
-  onAcknowledgeSwitch,
+  rearming,
+  stepRoute,
+  onSelectStepRoute,
   onConfirm,
+  onConfirmOnAlternateWeapon,
   onRecordActualResult,
   onRecordOperationUncertain,
   onRecoverOperationCount,
@@ -700,9 +767,14 @@ function LoadedNavigator({
   dependencies: ExecutionNavigatorPageDependencies
   debugMode: boolean
   submitting: boolean
-  acknowledgedSwitchStepId: PlanStepId | null
-  onAcknowledgeSwitch(stepId: PlanStepId): void
+  /** The current Step's confirmation is held back for a moment (see `COUNTER_ADVANCE_REARM_MS`). */
+  rearming: boolean
+  stepRoute: StepRouteChoice | null
+  /** `null` goes back to the Step's default view. */
+  onSelectStepRoute(stepId: PlanStepId, route: ExecutionStepRoute | null): void
   onConfirm(step: PlanStep, observation?: ExecutionNormalRestorationBonusObservation): void
+  /** 「スキル再付与済み・次へ」 of a Skill Counter-advance-only Reset Skills Step (UI_FLOW 12.12). */
+  onConfirmOnAlternateWeapon(step: PlanStep): void
   onRecordActualResult(step: PlanStep, actualResult: ExecutionActualResultObservation): void
   onRecordOperationUncertain(step: PlanStep): void
   onRecoverOperationCount(observations: OperationCountRecoveryObservation[], position: number): void
@@ -711,7 +783,7 @@ function LoadedNavigator({
   /** 「実行状態の管理」, below the Step's game actions. */
   stateControls(options: StateControlsOptions): ReactNode
 }) {
-  const { plan, ownedWeapons, targetWeapons, buildListEntries, normalCounters, latestExecutionHistory } = snapshot
+  const { plan, ownedWeapons, targetWeapons, buildListEntries, normalCounters, latestExecutionHistory, planExecutionHistory } = snapshot
   const progress = createExecutionProgress(plan)
   const normalCreationSources = { normalCounters, master: dependencies.master }
 
@@ -885,15 +957,25 @@ function LoadedNavigator({
     buildListEntries,
     master: dependencies.master,
   })
-  const switchWeaponId = weaponSwitchTarget(plan, step)
   /**
    * The weapon switch guidance is an interstitial placed *before* the current
    * Step is shown (`docs/PLANNER_SPEC.md` 16.14, `docs/UI_FLOW.md` 12.6), so
-   * the Step card itself is not rendered until 「武器を切り替えました」:
-   * the operation name, instruction, expected result and every action stay
-   * absent from the DOM and the accessibility tree, not merely hidden.
+   * the Step card itself is not rendered until 「武器を切り替えました」: the
+   * operation name, instruction, expected result and every action stay absent
+   * from the DOM and the accessibility tree, not merely hidden.
+   *
+   * It reads the persisted history too: after a Step performed on an unneeded
+   * weapon the weapon in hand is unknown, so the next compared Step prompts
+   * again - unless that Step can be performed on an unneeded weapon itself
+   * (12.12; the eligibility is display only, the runtime judges the Step again
+   * inside its transaction).
    */
-  const showsSwitchPrompt = switchWeaponId !== null && acknowledgedSwitchStepId !== step.id
+  const view = deriveExecutionStepView({
+    actionKind: presentation.actionKind,
+    alternateWeapon: inspectAlternateWeaponExecution(plan, step.id),
+    switchWeaponId: weaponSwitchTarget(plan, step, planExecutionHistory),
+    route: stepRoute?.stepId === step.id ? stepRoute.route : null,
+  })
 
   const header = (
     <>
@@ -907,7 +989,7 @@ function LoadedNavigator({
     </>
   )
 
-  if (showsSwitchPrompt && switchWeaponId !== null) {
+  if (view.kind === 'weapon_switch_prompt') {
     // Presentation-only: the acknowledgement confirms no Step and is never
     // persisted, so the state controls stay exactly as available as they are
     // on the current Step, and a reload shows this interstitial again.
@@ -915,10 +997,12 @@ function LoadedNavigator({
       <>
         {header}
         <WeaponSwitchPrompt
-          weaponLabel={ownedWeaponLabel(switchWeaponId, ownedWeapons)}
-          weapon={ownedWeapons.find(({ id }) => id === switchWeaponId) ?? null}
+          weaponLabel={ownedWeaponLabel(view.weaponId, ownedWeapons)}
+          weapon={ownedWeapons.find(({ id }) => id === view.weaponId) ?? null}
           master={dependencies.master}
-          onAcknowledge={() => onAcknowledgeSwitch(step.id)}
+          disabled={submitting || rearming}
+          onAcknowledge={() => onSelectStepRoute(step.id, 'switched')}
+          onReturnToCounterAdvance={view.offersCounterAdvanceReturn ? () => onSelectStepRoute(step.id, null) : undefined}
         />
         {stateControls({ running: true, canRecordSavePoint: true, showsSavePointRestore: true })}
       </>
@@ -928,7 +1012,11 @@ function LoadedNavigator({
   return (
     <>
       {header}
-      <ExecutionStepCard presentation={presentation} master={dependencies.master}>
+      <ExecutionStepCard
+        presentation={presentation}
+        master={dependencies.master}
+        counterAdvance={view.kind === 'counter_advance'}
+      >
         {presentation.actionKind === 'not_executable' ? (
           <Alert severity="warning">
             このStepは現在の実行形式ではないため、実行ナビでは確定できません。
@@ -939,8 +1027,18 @@ function LoadedNavigator({
             presentation={presentation}
             dependencies={dependencies}
             targetFound={presentation.target !== null}
-            submitting={submitting}
+            submitting={submitting || rearming}
+            route={
+              view.kind === 'counter_advance'
+                ? 'counter_advance'
+                : view.offersCounterAdvanceReturn
+                  ? 'guided_weapon'
+                  : 'ordinary'
+            }
             onConfirm={(observation) => onConfirm(step, observation)}
+            onConfirmOnAlternateWeapon={() => onConfirmOnAlternateWeapon(step)}
+            onRequestGuidedWeapon={() => onSelectStepRoute(step.id, 'switch_requested')}
+            onReturnToCounterAdvance={() => onSelectStepRoute(step.id, null)}
             onRecordActualResult={(actualResult) => onRecordActualResult(step, actualResult)}
             onRecordOperationUncertain={() => onRecordOperationUncertain(step)}
           />
@@ -953,18 +1051,26 @@ function LoadedNavigator({
 }
 
 /**
- * The current Step's actions (`docs/UI_FLOW.md` 12): the ordinary
- * confirmation first, and the divergence records 「結果が違う」 / 「何を何回
- * 操作したか分からない」 in a separate section below it, so they are not
- * tapped by mistake. Keyed by the Step, so a draft never outlives its Step; a
- * refused record keeps the draft.
+ * The current Step's actions (`docs/UI_FLOW.md` 12): the confirmation first, and
+ * the divergence records 「結果が違う」 / 「何を何回操作したか分からない」 in a
+ * separate section below it, so they are not tapped by mistake. Keyed by the
+ * Step, so a draft never outlives its Step; a refused record keeps the draft.
+ *
+ * A Skill Counter-advance-only Step (12.12) has two routes of its own:
+ * `counter_advance`, performed on an unneeded weapon and confirmed in one press,
+ * and `guided_weapon`, the ordinary confirmation, reached only after the switch
+ * to the tracked weapon was confirmed.
  */
 function StepActions({
   presentation,
   dependencies,
   targetFound,
   submitting,
+  route,
   onConfirm,
+  onConfirmOnAlternateWeapon,
+  onRequestGuidedWeapon,
+  onReturnToCounterAdvance,
   onRecordActualResult,
   onRecordOperationUncertain,
 }: {
@@ -972,7 +1078,11 @@ function StepActions({
   dependencies: ExecutionNavigatorPageDependencies
   targetFound: boolean
   submitting: boolean
+  route: 'ordinary' | 'counter_advance' | 'guided_weapon'
   onConfirm(observation?: ExecutionNormalRestorationBonusObservation): void
+  onConfirmOnAlternateWeapon(): void
+  onRequestGuidedWeapon(): void
+  onReturnToCounterAdvance(): void
   onRecordActualResult(actualResult: ExecutionActualResultObservation): void
   onRecordOperationUncertain(): void
 }) {
@@ -980,7 +1090,10 @@ function StepActions({
   const [draft, setDraft] = useState<ActualResultDraft>(emptyActualResultDraft)
   const [confirmingUncertain, setConfirmingUncertain] = useState(false)
   const { step, actionKind } = presentation
-  const actualKind = actualResultInputKind(step)
+  const weaponLabel = presentation.weaponLabel ?? '計画上の武器'
+  // On the default Counter-advance route the tracked weapon is not operated on,
+  // so it has no result that could differ; 「何を何回操作したか分からない」 stays.
+  const actualKind = route === 'counter_advance' ? null : actualResultInputKind(step)
   const uncertain = offersOperationUncertain(step)
 
   if (enteringActualResult && actualKind !== null) {
@@ -1001,7 +1114,48 @@ function StepActions({
 
   return (
     <>
-      {actionKind === 'confirm_expected' && (
+      {route === 'counter_advance' && (
+        <CounterAdvanceStepActions
+          weaponLabel={weaponLabel}
+          disabled={submitting}
+          onConfirm={onConfirmOnAlternateWeapon}
+          onRequestGuidedWeapon={onRequestGuidedWeapon}
+        />
+      )}
+      {route === 'guided_weapon' && (
+        <>
+          {/*
+            * The switch to the tracked weapon was confirmed, so the ordinary
+            * confirmation is the one primary action here. The way back stays
+            * beside it: the user may still prefer an unneeded weapon.
+            */}
+          <Alert severity="info" role="note" sx={{ '& .MuiAlert-message': { minWidth: 0, overflowWrap: 'anywhere' } }}>
+            <AlertTitle sx={{ fontWeight: 700 }}>案内された武器で実行します</AlertTitle>
+            ゲーム内で「{weaponLabel}」にスキル再付与を行い、結果を確認してから「結果一致・次へ」を押してください。
+          </Alert>
+          <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} useFlexGap sx={{ flexWrap: 'wrap' }}>
+            <Button
+              variant="contained"
+              size="large"
+              disabled={submitting}
+              onClick={() => onConfirm()}
+              sx={primarySx}
+            >
+              結果一致・次へ
+            </Button>
+            <Button
+              variant="outlined"
+              size="large"
+              disabled={submitting}
+              onClick={onReturnToCounterAdvance}
+              sx={primarySx}
+            >
+              不要な武器で進める
+            </Button>
+          </Stack>
+        </>
+      )}
+      {route === 'ordinary' && actionKind === 'confirm_expected' && (
         <Button
           variant="contained"
           size="large"

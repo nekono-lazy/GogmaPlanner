@@ -7,6 +7,7 @@ import {
   executionFailure,
   executionHistoryIdsAfterSavePoint,
   prepareActualResultDifferent,
+  prepareAlternateWeaponStepExecution,
   prepareExecutionSavePointRecord,
   prepareExecutionSavePointRestore,
   prepareExecutionUndo,
@@ -143,6 +144,12 @@ export interface RecordActualResultDifferentRequest {
 }
 
 export interface RecordOperationUncertainRequest {
+  planId: ProductionPlanId
+  planStepId: PlanStepId
+}
+
+/** The alternate-weapon execution of the current Step (`docs/PLANNER_SPEC.md` 16.20, Issue #379). */
+export interface ConfirmPlanStepOnAlternateWeaponRequest {
   planId: ProductionPlanId
   planStepId: PlanStepId
 }
@@ -319,7 +326,9 @@ export type AdoptRunningPlanReplanPreviewResult =
  * cases the transaction is rolled back and nothing is changed.
  *
  * Implemented: starting a draft Plan, the ordinary `confirmed_expected` Step
- * confirmation (including a blind observation and `confirm_owned_ideal`), and
+ * confirmation (including a blind observation and `confirm_owned_ideal`), the
+ * alternate-weapon execution of a Skill Counter-advance-only Reset Skills
+ * (`executed_on_alternate_weapon`, 16.20), and
  * the two divergence records `actual_result_different` and
  * `operation_uncertain`, the Current Position Recovery after
  * `operation_uncertain` (`operation_count_recovered`), the Undo of the latest ExecutionHistory, recording /
@@ -441,6 +450,33 @@ export class ProductionPlanExecutionService {
       })
       await this.writeStep(confirmation)
       return { plan: confirmation.plan, history: confirmation.history }
+    })
+  }
+
+  /**
+   * The current Skill Counter-advance-only Reset Skills Step was performed on an
+   * unneeded Gogma weapon (16.20, Issue #379): only the Skill Counter advances,
+   * the tracked weapon stays as it is, and the Step is completed with an
+   * `executed_on_alternate_weapon` record. The transaction judges the Step's
+   * eligibility again; a Step whose result is needed is refused with
+   * `alternate_weapon_not_allowed` and nothing is written.
+   */
+  confirmPlanStepOnAlternateWeapon(
+    request: ConfirmPlanStepOnAlternateWeaponRequest,
+  ): Promise<ExecutionStepRecordResult> {
+    return this.runExecutionTransaction(async () => {
+      const plan = await this.requirePlan(request.planId)
+      const execution = prepareAlternateWeaponStepExecution({
+        plan,
+        planStepId: request.planStepId,
+        state: await this.readState(plan),
+        currentCalculationContext: this.dependencies.currentCalculationContext,
+        counterAuthority: this.dependencies.counterAuthority,
+        executionHistoryId: this.dependencies.idFactory.executionHistoryId(),
+        now: this.dependencies.clock.now(),
+      })
+      await this.writeStep(execution)
+      return { plan: execution.plan, history: execution.history }
     })
   }
 

@@ -1,3 +1,4 @@
+export * from './alternateWeaponExecution'
 export * from './executionHistoryRecords'
 export * from './executionRuntimeError'
 export * from './executionSavePoint'

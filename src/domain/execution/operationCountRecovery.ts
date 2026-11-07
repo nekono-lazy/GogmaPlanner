@@ -23,7 +23,7 @@ import {
   assertExecutableProductionPlan,
   assertProductionPlanCompletionAssignmentSafe,
   assertPlanDependenciesUnchanged,
-  collectPlanObservationBindings,
+  collectPlanExecutionBindings,
   createActualExecutionState,
   executionStateMatches,
   requireCurrentPlanStep,
@@ -484,9 +484,13 @@ export function prepareOperationCountRecovery(input: OperationCountRecoveryInput
   }
   const current = requireCurrentPlanStep(plan, input.planStepId)
   assertPlanDependenciesUnchanged(plan, state.targetWeapons, state.buildListEntries)
-  const bindings = collectPlanObservationBindings(plan, state.planExecutionHistory)
-  const actualState = (working: Parameters<typeof createActualExecutionState>[1]) =>
-    createActualExecutionState(plan, working, bindings)
+  // The bindings follow the Steps completed so far: a replayed Reset Skills
+  // closes a retained Skill binding on its weapon exactly as an ordinary
+  // confirmation does (`docs/PLANNER_SPEC.md` 16.20).
+  const actualState = (
+    working: Parameters<typeof createActualExecutionState>[1],
+    stepsNow: ProductionPlan['steps'] = plan.steps,
+  ) => createActualExecutionState(plan, working, collectPlanExecutionBindings({ ...plan, steps: stepsNow }, state.planExecutionHistory))
   if (!executionStateMatches(actualState(state), current.expectedStateBefore)) {
     executionFailure(
       'execution_state_mismatch',
@@ -537,7 +541,7 @@ export function prepareOperationCountRecovery(input: OperationCountRecoveryInput
       ownedWeapons: [...mutable.weapons.values()],
       targetWeapons: [...mutable.targets.values()],
       buildListEntries: state.buildListEntries,
-    })
+    }, steps)
     if (!executionStateMatches(after, step.expectedStateAfter)) {
       executionFailure(
         'expected_state_after_mismatch',

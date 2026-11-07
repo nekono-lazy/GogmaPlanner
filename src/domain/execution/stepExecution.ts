@@ -4,7 +4,6 @@ import type {
   ExecutionUndoSnapshot,
   ISODateTimeString,
   NormalArtianCounter,
-  ObservedRestorationBonusBinding,
   OwnedNormalArtianWeapon,
   OwnedWeapon,
   OwnedWeaponId,
@@ -34,12 +33,13 @@ import {
   assertExecutableProductionPlan,
   assertProductionPlanCompletionAssignmentSafe,
   assertPlanDependenciesUnchanged,
-  collectPlanObservationBindings,
+  collectPlanExecutionBindings,
   createActualExecutionState,
   executionStateMatches,
   requireCurrentPlanStep,
   type ExecutableProductionPlanStep,
   type ExecutionPersistedState,
+  type ExecutionStateBindings,
 } from './planExecutionState'
 
 /**
@@ -92,8 +92,8 @@ export interface CurrentStepExecutionInput {
 
 export interface ExecutableCurrentStep {
   step: ExecutableProductionPlanStep
-  /** The observation bindings the Plan's confirmed Steps recorded. */
-  bindings: ObservedRestorationBonusBinding[]
+  /** The observation and retained Skill bindings the Plan's confirmed Steps recorded (16.5 / 16.20). */
+  bindings: ExecutionStateBindings
 }
 
 export function changedEntity(before: unknown, after: unknown): boolean {
@@ -130,7 +130,7 @@ export function requireExecutableCurrentStep(
   if (options.advancesPlan) assertProductionPlanCompletionAssignmentSafe(plan, state.targetWeapons)
   const step = requireCurrentPlanStep(plan, input.planStepId)
   assertPlanDependenciesUnchanged(plan, state.targetWeapons, state.buildListEntries)
-  const bindings = collectPlanObservationBindings(plan, state.planExecutionHistory)
+  const bindings = collectPlanExecutionBindings(plan, state.planExecutionHistory)
   if (!executionStateMatches(createActualExecutionState(plan, state, bindings), step.expectedStateBefore)) {
     executionFailure(
       'execution_state_mismatch',

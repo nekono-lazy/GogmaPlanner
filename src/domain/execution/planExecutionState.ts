@@ -8,9 +8,11 @@ import type {
   NormalArtianCounter,
   ObservedRestorationBonusBinding,
   OwnedWeapon,
+  OwnedWeaponId,
   PlanStep,
   PlanStepExecutionEffects,
   ProductionPlan,
+  RetainedSkillBinding,
   RngState,
   TargetWeapon,
 } from '../models/publicTypes'
@@ -20,6 +22,7 @@ import {
   isExecutionContractProductionPlan,
   isProductionPlanCalculationCompatible,
   resolveObservationBindingTokens,
+  resolveSkillRetentionOverrides,
   validateProductionPlan,
 } from '../models/publicTypes'
 import {
@@ -253,10 +256,99 @@ export function collectPlanObservationBindings(
 }
 
 /**
+ * The observation bindings and the retained Skill bindings an actual execution
+ * state is normalized with (`docs/PLANNER_SPEC.md` 16.5 / 16.20).
+ */
+export interface ExecutionStateBindings {
+  observations: readonly ObservedRestorationBonusBinding[]
+  skillRetentions: readonly RetainedSkillBinding[]
+}
+
+/**
+ * The alternate-weapon Reset Skills executions still in force
+ * (`docs/PLANNER_SPEC.md` 16.20), one per weapon: for each weapon, the latest
+ * completed Step in Plan order whose ordinary confirmation writes its Skills
+ * (a Reset Skills or conversion tracking it, or a Target completion with it),
+ * when that very Step was confirmed by an `executed_on_alternate_weapon`
+ * record. A later ordinary confirmation, a different actual result or a
+ * recovery replay of a skill-writing Step closes the binding by completing
+ * that Step without such a record; Undo and a save point restore close it by
+ * deleting the record and un-completing the Step.
+ *
+ * The binding carries the Skills the weapon kept (the record's
+ * `actualResult`) and the Skills the Plan expects after the Step (its
+ * `expectedResult`). A Step with two such records, or a record whose Step is
+ * not a Reset Skills on that weapon with an expected result, yields no binding,
+ * so the actual Skills are compared as they are.
+ */
+export function collectPlanSkillRetentionBindings(
+  plan: Pick<ProductionPlan, 'id' | 'steps'>,
+  planExecutionHistory: readonly ExecutionHistory[],
+): RetainedSkillBinding[] {
+  const recordsByStep = new Map<PlanStep['id'], ExecutionHistory[]>()
+  planExecutionHistory.forEach((history) => {
+    if (history.planId !== plan.id || history.action !== 'executed_on_alternate_weapon') return
+    recordsByStep.set(history.planStepId, [...(recordsByStep.get(history.planStepId) ?? []), history])
+  })
+  if (recordsByStep.size === 0) return []
+  const latestWriterByWeapon = new Map<OwnedWeaponId, PlanStep>()
+  plan.steps.forEach((step) => {
+    const effects = step.executionEffects
+    if (!step.isCompleted || effects === undefined) return
+    const written = new Set<OwnedWeaponId>(effects.targetCompletions.map(({ ownedWeaponId }) => ownedWeaponId))
+    if (
+      effects.trackedOwnedWeaponId !== null &&
+      (step.operationType === 'reset_skills' || step.operationType === 'convert_normal_to_gogma')
+    ) {
+      written.add(effects.trackedOwnedWeaponId)
+    }
+    written.forEach((ownedWeaponId) => latestWriterByWeapon.set(ownedWeaponId, step))
+  })
+  const bindings: RetainedSkillBinding[] = []
+  latestWriterByWeapon.forEach((step, ownedWeaponId) => {
+    const records = recordsByStep.get(step.id)
+    if (records === undefined || records.length !== 1) return
+    const [record] = records
+    const expected = step.expectedResult
+    if (
+      step.operationType !== 'reset_skills' ||
+      step.executionEffects?.trackedOwnedWeaponId !== ownedWeaponId ||
+      expected === null ||
+      record.actualResult === null
+    ) {
+      return
+    }
+    bindings.push({
+      ownedWeaponId,
+      planStepId: step.id,
+      retainedSeriesSkillId: record.actualResult.seriesSkillId,
+      retainedGroupSkillId: record.actualResult.groupSkillId,
+      expectedSeriesSkillId: expected.seriesSkillId,
+      expectedGroupSkillId: expected.groupSkillId,
+    })
+  })
+  return bindings.sort((left, right) =>
+    left.ownedWeaponId < right.ownedWeaponId ? -1 : left.ownedWeaponId > right.ownedWeaponId ? 1 : 0)
+}
+
+/** Both binding kinds of a Plan, from its persisted Steps and its ExecutionHistory metadata. */
+export function collectPlanExecutionBindings(
+  plan: ProductionPlan,
+  planExecutionHistory: readonly ExecutionHistory[],
+): ExecutionStateBindings {
+  return {
+    observations: collectPlanObservationBindings(plan, planExecutionHistory),
+    skillRetentions: collectPlanSkillRetentionBindings(plan, planExecutionHistory),
+  }
+}
+
+/**
  * The actual execution state of the persisted entities, hashed by the same
  * authority the Plan's expected states were built with. Only a weapon whose
  * five slots and scope exactly equal a recorded observation normalizes to its
- * binding token.
+ * binding token, and only a weapon whose Skills exactly equal the Skills it
+ * kept at an alternate-weapon Reset Skills normalizes to the expected Skills
+ * (16.20). A bare observation binding array means no retained Skill binding.
  */
 export function createActualExecutionState(
   plan: ProductionPlan,
@@ -264,8 +356,11 @@ export function createActualExecutionState(
     ExecutionPersistedState,
     'rngState' | 'normalCounters' | 'ownedWeapons' | 'targetWeapons' | 'buildListEntries'
   >,
-  bindings: readonly ObservedRestorationBonusBinding[],
+  bindings: readonly ObservedRestorationBonusBinding[] | ExecutionStateBindings,
 ): ExpectedPlanState {
+  const resolved: ExecutionStateBindings = 'observations' in bindings
+    ? bindings
+    : { observations: bindings, skillRetentions: [] }
   return createExpectedPlanState(
     state.rngState,
     state.normalCounters,
@@ -277,7 +372,8 @@ export function createActualExecutionState(
         state.buildListEntries,
       ),
     },
-    resolveObservationBindingTokens(state.ownedWeapons, bindings),
+    resolveObservationBindingTokens(state.ownedWeapons, resolved.observations),
+    resolveSkillRetentionOverrides(state.ownedWeapons, resolved.skillRetentions),
   )
 }
 

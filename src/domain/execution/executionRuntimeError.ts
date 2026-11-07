@@ -56,6 +56,12 @@ export type ExecutionRuntimeErrorCode =
   | 'actual_result_invalid'
   /** The actual result equals the expected result, so it is `confirmed_expected`. */
   | 'actual_result_matches_expected'
+  /**
+   * The Step is not a Skill Counter-advance-only Reset Skills Step, so it
+   * cannot be performed on an alternate weapon (Issue #379,
+   * `docs/PLANNER_SPEC.md` 16.20).
+   */
+  | 'alternate_weapon_not_allowed'
   /** The Step's recorded Counter advance or Execution effects cannot apply to the state. */
   | 'execution_effect_inconsistent'
   /** The resulting state differs from the Step's `expectedStateAfter`. */

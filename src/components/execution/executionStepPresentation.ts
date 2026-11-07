@@ -1,5 +1,6 @@
 import {
   executionReidentificationDestination,
+  type AlternateWeaponExecutionAvailability,
   type ExecutionRuntimeErrorCode,
   type ReidentificationDestination,
 } from '../../domain/execution'
@@ -440,28 +441,129 @@ function switchSubject(step: PlanStep): OwnedWeaponId | null {
 }
 
 /**
+ * The completed Steps the user performed on an unneeded weapon instead of the
+ * tracked one (`executed_on_alternate_weapon`, `docs/PLANNER_SPEC.md` 16.20),
+ * from the Plan's ExecutionHistory metadata. Undo and a save point restore
+ * delete the record, so the Step counts as ordinary again.
+ */
+export function alternateExecutedStepIds(
+  plan: Pick<ProductionPlan, 'id'>,
+  planExecutionHistory: readonly ExecutionHistory[],
+): Set<PlanStep['id']> {
+  return new Set(
+    planExecutionHistory
+      .filter(({ planId, action }) => planId === plan.id && action === 'executed_on_alternate_weapon')
+      .map(({ planStepId }) => planStepId),
+  )
+}
+
+/** The weapon the last completed compared Step really left in the player's hand, or `unknown`. */
+type PreviousWeaponSubject = OwnedWeaponId | 'unknown' | null
+
+/**
  * The weapon the user must switch to before the current Step
  * (`docs/UI_FLOW.md` 12.6, `docs/PLANNER_SPEC.md` 16.14), or `null`.
  *
  * Presentation only: it compares the current Step's tracked weapon with the
- * tracked weapon of the last *completed* conversion / Reset / Keep / Reset
- * Skills Step in Plan order. `create_normal_artian` and `confirm_owned_ideal`
- * are neither compared nor prompted. With no earlier compared Step there is no
- * weapon to switch from, so nothing is prompted.
+ * weapon the last *completed* conversion / Reset / Keep / Reset Skills Step in
+ * Plan order was really performed on. A Step confirmed through
+ * 「スキル再付与済み・次へ」 (`executed_on_alternate_weapon`, Issue #379) was performed on
+ * an unneeded weapon the Plan does not know, so after it the weapon in hand is
+ * unknown and the next compared Step always prompts - even when the Plan
+ * tracks the same weapon on both. `create_normal_artian` and
+ * `confirm_owned_ideal` are neither compared nor prompted, and they never
+ * change the weapon in hand. With no earlier compared Step there is no weapon
+ * to switch from, so nothing is prompted.
  */
 export function weaponSwitchTarget(
   plan: ProductionPlan,
   currentStep: PlanStep,
+  planExecutionHistory: readonly ExecutionHistory[] = [],
 ): OwnedWeaponId | null {
   const current = switchSubject(currentStep)
   if (current === null) return null
-  let previous: OwnedWeaponId | null = null
+  const alternate = alternateExecutedStepIds(plan, planExecutionHistory)
+  let previous: PreviousWeaponSubject = null
   for (const step of orderPlanSteps(plan)) {
     if (!step.isCompleted) continue
     const subject = switchSubject(step)
-    if (subject !== null) previous = subject
+    if (subject !== null) previous = alternate.has(step.id) ? 'unknown' : subject
   }
   return previous !== null && previous !== current ? current : null
+}
+
+/**
+ * The one confirmation of a Skill Counter-advance-only Step performed on an
+ * unneeded weapon (`docs/UI_FLOW.md` 12.12, Issue #381). The Step card, its
+ * note and the Undo control all name the button with these words.
+ */
+export const COUNTER_ADVANCE_CONFIRM_LABEL = 'スキル再付与済み・次へ'
+
+/**
+ * How long the confirmation controls stay disabled around a Skill
+ * Counter-advance-only confirmation (`docs/UI_FLOW.md` 12.12). The next Step's
+ * button can appear where the pointer already is, and saving can finish inside a
+ * double click, so its second click must not confirm a Step whose game operation
+ * has not been done. Well below the time one game operation takes.
+ */
+export const COUNTER_ADVANCE_REARM_MS = 600
+
+/**
+ * The presentation-only choice made on the current Step (`docs/UI_FLOW.md` 12.6
+ * / 12.12); never persisted, so a reload starts from the Step's default view.
+ *
+ * `switch_requested`: 「案内された武器で実行する」 on a Counter-advance-only Step
+ * asked for the switch, which is not confirmed yet. `switched`: the switch to
+ * the guided weapon was confirmed.
+ */
+export type ExecutionStepRoute = 'switch_requested' | 'switched'
+
+export type ExecutionStepView =
+  /** The weapon switch guidance stands in for the Step card; `offersCounterAdvanceReturn` adds 「不要な武器で進める」. */
+  | { kind: 'weapon_switch_prompt'; weaponId: OwnedWeaponId; offersCounterAdvanceReturn: boolean }
+  /** The compact card of a Counter-advance-only Step, confirmed on an unneeded weapon in one click. */
+  | { kind: 'counter_advance'; trackedOwnedWeaponId: OwnedWeaponId }
+  /** The whole Step card with its ordinary confirmation; `offersCounterAdvanceReturn` adds 「不要な武器で進める」. */
+  | { kind: 'step'; offersCounterAdvanceReturn: boolean }
+
+/**
+ * What the Navigator shows for the current Step (`docs/UI_FLOW.md` 12.6 /
+ * 12.12). Pure: it combines the Domain's eligibility, the weapon switch
+ * judgement and the temporary route, and decides nothing about Execution.
+ *
+ * A Counter-advance-only Step skips the guidance because it can be performed on
+ * an unneeded weapon whatever is in hand. Skipping it confirms no switch, so the
+ * ordinary confirmation stays out of reach until the switch was confirmed, even
+ * where `weaponSwitchTarget()` asks for none (the Plan's first compared Step, or
+ * the same weapon again): the card never assumes which weapon the user holds.
+ * Every other Step keeps the guidance exactly as `weaponSwitchTarget()` judges it.
+ */
+export function deriveExecutionStepView({
+  actionKind,
+  alternateWeapon,
+  switchWeaponId,
+  route,
+}: {
+  actionKind: ExecutionStepActionKind
+  alternateWeapon: AlternateWeaponExecutionAvailability
+  switchWeaponId: OwnedWeaponId | null
+  route: ExecutionStepRoute | null
+}): ExecutionStepView {
+  if (actionKind === 'confirm_expected' && alternateWeapon.kind === 'available') {
+    const trackedOwnedWeaponId = alternateWeapon.trackedOwnedWeaponId
+    switch (route) {
+      case null:
+        return { kind: 'counter_advance', trackedOwnedWeaponId }
+      case 'switch_requested':
+        return { kind: 'weapon_switch_prompt', weaponId: trackedOwnedWeaponId, offersCounterAdvanceReturn: true }
+      case 'switched':
+        return { kind: 'step', offersCounterAdvanceReturn: true }
+    }
+  }
+  if (switchWeaponId !== null && route !== 'switched') {
+    return { kind: 'weapon_switch_prompt', weaponId: switchWeaponId, offersCounterAdvanceReturn: false }
+  }
+  return { kind: 'step', offersCounterAdvanceReturn: false }
 }
 
 /**
@@ -525,6 +627,8 @@ export function executionErrorMessage(code: ExecutionRuntimeErrorCode): string {
       return '入力した実際の結果は、この武器の結果として保存できません。入力を確認してください。'
     case 'actual_result_matches_expected':
       return '入力した結果は想定結果と一致しています。「結果一致・次へ」を使用してください。'
+    case 'alternate_weapon_not_allowed':
+      return 'このStepはスキルカウンターを進めるだけの操作ではないため、他武器では実行できません。案内された武器で操作し、「結果一致・次へ」を使用してください。'
     case 'operation_count_recovery_not_applicable':
       return 'この作成プランは、現在位置の確認で再開できる状態ではありません。'
     case 'operation_count_recovery_changed':
@@ -738,6 +842,8 @@ export function executionUndoTargetLabel(plan: ProductionPlan, history: Executio
       return `${step} の「何を何回操作したか分からない」の記録`
     case 'operation_count_recovered':
       return `現在位置の確認による再開（${step}まで）`
+    case 'executed_on_alternate_weapon':
+      return `${step} の「${COUNTER_ADVANCE_CONFIRM_LABEL}」の記録`
     case 'finished_as_compromise':
       return '妥協品として確定して終了'
     case 'secured_weapon':

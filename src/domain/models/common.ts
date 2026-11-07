@@ -134,6 +134,14 @@ export type ExecutionAction =
    * replayed along the Plan to that position (`docs/PLANNER_SPEC.md` 16.15).
    */
   | 'operation_count_recovered'
+  /**
+   * A Skill Counter-advance-only Reset Skills Step was performed on an unneeded
+   * Gogma weapon instead of the tracked weapon (Issue #379,
+   * `docs/PLANNER_SPEC.md` 16.20): the Skill Counter advanced by one, the
+   * tracked weapon kept its Skills (recorded in `actualResult`), and the
+   * alternate weapon is recorded nowhere.
+   */
+  | 'executed_on_alternate_weapon'
   | 'finished_as_compromise'
   | 'secured_weapon'
   | 'skipped_candidate'
@@ -142,6 +150,7 @@ export const currentExecutionActions = [
   'actual_result_different',
   'operation_uncertain',
   'operation_count_recovered',
+  'executed_on_alternate_weapon',
   'finished_as_compromise',
 ] as const satisfies readonly ExecutionAction[]
 export const legacyExecutionActions = [

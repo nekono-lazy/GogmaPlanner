@@ -197,14 +197,22 @@ function NormalCreationGuidanceSection({ guidance }: { guidance: ExecutionNormal
  * shows its derived instruction instead of the persisted one (Issue #275).
  * The actions are the caller's children, so the card never decides which
  * confirmation applies.
+ *
+ * `counterAdvance` is the default view of a Skill Counter-advance-only Step
+ * (`docs/UI_FLOW.md` 12.12, Issue #381). Its weapon is the one the Plan tracks,
+ * not the one to use, and the predicted Skills are not what the user compares
+ * on an unneeded weapon, so the persisted instruction and the expected result
+ * stay off this view and come back on the guided weapon's ordinary view.
  */
 export function ExecutionStepCard({
   presentation,
   master,
+  counterAdvance = false,
   children,
 }: {
   presentation: ExecutionStepPresentation
   master: MasterDataRoot
+  counterAdvance?: boolean
   children?: ReactNode
 }) {
   const headingId = useId()
@@ -224,7 +232,7 @@ export function ExecutionStepCard({
           <Typography id={headingId} component="h2" variant="h2">
             {presentation.operationLabel}
           </Typography>
-          {normalCreationRole === 'counter_advance' && <StatusChip label="Counter進行用" tone="neutral" />}
+          {(normalCreationRole === 'counter_advance' || counterAdvance) && <StatusChip label="Counter進行用" tone="neutral" />}
           {normalCreationRole === 'production_target' && <StatusChip label="作成対象" tone="info" />}
           {presentation.completionTargetLabels.length > 0 && <StatusChip label="目標武器が完成" tone="positive" />}
         </Stack>
@@ -235,7 +243,7 @@ export function ExecutionStepCard({
             <br />
             理想品として確定します。
           </Alert>
-        ) : (
+        ) : !counterAdvance && (
           <>
             <Typography sx={{ fontWeight: 500, overflowWrap: 'anywhere' }}>{step.title}</Typography>
             {presentation.normalCreation === null ? (
@@ -258,7 +266,9 @@ export function ExecutionStepCard({
         <Box component="dl" sx={{ m: 0, display: 'grid', gridTemplateColumns: 'auto minmax(0, 1fr)', columnGap: 1.5, rowGap: 0.5, alignItems: 'center' }}>
           {presentation.weaponLabel !== null && (
             <>
-              <Typography id={weaponTermId} component="dt" variant="body2" color="text.secondary">使用する武器</Typography>
+              <Typography id={weaponTermId} component="dt" variant="body2" color="text.secondary">
+                {counterAdvance ? '計画上の武器' : '使用する武器'}
+              </Typography>
               <Box component="dd" sx={{ m: 0, minWidth: 0 }}>
                 <ExecutionEntityName
                   label={presentation.weaponLabel}
@@ -295,7 +305,7 @@ export function ExecutionStepCard({
           </Alert>
         ))}
 
-        {!isOwnedIdeal && (
+        {!isOwnedIdeal && !counterAdvance && (
           <>
             <Divider />
             <ExpectedResultSection presentation={presentation} master={master} />
